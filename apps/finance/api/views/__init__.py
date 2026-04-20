@@ -114,7 +114,7 @@ class PublicFinanceTokenView(APIView):
         }
 
         if handoff.module == "invoice":
-            invoice_data = self._build_invoice_payload(handoff)
+            invoice_data = self._build_invoice_payload(handoff, request)
             if invoice_data:
                 base_data.update(invoice_data)
                 return Response(InvoiceFinanceReviewSerializer(base_data).data)
@@ -136,7 +136,7 @@ class PublicFinanceTokenView(APIView):
                 return f"Campaign {handoff.subject_id}"
         return f"{handoff.subject_type} {handoff.subject_id}"
 
-    def _build_invoice_payload(self, handoff) -> dict | None:
+    def _build_invoice_payload(self, handoff, request) -> dict | None:
         """Build rich invoice finance review payload for invoice handoffs."""
         from apps.invoices.models import Invoice
 
@@ -232,7 +232,7 @@ class PublicFinanceTokenView(APIView):
                     "category_name": alloc.category.name if alloc.category else None,
                     "subcategory_name": alloc.subcategory.name if alloc.subcategory else None,
                     "campaign_name": alloc.campaign.name if alloc.campaign else None,
-                    "budget_name": alloc.budget.name if alloc.budget else None,
+                    "budget_name": str(alloc.budget) if alloc.budget else None,
                     "selected_approver_email": (
                         alloc.selected_approver.email if alloc.selected_approver else None
                     ),
