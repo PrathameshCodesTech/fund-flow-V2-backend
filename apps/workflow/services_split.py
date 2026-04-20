@@ -86,29 +86,19 @@ def get_runtime_split_options(instance_step: WorkflowInstanceStep, user) -> dict
             "scope_node__path__startswith": target_path,
         }
 
-        categories = [
-            {
-                "id": c.id,
-                "name": c.name,
-                "code": c.code,
-            }
-            for c in BudgetCategory.objects.filter(
-                org_id=opt.entity.org_id,
-                is_active=True,
-            ).order_by("name")
-        ]
-
+        category_ids = set()
         subcategories = []
         seen_subcategory_ids = set()
-        for b in (
-            Budget.objects.filter(
-                **target_scope_filter,
-                subcategory__isnull=False,
-                subcategory__is_active=True,
-            )
-            .select_related("category", "subcategory")
-            .order_by("category__name", "subcategory__name")
-        ):
+        scoped_budgets = (
+            Budget.objects.filter(**target_scope_filter)
+            .select_related("scope_node", "category", "subcategory")
+            .order_by("scope_node__name", "category__name", "subcategory__name")
+        )
+        for b in scoped_budgets:
+            if b.category_id:
+                category_ids.add(b.category_id)
+            if not b.subcategory_id or not b.subcategory or not b.subcategory.is_active:
+                continue
             if b.subcategory_id in seen_subcategory_ids:
                 continue
             seen_subcategory_ids.add(b.subcategory_id)
@@ -119,17 +109,9 @@ def get_runtime_split_options(instance_step: WorkflowInstanceStep, user) -> dict
                 "category_name": b.category.name if b.category else None,
             })
 
-        campaigns = [
-            {
-                "id": c.id,
-                "name": c.name,
-                "code": c.code,
-                "category_id": c.category_id,
-                "subcategory_id": c.subcategory_id,
-                "budget_id": c.budget_id,
-                "approved_amount": str(c.approved_amount or 0),
-            }
-            for c in Campaign.objects.filter(
+        campaigns = []
+        for c in (
+            Campaign.objects.filter(
                 **target_scope_filter,
                 status__in=[
                     CampaignStatus.INTERNALLY_APPROVED,
@@ -139,6 +121,30 @@ def get_runtime_split_options(instance_step: WorkflowInstanceStep, user) -> dict
             )
             .select_related("category", "subcategory", "budget")
             .order_by("name")
+        ):
+            if c.category_id:
+                category_ids.add(c.category_id)
+            campaigns.append({
+                "id": c.id,
+                "name": c.name,
+                "code": c.code,
+                "category_id": c.category_id,
+                "subcategory_id": c.subcategory_id,
+                "budget_id": c.budget_id,
+                "approved_amount": str(c.approved_amount or 0),
+            })
+
+        categories = [
+            {
+                "id": c.id,
+                "name": c.name,
+                "code": c.code,
+            }
+            for c in BudgetCategory.objects.filter(
+                id__in=category_ids,
+                org_id=opt.entity.org_id,
+                is_active=True,
+            ).order_by("name")
         ]
 
         budgets = [
@@ -153,12 +159,7 @@ def get_runtime_split_options(instance_step: WorkflowInstanceStep, user) -> dict
                 "available_amount": str(b.available_amount),
                 "currency": b.currency,
             }
-            for b in Budget.objects.filter(
-                **target_scope_filter,
-                status=BudgetStatus.ACTIVE,
-            )
-            .select_related("scope_node", "category", "subcategory")
-            .order_by("scope_node__name", "category__name", "subcategory__name")
+            for b in scoped_budgets.filter(status=BudgetStatus.ACTIVE)
         ]
 
         # Resolve eligible approvers for this entity
