@@ -6,10 +6,59 @@ User = get_user_model()
 
 
 class UserSerializer(serializers.ModelSerializer):
+    assigned_roles = serializers.SerializerMethodField()
+    is_vendor_portal_user = serializers.SerializerMethodField()
+    vendor_id = serializers.SerializerMethodField()
+    vendor_name = serializers.SerializerMethodField()
+
     class Meta:
         model = User
-        fields = ("id", "email", "first_name", "last_name", "employee_id", "is_active", "date_joined")
+        fields = (
+            "id", "email", "first_name", "last_name", "employee_id",
+            "is_active", "is_staff", "is_superuser", "date_joined",
+            "assigned_roles",
+            "is_vendor_portal_user", "vendor_id", "vendor_name",
+        )
         read_only_fields = ("id", "date_joined")
+
+    def get_assigned_roles(self, obj):
+        from apps.access.models import UserRoleAssignment
+        assignments = (
+            UserRoleAssignment.objects
+            .select_related("role")
+            .filter(user=obj, role__is_active=True)
+        )
+        seen = set()
+        result = []
+        for a in assignments:
+            if a.role.code not in seen:
+                seen.add(a.role.code)
+                result.append({"code": a.role.code, "name": a.role.name})
+        return result
+
+    def get_is_vendor_portal_user(self, obj):
+        from apps.vendors.models import UserVendorAssignment
+        return UserVendorAssignment.objects.filter(user=obj, is_active=True).exists()
+
+    def get_vendor_id(self, obj):
+        from apps.vendors.models import UserVendorAssignment
+        assignment = (
+            UserVendorAssignment.objects
+            .select_related("vendor")
+            .filter(user=obj, is_active=True)
+            .first()
+        )
+        return str(assignment.vendor_id) if assignment else None
+
+    def get_vendor_name(self, obj):
+        from apps.vendors.models import UserVendorAssignment
+        assignment = (
+            UserVendorAssignment.objects
+            .select_related("vendor")
+            .filter(user=obj, is_active=True)
+            .first()
+        )
+        return assignment.vendor.vendor_name if assignment else None
 
 
 class UserCreateSerializer(serializers.ModelSerializer):
