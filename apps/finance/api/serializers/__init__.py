@@ -76,3 +76,123 @@ class PublicFinanceTokenSerializer(serializers.Serializer):
     subject_type = serializers.CharField()
     subject_name = serializers.CharField()
     handoff_status = serializers.CharField()
+
+
+# ── Invoice Finance Review Serializers ─────────────────────────────────────────
+
+class InvoiceFinanceDocumentSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    file_name = serializers.CharField()
+    document_type = serializers.CharField()
+    uploaded_at = serializers.DateTimeField(allow_null=True)
+    url = serializers.CharField(allow_null=True)  # None if not publicly accessible
+
+
+class InvoiceFinanceVendorSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    vendor_name = serializers.CharField()
+    email = serializers.CharField(allow_null=True)
+    phone = serializers.CharField(allow_null=True)
+    gstin = serializers.CharField(allow_null=True)
+    pan = serializers.CharField(allow_null=True)
+    sap_vendor_id = serializers.CharField(allow_null=True)
+
+
+class InvoiceFinanceAllocationSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    entity_name = serializers.CharField()
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2)
+    category_name = serializers.CharField(allow_null=True)
+    subcategory_name = serializers.CharField(allow_null=True)
+    campaign_name = serializers.CharField(allow_null=True)
+    budget_name = serializers.CharField(allow_null=True)
+    selected_approver_email = serializers.CharField(allow_null=True)
+    status = serializers.CharField()
+    note = serializers.CharField(allow_null=True)
+
+
+class InvoiceFinanceWorkflowStepSerializer(serializers.Serializer):
+    name = serializers.CharField()
+    status = serializers.CharField()
+    assigned_user_email = serializers.CharField(allow_null=True)
+    acted_at = serializers.DateTimeField(allow_null=True)
+    note = serializers.CharField(allow_null=True)
+
+
+class InvoiceFinanceWorkflowBranchSerializer(serializers.Serializer):
+    entity_name = serializers.CharField()
+    status = serializers.CharField()
+    assigned_user_email = serializers.CharField(allow_null=True)
+    acted_at = serializers.DateTimeField(allow_null=True)
+    note = serializers.CharField(allow_null=True)
+
+
+class InvoiceFinanceWorkflowGroupSerializer(serializers.Serializer):
+    name = serializers.CharField()
+    status = serializers.CharField()
+    display_order = serializers.IntegerField()
+    steps = InvoiceFinanceWorkflowStepSerializer(many=True)
+    branches = InvoiceFinanceWorkflowBranchSerializer(many=True)
+
+
+class InvoiceFinanceWorkflowSerializer(serializers.Serializer):
+    instance_id = serializers.IntegerField(allow_null=True)
+    status = serializers.CharField(allow_null=True)
+    template_name = serializers.CharField(allow_null=True)
+    version_number = serializers.IntegerField(allow_null=True)
+    groups = InvoiceFinanceWorkflowGroupSerializer(many=True)
+
+
+class InvoiceFinanceTimelineEventSerializer(serializers.Serializer):
+    event_type = serializers.CharField()
+    actor_email = serializers.CharField(allow_null=True)
+    created_at = serializers.DateTimeField()
+    metadata = serializers.JSONField()
+
+
+class InvoiceFinanceHandoffDataSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    status = serializers.CharField()
+    sent_at = serializers.DateTimeField(allow_null=True)
+    created_at = serializers.DateTimeField()
+    finance_reference_id = serializers.CharField(allow_null=True)
+    recipient_count = serializers.IntegerField()
+    recipient_emails = serializers.ListField(child=serializers.CharField())
+
+
+class InvoiceFinanceInvoiceDataSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    title = serializers.CharField()
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2)
+    currency = serializers.CharField()
+    status = serializers.CharField()
+    po_number = serializers.CharField(allow_null=True)
+    vendor_invoice_number = serializers.CharField(allow_null=True)
+    invoice_date = serializers.DateField(allow_null=True)
+    due_date = serializers.DateField(allow_null=True)
+    description = serializers.CharField(allow_null=True)
+    scope_node_id = serializers.IntegerField()
+    scope_node_name = serializers.CharField()
+    created_at = serializers.DateTimeField()
+    updated_at = serializers.DateTimeField()
+
+
+class InvoiceFinanceReviewSerializer(serializers.Serializer):
+    """
+    Rich invoice finance review payload for GET /api/v1/finance/public/{token}/
+    when handoff.module == "invoice".
+    """
+    action_type = serializers.CharField()
+    is_expired = serializers.BooleanField()
+    is_used = serializers.BooleanField()
+    module = serializers.CharField()
+    subject_type = serializers.CharField()
+    subject_name = serializers.CharField()
+    handoff_status = serializers.CharField()
+    handoff = InvoiceFinanceHandoffDataSerializer()
+    invoice = InvoiceFinanceInvoiceDataSerializer()
+    vendor = InvoiceFinanceVendorSerializer(allow_null=True)
+    documents = InvoiceFinanceDocumentSerializer(many=True)
+    allocations = InvoiceFinanceAllocationSerializer(many=True)
+    workflow = InvoiceFinanceWorkflowSerializer(allow_null=True)
+    timeline = InvoiceFinanceTimelineEventSerializer(many=True)

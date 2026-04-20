@@ -18,9 +18,17 @@ from apps.dashboard.selectors import (
     get_recent_finance_handoffs,
     get_recent_vendor_submissions,
     get_insights_invoice_status_distribution,
-    get_insights_entity_volume,
+    get_insights_monthly_invoice_trend,
+    get_insights_entity_spend,
+    get_insights_category_spend,
+    get_insights_subcategory_spend,
+    get_insights_campaign_spend,
+    get_insights_budget_utilization,
+    get_insights_workflow_stage_turnaround,
     get_insights_finance_turnaround,
-    get_insights_stage_turnaround,
+    get_insights_top_vendors,
+    get_insights_risk_alerts,
+    get_insights_entity_volume,
     get_insights_bottleneck_stages,
 )
 
@@ -361,11 +369,25 @@ def get_invoice_control_tower_payload(invoice, user):
 
 
 def get_insights_payload(user):
-    """Assemble the insights payload for all analytics endpoints."""
+    """Assemble the full insights/analytics payload."""
     return {
+        # Invoice analytics
         "invoice_status_distribution": get_insights_invoice_status_distribution(user),
-        "entity_volume": get_insights_entity_volume(user),
-        "finance_turnaround": get_insights_finance_turnaround(user),
-        "stage_turnaround": get_insights_stage_turnaround(user),
+        "monthly_invoice_trend": get_insights_monthly_invoice_trend(user),
+        "entity_spend": get_insights_entity_spend(user),
+        "category_spend": get_insights_category_spend(user),
+        "subcategory_spend": get_insights_subcategory_spend(user),
+        "campaign_spend": get_insights_campaign_spend(user),
+        "budget_utilization": get_insights_budget_utilization(user),
+        # Workflow analytics
+        "stage_turnaround": get_insights_workflow_stage_turnaround(user),
         "bottleneck_stages": get_insights_bottleneck_stages(user),
+        # Finance analytics
+        "finance_turnaround": get_insights_finance_turnaround(user),
+        # Vendor analytics
+        "top_vendors": get_insights_top_vendors(user),
+        # Alerts
+        "risk_alerts": get_insights_risk_alerts(user),
+        # Legacy (kept for backwards compat)
+        "entity_volume": get_insights_entity_volume(user),
     }

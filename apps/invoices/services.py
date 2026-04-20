@@ -554,8 +554,12 @@ def validate_invoice_submission(submission: VendorInvoiceSubmission) -> list[dic
 def update_invoice_submission_fields(submission: VendorInvoiceSubmission, normalized_data: dict) -> VendorInvoiceSubmission:
     """Update normalized_data and re-validate. Returns updated submission."""
     submission.normalized_data = normalized_data
-    submission.validation_errors = []
-    submission.status = VendorInvoiceSubmissionStatus.NEEDS_CORRECTION
+    submission.validation_errors = validate_invoice_submission(submission)
+    submission.status = (
+        VendorInvoiceSubmissionStatus.NEEDS_CORRECTION
+        if submission.validation_errors
+        else VendorInvoiceSubmissionStatus.READY
+    )
     submission.save(update_fields=["normalized_data", "validation_errors", "status", "updated_at"])
     return submission
 

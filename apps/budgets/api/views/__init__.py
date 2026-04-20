@@ -3,6 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
+from rest_framework.views import APIView
 
 from apps.budgets.models import (
     BudgetCategory,
@@ -37,6 +38,7 @@ from apps.budgets.services import (
     BudgetLimitExceeded,
     BudgetNotActiveError,
 )
+from apps.budgets.selectors import get_budgets_overview
 from apps.access.selectors import (
     get_user_actionable_scope_ids,
     get_user_actionable_org_ids,
@@ -466,3 +468,17 @@ class BudgetVarianceRequestViewSet(ModelViewSet):
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response(BudgetVarianceRequestSerializer(updated).data)
+
+
+# ---------------------------------------------------------------------------
+# Budget Overview (analytics dashboard)
+# ---------------------------------------------------------------------------
+
+class BudgetOverviewView(APIView):
+    """GET /api/v1/budgets/overview/ — aggregated budget analytics."""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        payload = get_budgets_overview(request.user)
+        return Response(payload)
+

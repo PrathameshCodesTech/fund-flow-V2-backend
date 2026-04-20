@@ -21,6 +21,22 @@ class ParallelMode(models.TextChoices):
 class RejectionAction(models.TextChoices):
     TERMINATE = "TERMINATE", "Terminate"
     GO_TO_GROUP = "GO_TO_GROUP", "Go To Group"
+    PREVIOUS_STAGE = "PREVIOUS_STAGE", "Previous Stage"
+    RETURN_TO_SPLITTER = "RETURN_TO_SPLITTER", "Return To Splitter"
+    RETURN_TO_SUBMITTER = "RETURN_TO_SUBMITTER", "Return To Submitter"
+    BRANCH_CORRECTION = "BRANCH_CORRECTION", "Branch Correction"
+
+
+class AssignmentMode(models.TextChoices):
+    ROLE_RESOLVED = "ROLE_RESOLVED", "Role Resolved"
+    EXPLICIT_USER = "EXPLICIT_USER", "Explicit User"
+    APPROVER_POOL = "APPROVER_POOL", "Approver Pool"
+    RUNTIME_SELECTED_FROM_POOL = "RUNTIME_SELECTED_FROM_POOL", "Runtime Selected From Pool"
+
+
+class AllocationTotalPolicy(models.TextChoices):
+    MUST_EQUAL_INVOICE_TOTAL = "MUST_EQUAL_INVOICE_TOTAL", "Must Equal Invoice Total"
+    CAN_BE_PARTIAL = "CAN_BE_PARTIAL", "Can Be Partial"
 
 
 class ScopeResolutionPolicy(models.TextChoices):
@@ -43,6 +59,7 @@ class StepKind(models.TextChoices):
     NORMAL_APPROVAL = "NORMAL_APPROVAL", "Normal Approval"
     SPLIT_BY_SCOPE = "SPLIT_BY_SCOPE", "Split By Scope"
     JOIN_BRANCHES = "JOIN_BRANCHES", "Join Branches"
+    RUNTIME_SPLIT_ALLOCATION = "RUNTIME_SPLIT_ALLOCATION", "Runtime Split Allocation"
 
 
 class BranchStatus(models.TextChoices):
@@ -99,6 +116,11 @@ class WorkflowEventType(models.TextChoices):
     BRANCH_REASSIGNED = "BRANCH_REASSIGNED", "Branch Reassigned"
     BRANCHES_SPLIT = "BRANCHES_SPLIT", "Branches Split"
     BRANCHES_JOINED = "BRANCHES_JOINED", "Branches Joined"
+    SPLIT_ALLOCATIONS_SUBMITTED = "SPLIT_ALLOCATIONS_SUBMITTED", "Split Allocations Submitted"
+    SPLIT_ALLOCATION_CORRECTED = "SPLIT_ALLOCATION_CORRECTED", "Split Allocation Corrected"
+    ALLOCATION_BUDGET_RESERVED = "ALLOCATION_BUDGET_RESERVED", "Allocation Budget Reserved"
+    ALLOCATION_BUDGET_RELEASED = "ALLOCATION_BUDGET_RELEASED", "Allocation Budget Released"
+    ALLOCATION_BUDGET_CONSUMED = "ALLOCATION_BUDGET_CONSUMED", "Allocation Budget Consumed"
 
 
 class AssignmentState(models.TextChoices):
@@ -335,6 +357,27 @@ class WorkflowStep(models.Model):
         default="",
         help_text="Used when step_kind=JOIN_BRANCHES to determine when join completes",
     )
+    # --- Runtime split allocation config (step_kind=RUNTIME_SPLIT_ALLOCATION) ---
+    allocation_total_policy = models.CharField(
+        max_length=30,
+        choices=AllocationTotalPolicy.choices,
+        default=AllocationTotalPolicy.MUST_EQUAL_INVOICE_TOTAL,
+        help_text="Validation rule for total allocated amount vs invoice amount",
+    )
+    approver_selection_mode = models.CharField(
+        max_length=30,
+        choices=AssignmentMode.choices,
+        default=AssignmentMode.RUNTIME_SELECTED_FROM_POOL,
+        help_text="How branch approvers are selected at split time",
+    )
+    require_category = models.BooleanField(default=False, help_text="Allocation must have a budget category")
+    require_subcategory = models.BooleanField(default=False, help_text="Allocation must have a budget subcategory")
+    require_budget = models.BooleanField(default=False, help_text="Allocation must be linked to a budget")
+    require_campaign = models.BooleanField(default=False, help_text="Allocation must be linked to a campaign")
+    allow_multiple_lines_per_entity = models.BooleanField(
+        default=False,
+        help_text="Allow more than one allocation row for the same entity",
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -343,6 +386,88 @@ class WorkflowStep(models.Model):
 
     def __str__(self):
         return f"Step: {self.name} [{self.group}]"
+
+
+# ---------------------------------------------------------------------------
+# Runtime Split Allocation Config
+# ---------------------------------------------------------------------------
+
+class WorkflowSplitOption(models.Model):
+    """
+    Per-entity approver pool and budget config for a RUNTIME_SPLIT_ALLOCATION step.
+    Configures which entities are available, which roles/users can approve each entity,
+    and optional default budget/category/campaign mappings.
+    """
+    workflow_step = models.ForeignKey(
+        WorkflowStep,
+        on_delete=models.CASCADE,
+        related_name="split_options",
+    )
+    entity = models.ForeignKey(
+        "core.ScopeNode",
+        on_delete=models.CASCADE,
+        related_name="split_options",
+    )
+    approver_role = models.ForeignKey(
+        "access.Role",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="split_options",
+    )
+    allowed_approvers = models.ManyToManyField(
+        settings.AUTH_USER_MODEL,
+        blank=True,
+        related_name="allowed_split_options",
+        help_text="Explicit approver pool; overrides role if both are set",
+    )
+    category = models.ForeignKey(
+        "budgets.BudgetCategory",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="split_options",
+    )
+    subcategory = models.ForeignKey(
+        "budgets.BudgetSubCategory",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="split_options",
+    )
+    campaign = models.ForeignKey(
+        "campaigns.Campaign",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="split_options",
+    )
+    budget = models.ForeignKey(
+        "budgets.Budget",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="split_options",
+    )
+    is_active = models.BooleanField(default=True)
+    display_order = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "workflow_split_options"
+        ordering = ["display_order"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["workflow_step", "entity"],
+                name="unique_split_option_per_step_per_entity",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["workflow_step", "is_active"]),
+        ]
+
+    def __str__(self):
+        return f"SplitOption step={self.workflow_step_id} entity={self.entity_id}"
 
 
 # ---------------------------------------------------------------------------

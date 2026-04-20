@@ -14,10 +14,13 @@ Subject sync:
     via sync_subject_on_finance_change(). This is called at the end of
     every handoff state transition.
 """
+import logging
 import os
 import secrets
 from datetime import timedelta
 from pathlib import Path
+
+_logger = logging.getLogger(__name__)
 from typing import Optional
 
 from django.conf import settings
@@ -543,6 +546,9 @@ def finance_approve_handoff(
     # Sync subject status
     sync_subject_on_finance_change(handoff)
 
+    # Send notifications (non-fatal)
+    _notify_finance_decision(handoff, decision)
+
     _build_audit_log(
         user=None,
         action="finance_handoff_approved",
@@ -609,6 +615,9 @@ def finance_reject_handoff(
 
     # Sync subject status
     sync_subject_on_finance_change(handoff)
+
+    # Send notifications (non-fatal)
+    _notify_finance_decision(handoff, decision)
 
     _build_audit_log(
         user=None,
@@ -691,4 +700,42 @@ def _get_valid_finance_token(
         raise TokenError("This token has expired.")
 
     return token
+
+
+# ---------------------------------------------------------------------------
+# Notification dispatcher
+# ---------------------------------------------------------------------------
+
+def _notify_finance_decision(handoff: FinanceHandoff, decision: FinanceDecision) -> None:
+    """
+    Route finance decision notifications to the appropriate module handler.
+    Notification failures are non-fatal — callers must not roll back on email error.
+    """
+    if handoff.module == "invoice":
+        _notify_invoice_finance_decision(handoff, decision)
+
+
+def _notify_invoice_finance_decision(handoff: FinanceHandoff, decision: FinanceDecision) -> None:
+    """Send invoice finance approval/rejection email notifications."""
+    from apps.invoices.models import Invoice
+    try:
+        invoice = Invoice.objects.select_related("vendor").get(pk=handoff.subject_id)
+    except Invoice.DoesNotExist:
+        _logger.warning("Cannot send invoice finance notification: Invoice %s not found.", handoff.subject_id)
+        return
+
+    try:
+        from apps.finance.notifications import (
+            notify_invoice_finance_approval,
+            notify_invoice_finance_rejection,
+        )
+        if decision.decision == FinanceDecisionChoice.APPROVED:
+            notify_invoice_finance_approval(invoice, decision.reference_id)
+        elif decision.decision == FinanceDecisionChoice.REJECTED:
+            notify_invoice_finance_rejection(invoice, decision.note)
+    except Exception as exc:
+        _logger.warning(
+            "Invoice finance notification failed for handoff %s, decision %s: %s",
+            handoff.pk, decision.pk, exc,
+        )
 

@@ -293,6 +293,60 @@ class InvoiceViewSet(ModelViewSet):
             },
         }, status=status.HTTP_201_CREATED)
 
+    @action(detail=True, methods=["get"], url_path="allocations")
+    def allocations(self, request, pk=None):
+        """
+        GET /api/v1/invoices/{id}/allocations/
+        Returns all InvoiceAllocation rows for this invoice (runtime split context).
+        """
+        invoice = self.get_object()
+        from apps.invoices.models import InvoiceAllocation
+        qs = (
+            InvoiceAllocation.objects
+            .filter(invoice=invoice)
+            .select_related(
+                "entity", "category", "subcategory", "campaign", "budget",
+                "selected_approver", "branch", "split_step__workflow_step",
+            )
+            .order_by("id")
+        )
+        data = []
+        for a in qs:
+            data.append({
+                "id": a.id,
+                "entity_id": a.entity_id,
+                "entity_name": a.entity.name if a.entity else None,
+                "category_id": a.category_id,
+                "category_name": a.category.name if a.category else None,
+                "subcategory_id": a.subcategory_id,
+                "subcategory_name": a.subcategory.name if a.subcategory else None,
+                "campaign_id": a.campaign_id,
+                "campaign_name": a.campaign.name if a.campaign else None,
+                "budget_id": a.budget_id,
+                "amount": str(a.amount),
+                "percentage": str(a.percentage) if a.percentage else None,
+                "selected_approver": {
+                    "id": a.selected_approver.id,
+                    "email": a.selected_approver.email,
+                    "first_name": a.selected_approver.first_name,
+                    "last_name": a.selected_approver.last_name,
+                } if a.selected_approver else None,
+                "status": a.status,
+                "rejection_reason": a.rejection_reason,
+                "note": a.note,
+                "branch_id": a.branch_id,
+                "branch_status": a.branch.status if a.branch else None,
+                "split_step_id": a.split_step_id,
+                "split_step_name": a.split_step.workflow_step.name if a.split_step else None,
+                "revision_number": a.revision_number,
+                "selected_by_id": a.selected_by_id,
+                "selected_at": a.selected_at,
+                "approved_at": a.approved_at,
+                "rejected_at": a.rejected_at,
+                "created_at": a.created_at,
+            })
+        return Response(data)
+
     @action(detail=True, methods=["get"], url_path="control-tower")
     def control_tower(self, request, pk=None):
         """

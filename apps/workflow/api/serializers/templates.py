@@ -17,6 +17,9 @@ class WorkflowStepSerializer(serializers.ModelSerializer):
             "scope_resolution_policy", "ancestor_node_type",
             "fixed_scope_node", "default_user", "display_order",
             "step_kind", "split_target_nodes", "split_target_mode", "join_policy",
+            "allocation_total_policy", "approver_selection_mode",
+            "require_category", "require_subcategory", "require_budget",
+            "require_campaign", "allow_multiple_lines_per_entity",
             "created_at",
         )
         read_only_fields = ("id", "created_at")

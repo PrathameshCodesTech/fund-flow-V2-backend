@@ -7,6 +7,7 @@ from apps.budgets.api.views import (
     BudgetRuleViewSet,
     BudgetConsumptionViewSet,
     BudgetVarianceRequestViewSet,
+    BudgetOverviewView,
 )
 
 # Register specific prefixes first so they are matched before the greedy
@@ -21,5 +22,6 @@ router.register("variance-requests", BudgetVarianceRequestViewSet, basename="bud
 router.register("", BudgetViewSet, basename="budget")
 
 urlpatterns = [
+    path("overview/", BudgetOverviewView.as_view(), name="budgets-overview"),
     path("", include(router.urls)),
 ]

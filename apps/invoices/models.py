@@ -194,6 +194,175 @@ class VendorInvoiceSubmission(models.Model):
         return f"VendorInvoiceSubmission {self.id} [{self.status}]"
 
 
+# ---------------------------------------------------------------------------
+# Invoice Allocation (runtime split)
+# ---------------------------------------------------------------------------
+
+class InvoiceAllocationStatus(models.TextChoices):
+    DRAFT = "draft", "Draft"
+    SUBMITTED = "submitted", "Submitted"
+    BRANCH_PENDING = "branch_pending", "Branch Pending"
+    APPROVED = "approved", "Approved"
+    REJECTED = "rejected", "Rejected"
+    CORRECTION_REQUIRED = "correction_required", "Correction Required"
+    CANCELLED = "cancelled", "Cancelled"
+
+
+class InvoiceAllocation(models.Model):
+    """
+    First-class business object representing one line of a runtime invoice split.
+    Created when the assigned splitter submits allocation lines at a
+    RUNTIME_SPLIT_ALLOCATION workflow step. One allocation = one branch task.
+    """
+    invoice = models.ForeignKey(
+        "invoices.Invoice",
+        on_delete=models.CASCADE,
+        related_name="allocations",
+    )
+    workflow_instance = models.ForeignKey(
+        "workflow.WorkflowInstance",
+        on_delete=models.CASCADE,
+        related_name="invoice_allocations",
+    )
+    split_step = models.ForeignKey(
+        "workflow.WorkflowInstanceStep",
+        on_delete=models.CASCADE,
+        related_name="invoice_allocations",
+        help_text="The RUNTIME_SPLIT_ALLOCATION instance step that owns this allocation",
+    )
+    branch = models.OneToOneField(
+        "workflow.WorkflowInstanceBranch",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="invoice_allocation",
+        help_text="Branch task created for this allocation",
+    )
+    entity = models.ForeignKey(
+        "core.ScopeNode",
+        on_delete=models.PROTECT,
+        related_name="invoice_allocations",
+        help_text="The scope node (entity) this allocation is assigned to",
+    )
+    category = models.ForeignKey(
+        "budgets.BudgetCategory",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="invoice_allocations",
+    )
+    subcategory = models.ForeignKey(
+        "budgets.BudgetSubCategory",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="invoice_allocations",
+    )
+    campaign = models.ForeignKey(
+        "campaigns.Campaign",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="invoice_allocations",
+    )
+    budget = models.ForeignKey(
+        "budgets.Budget",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="invoice_allocations",
+    )
+    amount = models.DecimalField(max_digits=14, decimal_places=2)
+    percentage = models.DecimalField(max_digits=6, decimal_places=3, null=True, blank=True)
+    selected_approver = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="approver_allocations",
+    )
+    status = models.CharField(
+        max_length=25,
+        choices=InvoiceAllocationStatus.choices,
+        default=InvoiceAllocationStatus.DRAFT,
+    )
+    selected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="selected_allocations",
+    )
+    selected_at = models.DateTimeField(null=True, blank=True)
+    approved_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="approved_allocations",
+    )
+    approved_at = models.DateTimeField(null=True, blank=True)
+    rejected_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="rejected_allocations",
+    )
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    rejection_reason = models.TextField(blank=True)
+    note = models.TextField(blank=True)
+    revision_number = models.PositiveIntegerField(default=1)
+    metadata = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "invoice_allocations"
+        indexes = [
+            models.Index(fields=["invoice", "status"]),
+            models.Index(fields=["workflow_instance"]),
+            models.Index(fields=["entity", "status"]),
+            models.Index(fields=["budget", "status"]),
+        ]
+
+    def __str__(self):
+        return f"Allocation {self.id}: invoice={self.invoice_id} entity={self.entity_id} amount={self.amount} [{self.status}]"
+
+
+class InvoiceAllocationRevision(models.Model):
+    """Snapshot of an InvoiceAllocation at the time of each correction cycle."""
+    allocation = models.ForeignKey(
+        InvoiceAllocation,
+        on_delete=models.CASCADE,
+        related_name="revisions",
+    )
+    revision_number = models.PositiveIntegerField()
+    snapshot = models.JSONField(help_text="Full allocation field snapshot at this revision")
+    changed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="allocation_revisions",
+    )
+    changed_at = models.DateTimeField(auto_now_add=True)
+    change_reason = models.TextField(blank=True)
+
+    class Meta:
+        db_table = "invoice_allocation_revisions"
+        ordering = ["revision_number"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["allocation", "revision_number"],
+                name="unique_revision_per_allocation",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Revision {self.revision_number} for Allocation {self.allocation_id}"
+
+
 class InvoiceDocumentType(models.TextChoices):
     INVOICE_PDF = "invoice_pdf", "Invoice PDF"
     INVOICE_EXCEL = "invoice_excel", "Invoice Excel"

@@ -476,6 +476,34 @@ class WorkflowInstanceStepViewSet(ModelViewSet):
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(WorkflowInstanceStepSerializer(instance_step).data)
 
+    @action(detail=True, methods=["get"], url_path="split-options")
+    def split_options(self, request, pk=None):
+        """GET /instance-steps/{id}/split-options/ — fetch allowed entities and approvers for a RUNTIME_SPLIT_ALLOCATION step."""
+        instance_step = self.get_object()
+        from apps.workflow.services_split import get_runtime_split_options
+        from apps.workflow.services import StepActionError
+        try:
+            data = get_runtime_split_options(instance_step, request.user)
+        except StepActionError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(data)
+
+    @action(detail=True, methods=["post"], url_path="submit-split")
+    def submit_split(self, request, pk=None):
+        """POST /instance-steps/{id}/submit-split/ — submit runtime invoice split allocations."""
+        instance_step = self.get_object()
+        allocations_payload = request.data.get("allocations", [])
+        note = request.data.get("note", "")
+        if not isinstance(allocations_payload, list):
+            return Response({"detail": "allocations must be a list."}, status=status.HTTP_400_BAD_REQUEST)
+        from apps.workflow.services_split import submit_runtime_invoice_split
+        from apps.workflow.services import StepActionError
+        try:
+            result = submit_runtime_invoice_split(instance_step, actor=request.user, allocations_payload=allocations_payload, note=note)
+        except StepActionError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result, status=status.HTTP_201_CREATED)
+
     @action(detail=True, methods=["post"], url_path="assign")
     def assign(self, request, pk=None):
         """
@@ -796,6 +824,52 @@ class TaskReviewView(APIView):
             return self._build_invoice_subject(instance)
         return {"type": instance.subject_type, "missing": False}
 
+    def _build_allocation_context(self, instance_step):
+        """Return existing allocations + step config for a RUNTIME_SPLIT_ALLOCATION step."""
+        from apps.invoices.models import InvoiceAllocation
+        allocations = (
+            InvoiceAllocation.objects
+            .filter(split_step=instance_step)
+            .select_related("entity", "category", "subcategory", "campaign", "budget", "selected_approver")
+            .order_by("id")
+        )
+        step = instance_step.workflow_step
+        return {
+            "is_runtime_split": True,
+            "step_config": {
+                "allocation_total_policy": step.allocation_total_policy,
+                "require_category": step.require_category,
+                "require_subcategory": step.require_subcategory,
+                "require_budget": step.require_budget,
+                "require_campaign": step.require_campaign,
+                "allow_multiple_lines_per_entity": step.allow_multiple_lines_per_entity,
+                "approver_selection_mode": step.approver_selection_mode,
+            },
+            "allocations": [
+                {
+                    "id": a.id,
+                    "entity_id": a.entity_id,
+                    "entity_name": a.entity.name if a.entity else None,
+                    "amount": str(a.amount),
+                    "percentage": str(a.percentage) if a.percentage else None,
+                    "category_id": a.category_id,
+                    "category_name": a.category.name if a.category else None,
+                    "subcategory_id": a.subcategory_id,
+                    "subcategory_name": a.subcategory.name if a.subcategory else None,
+                    "campaign_id": a.campaign_id,
+                    "campaign_name": a.campaign.name if a.campaign else None,
+                    "budget_id": a.budget_id,
+                    "selected_approver": self._user_dict(a.selected_approver),
+                    "status": a.status,
+                    "rejection_reason": a.rejection_reason,
+                    "note": a.note,
+                    "branch_id": a.branch_id,
+                    "revision_number": a.revision_number,
+                }
+                for a in allocations
+            ],
+        }
+
     # ── Step review ──────────────────────────────────────────────────────────
 
     def _step_review(self, request, pk):
@@ -839,11 +913,17 @@ class TaskReviewView(APIView):
             "created_at": ist.created_at,
         }
 
+        # Include split allocation context for RUNTIME_SPLIT_ALLOCATION steps
+        allocation_context = None
+        if ist.workflow_step.step_kind == StepKind.RUNTIME_SPLIT_ALLOCATION:
+            allocation_context = self._build_allocation_context(ist)
+
         return Response({
             "task": task_data,
             "subject": self._build_subject(instance),
             "workflow": self._build_workflow_context(instance, current_step_id=ist.id),
             "timeline": self._build_timeline(instance),
+            "allocation_context": allocation_context,
         })
 
     # ── Branch review ────────────────────────────────────────────────────────
@@ -892,6 +972,33 @@ class TaskReviewView(APIView):
             "created_at": branch.created_at,
         }
 
+        # Include allocation info if this branch is from a RUNTIME_SPLIT_ALLOCATION step
+        branch_allocation = None
+        if branch.parent_instance_step.workflow_step.step_kind == StepKind.RUNTIME_SPLIT_ALLOCATION:
+            try:
+                from apps.invoices.models import InvoiceAllocation
+                alloc = branch.invoice_allocation
+                branch_allocation = {
+                    "id": alloc.id,
+                    "entity_id": alloc.entity_id,
+                    "entity_name": alloc.entity.name if alloc.entity else None,
+                    "amount": str(alloc.amount),
+                    "percentage": str(alloc.percentage) if alloc.percentage else None,
+                    "category_id": alloc.category_id,
+                    "category_name": alloc.category.name if alloc.category else None,
+                    "subcategory_id": alloc.subcategory_id,
+                    "subcategory_name": alloc.subcategory.name if alloc.subcategory else None,
+                    "campaign_id": alloc.campaign_id,
+                    "campaign_name": alloc.campaign.name if alloc.campaign else None,
+                    "budget_id": alloc.budget_id,
+                    "status": alloc.status,
+                    "rejection_reason": alloc.rejection_reason,
+                    "note": alloc.note,
+                    "revision_number": alloc.revision_number,
+                }
+            except Exception:
+                branch_allocation = None
+
         return Response({
             "task": task_data,
             "subject": self._build_subject(instance),
@@ -901,6 +1008,7 @@ class TaskReviewView(APIView):
                 current_branch_id=branch.id,
             ),
             "timeline": self._build_timeline(instance),
+            "branch_allocation": branch_allocation,
         })
 
 

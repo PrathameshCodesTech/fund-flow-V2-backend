@@ -52,6 +52,51 @@ class StepActionError(ValueError):
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _consume_allocation_budgets(instance, actor):
+    """Consume reserved budget for all approved allocations when instance is finally approved."""
+    from apps.invoices.models import InvoiceAllocation, InvoiceAllocationStatus
+    from apps.budgets.models import SourceType
+    from apps.budgets.services import consume_reserved_budget
+    from apps.workflow.models import WorkflowEventType
+
+    for alloc in InvoiceAllocation.objects.filter(
+        workflow_instance=instance,
+        status=InvoiceAllocationStatus.APPROVED,
+    ).select_related("budget"):
+        if not alloc.budget_id:
+            continue
+        source_id = f"invoice:{alloc.invoice_id}:allocation:{alloc.id}"
+        try:
+            consume_reserved_budget(
+                budget=alloc.budget,
+                source_type=SourceType.INVOICE,
+                source_id=source_id,
+                consumed_by=actor,
+                note=f"Final invoice approval — allocation {alloc.id}",
+            )
+            _emit_event(
+                instance,
+                WorkflowEventType.ALLOCATION_BUDGET_CONSUMED,
+                actor,
+                metadata={"allocation_id": alloc.id, "budget_id": alloc.budget_id},
+            )
+        except Exception as e:
+            # Record failure in allocation metadata for finance visibility
+            alloc.metadata = {**alloc.metadata, "budget_consume_error": str(e)}
+            alloc.save(update_fields=["metadata"])
+            _emit_event(
+                instance,
+                WorkflowEventType.ALLOCATION_BUDGET_RELEASED,  # reuse event for failure signal
+                actor,
+                metadata={
+                    "allocation_id": alloc.id,
+                    "budget_id": alloc.budget_id,
+                    "consume_failed": True,
+                    "error": str(e),
+                },
+            )
+
+
 def _emit_event(instance, event_type, actor_user, target_user=None, metadata=None):
     """Create a WorkflowEvent and an in_app NotificationDelivery in one call."""
     event = WorkflowEvent.objects.create(
@@ -84,10 +129,11 @@ def _assert_step_actionable(instance_step):
             f"its status is '{instance_step.status}', expected WAITING or WAITING_BRANCHES."
         )
     if instance_step.status == StepStatus.WAITING_BRANCHES:
-        raise StepActionError(
-            f"Step {instance_step.id} is a SPLIT_BY_SCOPE step and cannot be "
-            f"acted on directly — use branch approve/reject endpoints."
-        )
+        if instance_step.workflow_step.step_kind != StepKind.RUNTIME_SPLIT_ALLOCATION:
+            raise StepActionError(
+                f"Step {instance_step.id} is a SPLIT_BY_SCOPE step and cannot be "
+                f"acted on directly — use branch approve/reject endpoints."
+            )
     if not instance_step.assigned_user_id:
         raise StepActionError(f"Step {instance_step.id} has no assigned user.")
 
@@ -124,6 +170,8 @@ def _advance_on_group_complete(group, instance, acted_by):
         instance.save(update_fields=["status", "completed_at"])
         _emit_event(instance, WorkflowEventType.INSTANCE_APPROVED, acted_by)
         _sync_subject_status_on_workflow_change(instance)
+        # Consume budgets for all approved allocations on final approval
+        _consume_allocation_budgets(instance, acted_by)
 
 
 def _activate_group_entry_steps(group, instance, actor_user):
@@ -137,6 +185,18 @@ def _activate_group_entry_steps(group, instance, actor_user):
     ):
         if ist.workflow_step.step_kind == StepKind.SPLIT_BY_SCOPE:
             split_instance_step(ist)
+            continue
+
+        # RUNTIME_SPLIT_ALLOCATION waits for the assigned splitter — emit assignment event
+        if ist.workflow_step.step_kind == StepKind.RUNTIME_SPLIT_ALLOCATION:
+            if ist.assigned_user_id:
+                _emit_event(
+                    instance,
+                    WorkflowEventType.STEP_ASSIGNED,
+                    actor_user,
+                    target_user=ist.assigned_user,
+                    metadata={"instance_step_id": ist.id, "workflow_step_id": ist.workflow_step_id, "kind": "RUNTIME_SPLIT_ALLOCATION"},
+                )
             continue
 
         if ist.assigned_user_id:
@@ -1053,6 +1113,14 @@ def approve_workflow_branch(branch: WorkflowInstanceBranch, acted_by, note=""):
     branch.note = note
     branch.save(update_fields=["status", "acted_at", "note"])
 
+    # Update linked allocation status for RUNTIME_SPLIT_ALLOCATION branches.
+    allocation = getattr(branch, "invoice_allocation", None)
+    if allocation:
+        allocation.status = "approved"
+        allocation.approved_by = acted_by
+        allocation.approved_at = now
+        allocation.save(update_fields=["status", "approved_by", "approved_at"])
+
     _emit_event(
         instance,
         WorkflowEventType.BRANCH_APPROVED,
@@ -1128,11 +1196,11 @@ def reject_workflow_branch(branch: WorkflowInstanceBranch, acted_by, note=""):
     - Branch must be PENDING.
     - Actor must be the branch's assigned_user.
 
-    Rejection policy: ANY_BRANCH_REJECTS_RETURNS_TO_SPLIT_OWNER
-    - Mark branch REJECTED.
-    - Emit BRANCH_REJECTED event.
-    - Immediately terminate the entire instance (reject the split step).
-    - Notify the split owner.
+    For RUNTIME_SPLIT_ALLOCATION branches: delegates to handle_runtime_split_branch_rejection
+    which honors the configured rejection_action (BRANCH_CORRECTION returns to splitter;
+    TERMINATE kills the instance).
+
+    For legacy SPLIT_BY_SCOPE branches: terminates the instance (original behavior).
     """
     if branch.status != BranchStatus.PENDING:
         raise StepActionError(
@@ -1152,6 +1220,15 @@ def reject_workflow_branch(branch: WorkflowInstanceBranch, acted_by, note=""):
     branch.rejection_reason = note
     branch.save(update_fields=["status", "acted_at", "note", "rejection_reason"])
 
+    parent_step = branch.parent_instance_step
+
+    # Runtime split allocation branches use configurable rejection behavior
+    if parent_step.workflow_step.step_kind == StepKind.RUNTIME_SPLIT_ALLOCATION:
+        from apps.workflow.services_split import handle_runtime_split_branch_rejection
+        handle_runtime_split_branch_rejection(branch, acted_by, note)
+        return branch
+
+    # Legacy SPLIT_BY_SCOPE: terminate on rejection (original behavior)
     _emit_event(
         instance,
         WorkflowEventType.BRANCH_REJECTED,
@@ -1159,8 +1236,6 @@ def reject_workflow_branch(branch: WorkflowInstanceBranch, acted_by, note=""):
         metadata={"branch_id": branch.id, "note": note},
     )
 
-    # Rejection policy: terminate instance, return to split owner
-    parent_step = branch.parent_instance_step
     parent_step.status = StepStatus.REJECTED
     parent_step.acted_at = now
     parent_step.note = note

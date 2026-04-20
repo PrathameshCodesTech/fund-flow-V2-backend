@@ -15,6 +15,7 @@ from apps.workflow.api.views.instances import (
     MyTasksView,
     TaskReviewView,
 )
+from apps.workflow.api.views.split_options import WorkflowSplitOptionViewSet
 
 router = DefaultRouter()
 router.register("templates", WorkflowTemplateViewSet, basename="workflowtemplate")
@@ -25,6 +26,7 @@ router.register("instances", WorkflowInstanceViewSet, basename="workflowinstance
 router.register("instance-groups", WorkflowInstanceGroupViewSet, basename="workflowinstancegroup")
 router.register("instance-steps", WorkflowInstanceStepViewSet, basename="workflowinstancestep")
 router.register("branches", WorkflowInstanceBranchViewSet, basename="workflowinstancebranch")
+router.register("split-options", WorkflowSplitOptionViewSet, basename="workflowsplitoption")
 
 urlpatterns = [
     path("", include(router.urls)),
