@@ -4,7 +4,8 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
 from rest_framework.views import APIView
-from django.db.models import Q
+from django.db.models import Q, Sum
+from decimal import Decimal
 
 from apps.workflow.models import (
     WorkflowInstance, WorkflowInstanceGroup, WorkflowInstanceStep, InstanceStatus,
@@ -504,6 +505,38 @@ class WorkflowInstanceStepViewSet(ModelViewSet):
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(result, status=status.HTTP_201_CREATED)
 
+    @action(detail=True, methods=["get"], url_path="single-allocation-options")
+    def single_allocation_options(self, request, pk=None):
+        """GET /instance-steps/{id}/single-allocation-options/ — fetch entities, categories, budgets for a SINGLE_ALLOCATION step."""
+        instance_step = self.get_object()
+        from apps.workflow.services_allocation import get_single_allocation_options
+        from apps.workflow.services import StepActionError
+        try:
+            data = get_single_allocation_options(instance_step, request.user)
+        except StepActionError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(data)
+
+    @action(detail=True, methods=["post"], url_path="submit-single-allocation")
+    def submit_single_allocation(self, request, pk=None):
+        """POST /instance-steps/{id}/submit-single-allocation/ — submit a single invoice allocation covering the full amount."""
+        instance_step = self.get_object()
+        payload = request.data.get("allocation", {})
+        note = request.data.get("note", "")
+        if not isinstance(payload, dict):
+            return Response({"detail": "allocation must be an object."}, status=status.HTTP_400_BAD_REQUEST)
+        from apps.workflow.services_allocation import submit_single_invoice_allocation
+        from apps.workflow.services import StepActionError, AllocationCoverageError
+        try:
+            result = submit_single_invoice_allocation(
+                instance_step, actor=request.user, payload=payload, note=note
+            )
+        except AllocationCoverageError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_422_UNPROCESSABLE_ENTITY)
+        except StepActionError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(result, status=status.HTTP_201_CREATED)
+
     @action(detail=True, methods=["post"], url_path="assign")
     def assign(self, request, pk=None):
         """
@@ -744,7 +777,7 @@ class TaskReviewView(APIView):
             })
         return result
 
-    def _build_invoice_subject(self, instance):
+    def _build_invoice_subject(self, request, instance):
         """Fetch and shape invoice + vendor + documents for the review payload."""
         from apps.invoices.models import Invoice, InvoiceDocument
         from apps.vendors.models import Vendor
@@ -752,7 +785,7 @@ class TaskReviewView(APIView):
         try:
             invoice = (
                 Invoice.objects
-                .select_related("scope_node", "created_by", "vendor", "vendor__onboarding_submission")
+                .select_related("scope_node", "created_by", "vendor", "vendor__onboarding_submission", "submission")
                 .prefetch_related("documents__submission")
                 .get(pk=instance.subject_id)
             )
@@ -802,13 +835,34 @@ class TaskReviewView(APIView):
 
         # Documents
         docs = []
+        seen_source_keys = set()
+        submission = getattr(invoice, "submission", None)
+        if submission and (submission.source_file or submission.source_file_name):
+            source_doc_type = "invoice_pdf" if submission.source_file_type == "pdf" else "invoice_excel"
+            source_key = (submission.source_file_name, source_doc_type)
+            seen_source_keys.add(source_key)
+            docs.append({
+                "id": f"submission-source-{submission.id}",
+                "document_type": source_doc_type,
+                "file_name": submission.source_file_name or "Original invoice file",
+                "file_type": submission.source_file_type,
+                "has_file": bool(submission.source_file),
+                "is_source_file": True,
+                "file_url": request.build_absolute_uri(submission.source_file.url) if submission.source_file else None,
+            })
+
         for doc in invoice.documents.order_by("-created_at"):
+            doc_key = (doc.file_name, doc.document_type)
+            if doc_key in seen_source_keys:
+                continue
             docs.append({
                 "id": doc.id,
                 "document_type": doc.document_type,
                 "file_name": doc.file_name,
                 "file_type": doc.file_type,
                 "has_file": bool(doc.file),
+                "is_source_file": False,
+                "file_url": request.build_absolute_uri(doc.file.url) if doc.file else None,
             })
 
         return {
@@ -819,13 +873,13 @@ class TaskReviewView(APIView):
             "missing": False,
         }
 
-    def _build_subject(self, instance):
+    def _build_subject(self, request, instance):
         if instance.subject_type == "invoice":
-            return self._build_invoice_subject(instance)
+            return self._build_invoice_subject(request, instance)
         return {"type": instance.subject_type, "missing": False}
 
     def _build_allocation_context(self, instance_step):
-        """Return existing allocations + step config for a RUNTIME_SPLIT_ALLOCATION step."""
+        """Return existing allocations + step config for RUNTIME_SPLIT_ALLOCATION or SINGLE_ALLOCATION steps."""
         from apps.invoices.models import InvoiceAllocation
         allocations = (
             InvoiceAllocation.objects
@@ -834,8 +888,10 @@ class TaskReviewView(APIView):
             .order_by("id")
         )
         step = instance_step.workflow_step
+        is_split = step.step_kind == StepKind.RUNTIME_SPLIT_ALLOCATION
         return {
-            "is_runtime_split": True,
+            "allocation_mode": "SPLIT" if is_split else "SINGLE",
+            "is_runtime_split": is_split,
             "step_config": {
                 "allocation_total_policy": step.allocation_total_policy,
                 "require_category": step.require_category,
@@ -868,6 +924,242 @@ class TaskReviewView(APIView):
                 }
                 for a in allocations
             ],
+        }
+
+    def _build_budget_impact(self, allocation):
+        if not allocation.budget_id:
+            return None
+
+        from apps.budgets.models import BudgetConsumption, ConsumptionStatus, ConsumptionType, SourceType
+        from apps.budgets.services import get_source_reserved_balance, get_source_reserved_balance_for_line
+
+        source_id = f"invoice:{allocation.invoice_id}:allocation:{allocation.id}"
+        header_rows = BudgetConsumption.objects.filter(
+            budget=allocation.budget,
+            source_type=SourceType.INVOICE,
+            source_id=source_id,
+            status=ConsumptionStatus.APPLIED,
+        )
+        header_consumed = header_rows.filter(consumption_type=ConsumptionType.CONSUMED).aggregate(t=Sum("amount"))["t"] or Decimal("0")
+        header_released = header_rows.filter(consumption_type=ConsumptionType.RELEASED).aggregate(t=Sum("amount"))["t"] or Decimal("0")
+        header_reserved_balance = get_source_reserved_balance(
+            allocation.budget,
+            SourceType.INVOICE,
+            source_id,
+        )
+        header_before_reserved = allocation.budget.reserved_amount - header_reserved_balance
+        header_before_consumed = allocation.budget.consumed_amount - header_consumed
+        header_before_available = allocation.budget.allocated_amount - header_before_reserved - header_before_consumed
+
+        impact = {
+            "budget": {
+                "id": allocation.budget_id,
+                "name": allocation.budget.name if allocation.budget else None,
+                "code": allocation.budget.code if allocation.budget else None,
+                "currency": allocation.budget.currency if allocation.budget else None,
+                "allocated_amount": str(allocation.budget.allocated_amount) if allocation.budget else None,
+                "reserved_amount": str(allocation.budget.reserved_amount) if allocation.budget else None,
+                "consumed_amount": str(allocation.budget.consumed_amount) if allocation.budget else None,
+                "available_amount": str(allocation.budget.available_amount) if allocation.budget else None,
+                "before_reserved_amount": str(header_before_reserved),
+                "before_consumed_amount": str(header_before_consumed),
+                "before_available_amount": str(max(header_before_available, Decimal("0"))),
+                "effect_reserved_amount": str(header_reserved_balance),
+                "effect_consumed_amount": str(header_consumed),
+                "effect_released_amount": str(header_released),
+            },
+            "line": None,
+        }
+
+        try:
+            from apps.budgets.services import resolve_budget_line_for_allocation
+
+            line = resolve_budget_line_for_allocation(
+                allocation.budget,
+                allocation.category_id,
+                allocation.subcategory_id,
+            )
+            line_rows = BudgetConsumption.objects.filter(
+                budget_line=line,
+                source_type=SourceType.INVOICE,
+                source_id=source_id,
+                status=ConsumptionStatus.APPLIED,
+            )
+            line_consumed = line_rows.filter(consumption_type=ConsumptionType.CONSUMED).aggregate(t=Sum("amount"))["t"] or Decimal("0")
+            line_released = line_rows.filter(consumption_type=ConsumptionType.RELEASED).aggregate(t=Sum("amount"))["t"] or Decimal("0")
+            line_reserved_balance = get_source_reserved_balance_for_line(
+                line,
+                SourceType.INVOICE,
+                source_id,
+            )
+            line_before_reserved = line.reserved_amount - line_reserved_balance
+            line_before_consumed = line.consumed_amount - line_consumed
+            line_before_available = line.allocated_amount - line_before_reserved - line_before_consumed
+            impact["line"] = {
+                "id": line.id,
+                "allocated_amount": str(line.allocated_amount),
+                "reserved_amount": str(line.reserved_amount),
+                "consumed_amount": str(line.consumed_amount),
+                "available_amount": str(line.available_amount),
+                "utilization_percent": str(line.utilization_percent),
+                "before_reserved_amount": str(line_before_reserved),
+                "before_consumed_amount": str(line_before_consumed),
+                "before_available_amount": str(max(line_before_available, Decimal("0"))),
+                "effect_reserved_amount": str(line_reserved_balance),
+                "effect_consumed_amount": str(line_consumed),
+                "effect_released_amount": str(line_released),
+            }
+        except Exception:
+            pass
+
+        return impact
+
+    def _allocation_dict(self, allocation):
+        return {
+            "id": allocation.id,
+            "entity_id": allocation.entity_id,
+            "entity_name": allocation.entity.name if allocation.entity else None,
+            "amount": str(allocation.amount),
+            "percentage": str(allocation.percentage) if allocation.percentage else None,
+            "category_id": allocation.category_id,
+            "category_name": allocation.category.name if allocation.category else None,
+            "subcategory_id": allocation.subcategory_id,
+            "subcategory_name": allocation.subcategory.name if allocation.subcategory else None,
+            "campaign_id": allocation.campaign_id,
+            "campaign_name": allocation.campaign.name if allocation.campaign else None,
+            "budget_id": allocation.budget_id,
+            "budget_name": allocation.budget.name if allocation.budget else None,
+            "budget_code": allocation.budget.code if allocation.budget else None,
+            "selected_approver": self._user_dict(allocation.selected_approver),
+            "selected_by": self._user_dict(allocation.selected_by),
+            "selected_at": allocation.selected_at,
+            "approved_by": self._user_dict(allocation.approved_by),
+            "approved_at": allocation.approved_at,
+            "rejected_by": self._user_dict(allocation.rejected_by),
+            "rejected_at": allocation.rejected_at,
+            "status": allocation.status,
+            "rejection_reason": allocation.rejection_reason,
+            "note": allocation.note,
+            "branch_id": allocation.branch_id,
+            "revision_number": allocation.revision_number,
+            "budget_impact": self._build_budget_impact(allocation),
+        }
+
+    def _build_allocation_audit(self, instance):
+        from apps.invoices.models import Invoice, InvoiceAllocation, InvoiceAllocationRevision
+        from apps.core.models import ScopeNode
+        from apps.budgets.models import Budget, BudgetCategory, BudgetSubCategory
+        from apps.campaigns.models import Campaign
+
+        allocations = list(
+            InvoiceAllocation.objects
+            .filter(invoice_id=instance.subject_id, workflow_instance=instance)
+            .select_related(
+                "invoice",
+                "entity",
+                "category",
+                "subcategory",
+                "campaign",
+                "budget",
+                "selected_approver",
+                "selected_by",
+                "approved_by",
+                "rejected_by",
+            )
+            .order_by("id")
+        )
+
+        if not allocations:
+            return None
+
+        invoice = allocations[0].invoice
+        current_allocations = [self._allocation_dict(a) for a in allocations]
+
+        history_rows = list(
+            InvoiceAllocationRevision.objects
+            .filter(allocation__invoice_id=instance.subject_id, allocation__workflow_instance=instance)
+            .select_related("changed_by", "allocation")
+            .order_by("-changed_at", "-id")
+        )
+
+        entity_ids, category_ids, subcategory_ids, campaign_ids, budget_ids = set(), set(), set(), set(), set()
+        for row in history_rows:
+            snap = row.snapshot or {}
+            if snap.get("entity_id"):
+                entity_ids.add(snap["entity_id"])
+            if snap.get("category_id"):
+                category_ids.add(snap["category_id"])
+            if snap.get("subcategory_id"):
+                subcategory_ids.add(snap["subcategory_id"])
+            if snap.get("campaign_id"):
+                campaign_ids.add(snap["campaign_id"])
+            if snap.get("budget_id"):
+                budget_ids.add(snap["budget_id"])
+
+        entity_map = {obj.id: obj.name for obj in ScopeNode.objects.filter(id__in=entity_ids)}
+        category_map = {obj.id: obj.name for obj in BudgetCategory.objects.filter(id__in=category_ids)}
+        subcategory_map = {obj.id: obj.name for obj in BudgetSubCategory.objects.filter(id__in=subcategory_ids)}
+        campaign_map = {obj.id: obj.name for obj in Campaign.objects.filter(id__in=campaign_ids)}
+        budget_map = {obj.id: {"name": obj.name, "code": obj.code} for obj in Budget.objects.filter(id__in=budget_ids)}
+
+        history = []
+        for row in history_rows:
+            snap = row.snapshot or {}
+            budget_ref = budget_map.get(snap.get("budget_id"))
+            history.append({
+                "id": row.id,
+                "allocation_id": row.allocation_id,
+                "revision_number": row.revision_number,
+                "changed_by": self._user_dict(row.changed_by),
+                "changed_at": row.changed_at,
+                "change_reason": row.change_reason,
+                "snapshot": {
+                    "entity_id": snap.get("entity_id"),
+                    "entity_name": entity_map.get(snap.get("entity_id")),
+                    "category_id": snap.get("category_id"),
+                    "category_name": category_map.get(snap.get("category_id")),
+                    "subcategory_id": snap.get("subcategory_id"),
+                    "subcategory_name": subcategory_map.get(snap.get("subcategory_id")),
+                    "campaign_id": snap.get("campaign_id"),
+                    "campaign_name": campaign_map.get(snap.get("campaign_id")),
+                    "budget_id": snap.get("budget_id"),
+                    "budget_name": budget_ref["name"] if budget_ref else None,
+                    "budget_code": budget_ref["code"] if budget_ref else None,
+                    "amount": snap.get("amount"),
+                    "selected_approver_id": snap.get("selected_approver_id"),
+                    "status": snap.get("status"),
+                    "note": snap.get("note"),
+                },
+            })
+
+        splitters = []
+        seen_splitter_ids = set()
+        for allocation in allocations:
+            if allocation.selected_by_id and allocation.selected_by_id not in seen_splitter_ids:
+                splitters.append(self._user_dict(allocation.selected_by))
+                seen_splitter_ids.add(allocation.selected_by_id)
+
+        total_allocated = sum((allocation.amount for allocation in allocations), start=0)
+        latest_selected_at = max(
+            (allocation.selected_at for allocation in allocations if allocation.selected_at),
+            default=None,
+        )
+
+        return {
+            "summary": {
+                "invoice_amount": str(invoice.amount),
+                "currency": invoice.currency,
+                "line_count": len(allocations),
+                "entity_count": len({allocation.entity_id for allocation in allocations if allocation.entity_id}),
+                "budget_count": len({allocation.budget_id for allocation in allocations if allocation.budget_id}),
+                "total_allocated": str(total_allocated),
+                "is_balanced": str(total_allocated) == str(invoice.amount),
+                "latest_revision_number": max((allocation.revision_number for allocation in allocations), default=1),
+                "splitters": [s for s in splitters if s],
+                "latest_selected_at": latest_selected_at,
+            },
+            "current_allocations": current_allocations,
+            "history": history,
         }
 
     # ── Step review ──────────────────────────────────────────────────────────
@@ -913,17 +1205,19 @@ class TaskReviewView(APIView):
             "created_at": ist.created_at,
         }
 
-        # Include split allocation context for RUNTIME_SPLIT_ALLOCATION steps
+        # Include allocation context for RUNTIME_SPLIT_ALLOCATION and SINGLE_ALLOCATION steps
         allocation_context = None
-        if ist.workflow_step.step_kind == StepKind.RUNTIME_SPLIT_ALLOCATION:
+        if ist.workflow_step.step_kind in (StepKind.RUNTIME_SPLIT_ALLOCATION, StepKind.SINGLE_ALLOCATION):
             allocation_context = self._build_allocation_context(ist)
+        allocation_audit = self._build_allocation_audit(instance) if instance.subject_type == "invoice" else None
 
         return Response({
             "task": task_data,
-            "subject": self._build_subject(instance),
+            "subject": self._build_subject(request, instance),
             "workflow": self._build_workflow_context(instance, current_step_id=ist.id),
             "timeline": self._build_timeline(instance),
             "allocation_context": allocation_context,
+            "allocation_audit": allocation_audit,
         })
 
     # ── Branch review ────────────────────────────────────────────────────────
@@ -976,32 +1270,15 @@ class TaskReviewView(APIView):
         branch_allocation = None
         if branch.parent_instance_step.workflow_step.step_kind == StepKind.RUNTIME_SPLIT_ALLOCATION:
             try:
-                from apps.invoices.models import InvoiceAllocation
                 alloc = branch.invoice_allocation
-                branch_allocation = {
-                    "id": alloc.id,
-                    "entity_id": alloc.entity_id,
-                    "entity_name": alloc.entity.name if alloc.entity else None,
-                    "amount": str(alloc.amount),
-                    "percentage": str(alloc.percentage) if alloc.percentage else None,
-                    "category_id": alloc.category_id,
-                    "category_name": alloc.category.name if alloc.category else None,
-                    "subcategory_id": alloc.subcategory_id,
-                    "subcategory_name": alloc.subcategory.name if alloc.subcategory else None,
-                    "campaign_id": alloc.campaign_id,
-                    "campaign_name": alloc.campaign.name if alloc.campaign else None,
-                    "budget_id": alloc.budget_id,
-                    "status": alloc.status,
-                    "rejection_reason": alloc.rejection_reason,
-                    "note": alloc.note,
-                    "revision_number": alloc.revision_number,
-                }
+                branch_allocation = self._allocation_dict(alloc)
             except Exception:
                 branch_allocation = None
+        allocation_audit = self._build_allocation_audit(instance) if instance.subject_type == "invoice" else None
 
         return Response({
             "task": task_data,
-            "subject": self._build_subject(instance),
+            "subject": self._build_subject(request, instance),
             "workflow": self._build_workflow_context(
                 instance,
                 current_step_id=branch.parent_instance_step_id,
@@ -1009,6 +1286,7 @@ class TaskReviewView(APIView):
             ),
             "timeline": self._build_timeline(instance),
             "branch_allocation": branch_allocation,
+            "allocation_audit": allocation_audit,
         })
 
 

@@ -20,9 +20,9 @@ EMAIL_PORT = 587
 EMAIL_USE_TLS = True
 EMAIL_USE_SSL = False
 EMAIL_TIMEOUT = 10
-EMAIL_HOST_USER = "noreply@vibecopilot.ai"
-EMAIL_HOST_PASSWORD = "kvmfhqmrmqifmtlh"
-DEFAULT_FROM_EMAIL = "InvoFlow <noreply@vibecopilot.ai>"
+EMAIL_HOST_USER = "solodevbuilds@gmail.com"
+EMAIL_HOST_PASSWORD = "qouh exkt ywep gwxq"
+DEFAULT_FROM_EMAIL = "InvoFlow <solodevbuilds@gmail.com>"
 
 # Vendor portal
 VENDOR_PORTAL_BASE_URL = "http://localhost:8080"

@@ -176,6 +176,24 @@ class VendorInvoiceSubmission(models.Model):
         null=True, blank=True,
         related_name="submission",
     )
+    # Route selected by vendor at submit time (new flow)
+    send_to_route = models.ForeignKey(
+        "vendors.VendorSubmissionRoute",
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="invoice_submissions",
+        help_text="VendorSubmissionRoute chosen by vendor at submit time.",
+    )
+    correction_note = models.TextField(blank=True)
+    correction_requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="invoice_submission_corrections_requested",
+    )
+    correction_requested_at = models.DateTimeField(null=True, blank=True)
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -418,3 +436,99 @@ class InvoiceDocument(models.Model):
 
     def __str__(self):
         return f"InvoiceDocument {self.id}: {self.file_name}"
+
+
+# ---------------------------------------------------------------------------
+# InvoicePayment — post-finance payment recording
+# ---------------------------------------------------------------------------
+
+class InvoicePaymentStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    PAID = "paid", "Paid"
+    FAILED = "failed", "Failed"
+    REVERSED = "reversed", "Reversed"
+
+
+class PaymentMethod(models.TextChoices):
+    BANK_TRANSFER = "bank_transfer", "Bank Transfer"
+    RTGS = "rtgs", "RTGS"
+    NEFT = "neft", "NEFT"
+    IMPS = "imps", "IMPS"
+    UPI = "upi", "UPI"
+    CHEQUE = "cheque", "Cheque"
+    OTHER = "other", "Other"
+
+
+class InvoicePayment(models.Model):
+    """
+    Records payment details for an invoice after finance approval.
+
+    V1: One payment record per invoice (OneToOne).
+    Linked to the invoice that was cleared by finance — reachable via
+    FinanceHandoff subject or direct invoice status FINANCE_APPROVED.
+
+    Who can record: workflow participants on the invoice's active workflow
+    instance.  Fallback: invoice creator.  Admin/superuser always allowed.
+    """
+    invoice = models.OneToOneField(
+        "invoices.Invoice",
+        on_delete=models.CASCADE,
+        related_name="payment_record",
+    )
+    # Status
+    payment_status = models.CharField(
+        max_length=20,
+        choices=InvoicePaymentStatus.choices,
+        default=InvoicePaymentStatus.PENDING,
+    )
+    payment_method = models.CharField(
+        max_length=20,
+        choices=PaymentMethod.choices,
+        blank=True,
+        default="",
+    )
+    # Reference numbers
+    payment_reference_number = models.CharField(max_length=255, blank=True, default="")
+    utr_number = models.CharField(max_length=255, blank=True, default="")
+    transaction_id = models.CharField(max_length=255, blank=True, default="")
+    bank_reference_number = models.CharField(max_length=255, blank=True, default="")
+    # Bank details (internal only — NOT exposed to vendor)
+    payer_bank_name = models.CharField(max_length=255, blank=True, default="")
+    beneficiary_name = models.CharField(max_length=255, blank=True, default="")
+    beneficiary_bank_name = models.CharField(max_length=255, blank=True, default="")
+    # Amount / date
+    paid_amount = models.DecimalField(
+        max_digits=14, decimal_places=2,
+        null=True, blank=True,
+    )
+    currency = models.CharField(max_length=10, default="INR")
+    payment_date = models.DateField(null=True, blank=True)
+    # Notes
+    remarks = models.TextField(blank=True, default="")
+    # Audit
+    recorded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="recorded_invoice_payments",
+    )
+    recorded_at = models.DateTimeField(null=True, blank=True)
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True, blank=True,
+        on_delete=models.SET_NULL,
+        related_name="updated_invoice_payments",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "invoice_payments"
+        indexes = [
+            models.Index(fields=["invoice"]),
+            models.Index(fields=["payment_status"]),
+            models.Index(fields=["recorded_by"]),
+        ]
+
+    def __str__(self):
+        return f"InvoicePayment [{self.payment_status}] {self.invoice_id}"

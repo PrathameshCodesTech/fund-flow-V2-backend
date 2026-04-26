@@ -3,6 +3,7 @@ from .models import (
     BudgetCategory,
     BudgetSubCategory,
     Budget,
+    BudgetLine,
     BudgetRule,
     BudgetConsumption,
     BudgetVarianceRequest,
@@ -26,13 +27,23 @@ class BudgetSubCategoryAdmin(admin.ModelAdmin):
 @admin.register(Budget)
 class BudgetAdmin(admin.ModelAdmin):
     list_display = (
-        "id", "category", "subcategory", "scope_node",
+        "id", "name", "code", "scope_node",
         "financial_year", "period_type", "allocated_amount",
         "reserved_amount", "consumed_amount", "currency", "status",
         "created_by", "created_at",
     )
     list_filter = ("status", "currency", "period_type", "financial_year")
-    raw_id_fields = ("scope_node", "category", "subcategory", "created_by", "approved_by")
+    raw_id_fields = ("scope_node", "created_by", "approved_by")
+
+
+@admin.register(BudgetLine)
+class BudgetLineAdmin(admin.ModelAdmin):
+    list_display = (
+        "id", "budget", "category", "subcategory",
+        "allocated_amount", "reserved_amount", "consumed_amount", "created_at",
+    )
+    list_filter = ("category",)
+    raw_id_fields = ("budget", "category", "subcategory")
 
 
 @admin.register(BudgetRule)

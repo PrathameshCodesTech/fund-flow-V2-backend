@@ -32,6 +32,7 @@ INSTALLED_APPS = [
     "apps.audit",
     "apps.finance",
     "apps.dashboard",
+    "apps.manual_expenses",
 ]
 
 MIDDLEWARE = [
@@ -98,6 +99,8 @@ USE_I18N = True
 USE_TZ = True
 
 STATIC_URL = "/static/"
+MEDIA_URL = "/media/"
+MEDIA_ROOT = BASE_DIR
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 AUTH_USER_MODEL = "users.User"

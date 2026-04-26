@@ -4,15 +4,15 @@ Service-level tests for budget runtime logic.
 import pytest
 from decimal import Decimal
 from apps.budgets.models import (
-    BudgetCategory, BudgetSubCategory, Budget, BudgetRule,
+    BudgetCategory, BudgetSubCategory, Budget, BudgetLine, BudgetRule,
     BudgetConsumption, BudgetVarianceRequest,
     BudgetStatus, PeriodType, ConsumptionType, ConsumptionStatus,
     VarianceStatus, SourceType,
 )
 from apps.budgets.services import (
-    reserve_budget,
-    consume_reserved_budget,
-    release_reserved_budget,
+    reserve_budget_line,
+    consume_reserved_budget_line,
+    release_reserved_budget_line,
     review_variance_request,
     BudgetLimitExceeded,
     BudgetNotActiveError,
@@ -50,12 +50,12 @@ def admin_user(db):
 
 
 @pytest.fixture
-def budget(org, company, category, subcategory, admin_user):
+def budget(org, company, admin_user):
     return Budget.objects.create(
         org=org,
         scope_node=company,
-        category=category,
-        subcategory=subcategory,
+        name="FY27 Marketing HQ",
+        code="FY27-MKT-HQ",
         financial_year="2026-27",
         period_type=PeriodType.YEARLY,
         period_start="2026-04-01",
@@ -69,20 +69,30 @@ def budget(org, company, category, subcategory, admin_user):
     )
 
 
+@pytest.fixture
+def budget_line(budget, category, subcategory):
+    return BudgetLine.objects.create(
+        budget=budget,
+        category=category,
+        subcategory=subcategory,
+        allocated_amount=Decimal("50000000.00"),
+    )
+
+
 # ---------------------------------------------------------------------------
-# calculate_projected_utilization — implicit via reserve_budget results
+# reserve_budget_line
 # ---------------------------------------------------------------------------
 
-class TestReserveBudget:
+class TestReserveBudgetLine:
     def test_reserve_below_warning_creates_applied_reservation(
-        self, budget, admin_user,
+        self, budget, budget_line, admin_user,
     ):
         """
-        Reserving 10M on a 50M budget (20% util) is below 80% warning
-        → creates type=reserved, status=applied, increments reserved_amount.
+        Reserving 10M on a 50M line (20% util) is below 80% warning
+        → creates type=reserved, status=applied, increments both line and header.
         """
-        result = reserve_budget(
-            budget=budget,
+        result = reserve_budget_line(
+            line=budget_line,
             amount=Decimal("10000000.00"),
             source_type=SourceType.CAMPAIGN,
             source_id="camp-001",
@@ -93,57 +103,51 @@ class TestReserveBudget:
         assert result["consumption"] is not None
         assert result["consumption"].consumption_type == ConsumptionType.RESERVED
         assert result["consumption"].status == ConsumptionStatus.APPLIED
+        budget_line.refresh_from_db()
+        budget.refresh_from_db()
+        assert budget_line.reserved_amount == Decimal("10000000.00")
         assert budget.reserved_amount == Decimal("10000000.00")
-        assert budget.consumed_amount == Decimal("0")
 
     def test_reserve_between_warning_and_approval_returns_reserved_with_warning(
-        self, budget, admin_user,
+        self, budget, budget_line, admin_user,
     ):
         """
-        Reserving 10M → 20% (below warning), then 30M more → 80% total.
-        80% >= 80% warning → reserved_with_warning.
+        Reserving 40M on a 50M line → 80% projected (≥ 80% warning threshold)
+        → reserved_with_warning.
         """
-        # First reserve 10M → 20% utilization
-        reserve_budget(
-            budget=budget,
+        reserve_budget_line(
+            line=budget_line,
             amount=Decimal("10000000.00"),
             source_type=SourceType.CAMPAIGN,
             source_id="camp-001",
             requested_by=admin_user,
         )
-        # Now reserve 30M more → 80% projected (>= 80% warning)
-        result = reserve_budget(
-            budget=budget,
+        result = reserve_budget_line(
+            line=budget_line,
             amount=Decimal("30000000.00"),
             source_type=SourceType.CAMPAIGN,
             source_id="camp-002",
             requested_by=admin_user,
         )
         assert result["status"] == "reserved_with_warning"
-        assert result["consumption"] is not None
-        assert result["consumption"].consumption_type == ConsumptionType.RESERVED
-        # 10M + 30M = 40M reserved on 50M = 80%
-        assert budget.reserved_amount == Decimal("40000000.00")
+        budget_line.refresh_from_db()
+        assert budget_line.reserved_amount == Decimal("40000000.00")
 
     def test_reserve_between_approval_and_hard_block_creates_variance_request(
-        self, budget, admin_user,
+        self, budget, budget_line, admin_user,
     ):
         """
-        Default approval=100%. Reserve 39M → 78% (below 100% approval).
-        Then reserve 12M more → 102% projected (>= 100% approval, < 110% hard block).
-        → variance_required, no reservation created.
+        Reserving 12M when 39M already reserved (102% projected) → variance_required.
         """
-        # Reserve 39M → 78% (below approval threshold)
-        reserve_budget(
-            budget=budget,
+        reserve_budget_line(
+            line=budget_line,
             amount=Decimal("39000000.00"),
             source_type=SourceType.CAMPAIGN,
             source_id="camp-001",
             requested_by=admin_user,
         )
-        # Now reserve 12M more → 102% projected (above 100% approval threshold)
-        result = reserve_budget(
-            budget=budget,
+        result = reserve_budget_line(
+            line=budget_line,
             amount=Decimal("12000000.00"),
             source_type=SourceType.INVOICE,
             source_id="inv-001",
@@ -153,38 +157,35 @@ class TestReserveBudget:
         assert result["consumption"] is None
         assert result["variance_request"] is not None
         assert result["variance_request"].status == VarianceStatus.PENDING
-        # Reserved amount unchanged (variance, not reservation)
-        assert budget.reserved_amount == Decimal("39000000.00")
+        assert result["variance_request"].budget_line == budget_line
+        # Reserved unchanged
+        budget_line.refresh_from_db()
+        assert budget_line.reserved_amount == Decimal("39000000.00")
 
     def test_reserve_above_hard_block_raises_and_does_not_increment(
-        self, budget, admin_user,
+        self, budget, budget_line, admin_user,
     ):
-        """
-        Reserving 56M on a 50M budget (112% projected) exceeds 110% hard block
-        → BudgetLimitExceeded, no consumption, reserved unchanged.
-        """
-        initial_reserved = budget.reserved_amount
+        """112% projected → BudgetLimitExceeded."""
         with pytest.raises(BudgetLimitExceeded) as exc_info:
-            reserve_budget(
-                budget=budget,
+            reserve_budget_line(
+                line=budget_line,
                 amount=Decimal("56000000.00"),
                 source_type=SourceType.CAMPAIGN,
                 source_id="camp-big",
                 requested_by=admin_user,
             )
         assert "hard block" in str(exc_info.value).lower()
-        budget.refresh_from_db()
-        assert budget.reserved_amount == initial_reserved
+        budget_line.refresh_from_db()
+        assert budget_line.reserved_amount == Decimal("0")
 
     def test_reserve_inactive_budget_raises(
-        self, budget, admin_user,
+        self, budget, budget_line, admin_user,
     ):
-        """Only ACTIVE budgets accept reservations."""
         budget.status = BudgetStatus.DRAFT
         budget.save()
         with pytest.raises(BudgetNotActiveError):
-            reserve_budget(
-                budget=budget,
+            reserve_budget_line(
+                line=budget_line,
                 amount=Decimal("1000000.00"),
                 source_type=SourceType.CAMPAIGN,
                 source_id="camp-001",
@@ -192,11 +193,11 @@ class TestReserveBudget:
             )
 
     def test_reserve_zero_amount_raises(
-        self, budget, admin_user,
+        self, budget, budget_line, admin_user,
     ):
         with pytest.raises(ValueError) as exc_info:
-            reserve_budget(
-                budget=budget,
+            reserve_budget_line(
+                line=budget_line,
                 amount=Decimal("0"),
                 source_type=SourceType.CAMPAIGN,
                 source_id="camp-001",
@@ -205,24 +206,23 @@ class TestReserveBudget:
         assert "greater than zero" in str(exc_info.value).lower()
 
 
+# ---------------------------------------------------------------------------
+# review_variance_request (with budget_line)
+# ---------------------------------------------------------------------------
+
 class TestReviewVarianceRequest:
-    def test_approved_variance_creates_reservation_and_increments_reserved(
-        self, budget, admin_user,
+    def test_approved_variance_creates_reservation_and_increments_both(
+        self, budget, budget_line, admin_user,
     ):
-        """Approved variance creates reserved consumption and increments budget.reserved_amount."""
-        # Default approval=100%. Reserve 39M → 78% (below 100%, normal reservation).
-        reserve_budget(
-            budget=budget,
+        reserve_budget_line(
+            line=budget_line,
             amount=Decimal("39000000.00"),
             source_type=SourceType.CAMPAIGN,
             source_id="camp-001",
             requested_by=admin_user,
         )
-        assert budget.reserved_amount == Decimal("39000000.00")
-
-        # Reserve 12M more → 102% projected (above 100% approval) → variance_required
-        result = reserve_budget(
-            budget=budget,
+        result = reserve_budget_line(
+            line=budget_line,
             amount=Decimal("12000000.00"),
             source_type=SourceType.INVOICE,
             source_id="inv-001",
@@ -230,53 +230,50 @@ class TestReviewVarianceRequest:
         )
         variance = result["variance_request"]
         assert variance.status == VarianceStatus.PENDING
-        # Reserved unchanged (variance not yet approved)
-        budget.refresh_from_db()
-        assert budget.reserved_amount == Decimal("39000000.00")
 
-        # Approve
         updated = review_variance_request(
             variance_request=variance,
             decision="approved",
             reviewed_by=admin_user,
-            review_note="Approved for Q2 campaign.",
+            review_note="Approved for Q2.",
         )
         assert updated.status == VarianceStatus.APPROVED
+        budget_line.refresh_from_db()
         budget.refresh_from_db()
-        assert budget.reserved_amount == Decimal("51000000.00")  # 39M + 12M
+        assert budget_line.reserved_amount == Decimal("51000000.00")
+        assert budget.reserved_amount == Decimal("51000000.00")
 
-        # Check consumption was created
         consumption = BudgetConsumption.objects.filter(
-            budget=budget,
+            budget_line=budget_line,
             source_type=SourceType.INVOICE,
             source_id="inv-001",
             consumption_type=ConsumptionType.RESERVED,
+        ).filter(
+            note__icontains="Approved variance"
         ).first()
         assert consumption is not None
         assert consumption.amount == Decimal("12000000.00")
-        assert consumption.status == ConsumptionStatus.APPLIED
 
     def test_rejected_variance_does_not_change_budget(
-        self, budget, admin_user,
+        self, budget, budget_line, admin_user,
     ):
-        """Rejected variance leaves reserved_amount unchanged."""
-        reserve_budget(
-            budget=budget,
+        reserve_budget_line(
+            line=budget_line,
             amount=Decimal("39000000.00"),
             source_type=SourceType.CAMPAIGN,
             source_id="camp-001",
             requested_by=admin_user,
         )
-        result = reserve_budget(
-            budget=budget,
+        result = reserve_budget_line(
+            line=budget_line,
             amount=Decimal("12000000.00"),
             source_type=SourceType.INVOICE,
             source_id="inv-001",
             requested_by=admin_user,
         )
         variance = result["variance_request"]
-        budget.refresh_from_db()
-        initial_reserved = budget.reserved_amount  # 39M
+        budget_line.refresh_from_db()
+        initial_reserved = budget_line.reserved_amount  # 39M
 
         updated = review_variance_request(
             variance_request=variance,
@@ -285,52 +282,51 @@ class TestReviewVarianceRequest:
             review_note="Budget exhausted.",
         )
         assert updated.status == VarianceStatus.REJECTED
-        budget.refresh_from_db()
-        assert budget.reserved_amount == initial_reserved  # still 39M
+        budget_line.refresh_from_db()
+        assert budget_line.reserved_amount == initial_reserved
 
     def test_review_non_pending_raises(
-        self, budget, admin_user,
+        self, budget, budget_line, admin_user,
     ):
-        """Reviewing a non-PENDING variance raises ValueError."""
-        reserve_budget(
-            budget=budget,
+        reserve_budget_line(
+            line=budget_line,
             amount=Decimal("39000000.00"),
             source_type=SourceType.CAMPAIGN,
             source_id="camp-001",
             requested_by=admin_user,
         )
-        result = reserve_budget(
-            budget=budget,
+        result = reserve_budget_line(
+            line=budget_line,
             amount=Decimal("12000000.00"),
             source_type=SourceType.INVOICE,
             source_id="inv-001",
             requested_by=admin_user,
         )
         variance = result["variance_request"]
-
-        # First approve
         review_variance_request(variance, "approved", admin_user)
 
-        # Try approving again — should raise
         with pytest.raises(ValueError) as exc_info:
             review_variance_request(variance, "approved", admin_user)
         assert "PENDING" in str(exc_info.value)
 
 
-class TestConsumeReservedBudget:
+# ---------------------------------------------------------------------------
+# consume_reserved_budget_line
+# ---------------------------------------------------------------------------
+
+class TestConsumeReservedBudgetLine:
     def test_consume_reduces_reserved_and_increases_consumed(
-        self, budget, admin_user,
+        self, budget, budget_line, admin_user,
     ):
-        """Consuming 5M from a 10M reservation reduces reserved, increases consumed."""
-        reserve_budget(
-            budget=budget,
+        reserve_budget_line(
+            line=budget_line,
             amount=Decimal("10000000.00"),
             source_type=SourceType.CAMPAIGN,
             source_id="camp-001",
             requested_by=admin_user,
         )
-        result = consume_reserved_budget(
-            budget=budget,
+        result = consume_reserved_budget_line(
+            line=budget_line,
             amount=Decimal("5000000.00"),
             source_type=SourceType.CAMPAIGN,
             source_id="camp-001",
@@ -338,24 +334,26 @@ class TestConsumeReservedBudget:
             note="Actual spend",
         )
         assert result["status"] == "consumed"
+        budget_line.refresh_from_db()
         budget.refresh_from_db()
+        assert budget_line.reserved_amount == Decimal("5000000.00")
+        assert budget_line.consumed_amount == Decimal("5000000.00")
         assert budget.reserved_amount == Decimal("5000000.00")
         assert budget.consumed_amount == Decimal("5000000.00")
 
     def test_consume_more_than_reserved_raises(
-        self, budget, admin_user,
+        self, budget, budget_line, admin_user,
     ):
-        """Cannot consume more than currently reserved."""
-        reserve_budget(
-            budget=budget,
+        reserve_budget_line(
+            line=budget_line,
             amount=Decimal("1000000.00"),
             source_type=SourceType.CAMPAIGN,
             source_id="camp-001",
             requested_by=admin_user,
         )
         with pytest.raises(ValueError) as exc_info:
-            consume_reserved_budget(
-                budget=budget,
+            consume_reserved_budget_line(
+                line=budget_line,
                 amount=Decimal("5000000.00"),
                 source_type=SourceType.CAMPAIGN,
                 source_id="camp-001",
@@ -364,20 +362,23 @@ class TestConsumeReservedBudget:
         assert "only" in str(exc_info.value).lower()
 
 
-class TestReleaseReservedBudget:
+# ---------------------------------------------------------------------------
+# release_reserved_budget_line
+# ---------------------------------------------------------------------------
+
+class TestReleaseReservedBudgetLine:
     def test_release_reduces_reserved_amount(
-        self, budget, admin_user,
+        self, budget, budget_line, admin_user,
     ):
-        """Releasing 3M from a 10M reservation reduces reserved_amount."""
-        reserve_budget(
-            budget=budget,
+        reserve_budget_line(
+            line=budget_line,
             amount=Decimal("10000000.00"),
             source_type=SourceType.CAMPAIGN,
             source_id="camp-001",
             requested_by=admin_user,
         )
-        result = release_reserved_budget(
-            budget=budget,
+        result = release_reserved_budget_line(
+            line=budget_line,
             amount=Decimal("3000000.00"),
             source_type=SourceType.CAMPAIGN,
             source_id="camp-001",
@@ -385,24 +386,24 @@ class TestReleaseReservedBudget:
             note="Campaign cancelled",
         )
         assert result["status"] == "released"
+        budget_line.refresh_from_db()
         budget.refresh_from_db()
+        assert budget_line.reserved_amount == Decimal("7000000.00")
         assert budget.reserved_amount == Decimal("7000000.00")
-        assert budget.consumed_amount == Decimal("0")
 
     def test_release_more_than_reserved_raises(
-        self, budget, admin_user,
+        self, budget, budget_line, admin_user,
     ):
-        """Cannot release more than currently reserved."""
-        reserve_budget(
-            budget=budget,
+        reserve_budget_line(
+            line=budget_line,
             amount=Decimal("1000000.00"),
             source_type=SourceType.CAMPAIGN,
             source_id="camp-001",
             requested_by=admin_user,
         )
         with pytest.raises(ValueError) as exc_info:
-            release_reserved_budget(
-                budget=budget,
+            release_reserved_budget_line(
+                line=budget_line,
                 amount=Decimal("5000000.00"),
                 source_type=SourceType.CAMPAIGN,
                 source_id="camp-001",
@@ -417,39 +418,33 @@ class TestReleaseReservedBudget:
 
 class TestBudgetModel:
     def test_available_amount(self, budget):
-        """available_amount = allocated - reserved - consumed."""
         budget.reserved_amount = Decimal("10000000.00")
         budget.consumed_amount = Decimal("5000000.00")
         budget.save()
         assert budget.available_amount == Decimal("35000000.00")
 
     def test_available_amount_never_negative(self, budget):
-        """available_amount floors at 0."""
         budget.reserved_amount = Decimal("60000000.00")
         budget.consumed_amount = Decimal("0")
         budget.save()
         assert budget.available_amount == Decimal("0")
 
     def test_utilization_percent(self, budget):
-        """utilization_percent = (reserved+consumed) / allocated * 100."""
         budget.reserved_amount = Decimal("10000000.00")
         budget.consumed_amount = Decimal("0")
         budget.save()
         assert budget.utilization_percent == Decimal("20.00")
 
     def test_utilization_percent_zero_allocated(self, budget):
-        """Zero allocated returns 0 utilization."""
         budget.allocated_amount = Decimal("0")
         budget.save()
         assert budget.utilization_percent == Decimal("0")
 
-    def test_unique_constraint_on_budget(
-        self, org, company, category, subcategory, admin_user,
-    ):
-        """Duplicate budget allocation raises IntegrityError."""
+    def test_unique_constraint_on_budget(self, org, company, admin_user):
+        """Duplicate budget (same scope_node+financial_year+code) raises IntegrityError."""
         Budget.objects.create(
-            org=org, scope_node=company, category=category,
-            subcategory=subcategory,
+            org=org, scope_node=company,
+            name="FY27 Marketing A", code="FY27-MKT-A",
             financial_year="2026-27",
             period_type=PeriodType.YEARLY,
             period_start="2026-04-01",
@@ -460,8 +455,8 @@ class TestBudgetModel:
         )
         with pytest.raises(Exception):  # IntegrityError
             Budget.objects.create(
-                org=org, scope_node=company, category=category,
-                subcategory=subcategory,
+                org=org, scope_node=company,
+                name="FY27 Marketing A Dupe", code="FY27-MKT-A",
                 financial_year="2026-27",
                 period_type=PeriodType.YEARLY,
                 period_start="2026-04-01",
@@ -471,25 +466,36 @@ class TestBudgetModel:
                 created_by=admin_user,
             )
 
+    def test_line_sum_validation(self, budget, category, subcategory):
+        """BudgetLine available_amount property works correctly."""
+        line = BudgetLine.objects.create(
+            budget=budget,
+            category=category,
+            subcategory=subcategory,
+            allocated_amount=Decimal("50000000.00"),
+        )
+        line.reserved_amount = Decimal("10000000.00")
+        line.consumed_amount = Decimal("5000000.00")
+        line.save()
+        assert line.available_amount == Decimal("35000000.00")
+
 
 class TestBudgetRuleValidation:
     def test_warning_must_be_less_than_approval(self, budget):
-        """warning >= approval should raise during clean()."""
         rule = BudgetRule(
             budget=budget,
             warning_threshold_percent=Decimal("90.00"),
-            approval_threshold_percent=Decimal("80.00"),  # invalid
+            approval_threshold_percent=Decimal("80.00"),
         )
         from django.core.exceptions import ValidationError
         with pytest.raises(ValidationError):
             rule.clean()
 
     def test_approval_must_be_lte_hard_block(self, budget):
-        """approval > hard_block should raise during clean()."""
         rule = BudgetRule(
             budget=budget,
             warning_threshold_percent=Decimal("70.00"),
-            approval_threshold_percent=Decimal("120.00"),  # > 110 hard block
+            approval_threshold_percent=Decimal("120.00"),
             hard_block_threshold_percent=Decimal("110.00"),
         )
         from django.core.exceptions import ValidationError

@@ -7,8 +7,12 @@ from apps.budgets.models import SourceType
 from apps.budgets.services import (
     reserve_budget,
     release_reserved_budget,
+    release_reserved_budget_line,
     review_variance_request,
     get_source_reserved_balance,
+    reserve_budget_line,
+    resolve_budget_line_for_allocation,
+    BudgetLineNotFoundError,
     BudgetLimitExceeded,
     BudgetNotActiveError,
 )
@@ -88,8 +92,23 @@ def submit_campaign_for_budget(campaign: Campaign, submitted_by) -> dict:
         campaign.save(update_fields=["status", "updated_at"])
         return {"status": "no_budget_linked"}
 
-    result = reserve_budget(
-        budget=campaign.budget,
+    # Resolve the BudgetLine for this campaign's category/subcategory context
+    try:
+        budget_line = resolve_budget_line_for_allocation(
+            budget=campaign.budget,
+            category_id=campaign.category_id,
+            subcategory_id=campaign.subcategory_id,
+        )
+    except BudgetLineNotFoundError:
+        raise BudgetLineNotFoundError(
+            f"No BudgetLine found for budget={campaign.budget_id} "
+            f"matching campaign's category={campaign.category_id}, "
+            f"subcategory={campaign.subcategory_id}. "
+            "A budget line must exist before a campaign can reserve against it."
+        )
+
+    result = reserve_budget_line(
+        line=budget_line,
         amount=campaign.requested_amount,
         source_type=SourceType.CAMPAIGN,
         source_id=str(campaign.id),
@@ -190,20 +209,44 @@ def cancel_campaign(campaign: Campaign, cancelled_by, note: str = "") -> Campaig
     # Release the net reserved balance for this campaign source
     if campaign.budget_id:
         campaign.budget.refresh_from_db()
-        net_balance = get_source_reserved_balance(
-            budget=campaign.budget,
-            source_type=SourceType.CAMPAIGN,
-            source_id=str(campaign.id),
-        )
-        if net_balance > Decimal("0"):
-            release_reserved_budget(
+        # Try line-level release first (new campaigns); fall back to header for legacy
+        try:
+            budget_line = resolve_budget_line_for_allocation(
                 budget=campaign.budget,
-                amount=net_balance,
+                category_id=campaign.category_id,
+                subcategory_id=campaign.subcategory_id,
+            )
+            from apps.budgets.services import get_source_reserved_balance_for_line
+            net_balance = get_source_reserved_balance_for_line(
+                budget_line,
                 source_type=SourceType.CAMPAIGN,
                 source_id=str(campaign.id),
-                released_by=cancelled_by,
-                note=note or f"Campaign {campaign.code} cancelled",
             )
+            if net_balance > Decimal("0"):
+                release_reserved_budget_line(
+                    line=budget_line,
+                    amount=net_balance,
+                    source_type=SourceType.CAMPAIGN,
+                    source_id=str(campaign.id),
+                    released_by=cancelled_by,
+                    note=note or f"Campaign {campaign.code} cancelled",
+                )
+        except BudgetLineNotFoundError:
+            # Legacy campaign without matching BudgetLine — fall back to header release
+            net_balance = get_source_reserved_balance(
+                budget=campaign.budget,
+                source_type=SourceType.CAMPAIGN,
+                source_id=str(campaign.id),
+            )
+            if net_balance > Decimal("0"):
+                release_reserved_budget(
+                    budget=campaign.budget,
+                    amount=net_balance,
+                    source_type=SourceType.CAMPAIGN,
+                    source_id=str(campaign.id),
+                    released_by=cancelled_by,
+                    note=note or f"Campaign {campaign.code} cancelled (legacy)",
+                )
 
     campaign.status = CampaignStatus.CANCELLED
     campaign.save(update_fields=["status", "updated_at"])

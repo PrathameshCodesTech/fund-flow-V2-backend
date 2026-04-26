@@ -6,6 +6,7 @@ from django.db.models import Q
 from apps.users.models import User
 from apps.users.api.serializers.users import (
     UserSerializer,
+    UserListSerializer,
     UserCreateSerializer,
     UserUpdateSerializer,
 )
@@ -71,6 +72,8 @@ class UserViewSet(viewsets.ModelViewSet):
             return UserCreateSerializer
         if self.action in ("partial_update", "update"):
             return UserUpdateSerializer
+        if self.action == "list":
+            return UserListSerializer
         return UserSerializer
 
     def create(self, request, *args, **kwargs):

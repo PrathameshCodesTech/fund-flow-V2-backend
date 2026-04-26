@@ -61,6 +61,30 @@ def user_can_act_on_scope(user, scope_node_id: int) -> bool:
     return int(scope_node_id) in [int(x) for x in actionable_ids]
 
 
+def user_can_act_on_scope_or_ancestors(user, scope_node_id: int) -> bool:
+    """
+    Returns True if the user has an actionable (direct) assignment at the given
+    scope node OR any of its ancestors.
+
+    Use this when a module intentionally allows parent-scope operators to
+    manage child-scope records without relaxing the global actionable-scope
+    semantics for every feature.
+    """
+    from apps.core.models import ScopeNode
+    from apps.access.selectors import get_user_actionable_scope_ids
+
+    try:
+        node = ScopeNode.objects.select_related("org").get(pk=scope_node_id)
+    except ScopeNode.DoesNotExist:
+        return False
+
+    actionable_ids = {int(x) for x in get_user_actionable_scope_ids(user)}
+    if int(scope_node_id) in actionable_ids:
+        return True
+
+    return any(int(ancestor.id) in actionable_ids for ancestor in get_ancestors(node))
+
+
 def user_can_act_on_scope_response(user, scope_node_id: int, action: str = "this action"):
     """
     Returns a 403 Response if user cannot act on the given scope_node_id.
@@ -71,6 +95,22 @@ def user_can_act_on_scope_response(user, scope_node_id: int, action: str = "this
     from rest_framework.response import Response
     from rest_framework import status
     if not user_can_act_on_scope(user, scope_node_id):
+        return Response(
+            {"detail": f"You do not have permission to {action} at this scope."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    return None
+
+
+def user_can_act_on_scope_or_ancestors_response(user, scope_node_id: int, action: str = "this action"):
+    """
+    Returns a 403 Response if user cannot act on the given scope node or any of
+    its ancestors. Returns None if the user is allowed to proceed.
+    """
+    from rest_framework.response import Response
+    from rest_framework import status
+
+    if not user_can_act_on_scope_or_ancestors(user, scope_node_id):
         return Response(
             {"detail": f"You do not have permission to {action} at this scope."},
             status=status.HTTP_403_FORBIDDEN,

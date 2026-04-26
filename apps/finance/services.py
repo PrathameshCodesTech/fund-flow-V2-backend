@@ -75,7 +75,7 @@ def resolve_finance_recipients_for_handoff(handoff: FinanceHandoff) -> list[str]
     For other modules: falls back to VENDOR_FINANCE_RECIPIENTS setting.
 
     Raises:
-        NoFinanceRecipientsError â€” for invoice handoffs when no finance users exist
+        NoFinanceRecipientsError — for invoice handoffs when no finance users exist
     """
     if handoff.module == "invoice":
         return _resolve_invoice_finance_recipients(handoff)
@@ -256,6 +256,54 @@ def sync_subject_on_finance_change(handoff: FinanceHandoff) -> None:
             )
 
 
+def _apply_invoice_budget_transition_for_finance(handoff: FinanceHandoff) -> None:
+    """
+    Move invoice allocation budget state at finance decision time.
+
+    - finance_approved: consume any outstanding reserved allocation balances
+    - finance_rejected: release any outstanding reserved allocation balances
+
+    This intentionally happens at finance decision, not internal workflow approval.
+    """
+    if handoff.module != "invoice":
+        return
+
+    from apps.workflow.models import WorkflowInstance, InstanceStatus
+
+    instance = (
+        WorkflowInstance.objects
+        .filter(
+            subject_type="invoice",
+            subject_id=handoff.subject_id,
+            status=InstanceStatus.APPROVED,
+        )
+        .order_by("-completed_at", "-created_at")
+        .first()
+    )
+    if not instance:
+        return
+
+    from apps.workflow.services import (
+        _consume_allocation_budgets,
+        _release_allocation_budgets,
+        _reverse_consumed_allocation_budgets,
+    )
+
+    if handoff.status == FinanceHandoffStatus.FINANCE_APPROVED:
+        _consume_allocation_budgets(instance, actor=instance.started_by)
+    elif handoff.status == FinanceHandoffStatus.FINANCE_REJECTED:
+        _reverse_consumed_allocation_budgets(
+            instance,
+            actor=instance.started_by,
+            note=f"Finance rejected handoff {handoff.id} — consumed budget reversed",
+        )
+        _release_allocation_budgets(
+            instance,
+            actor=instance.started_by,
+            note=f"Finance rejected handoff {handoff.id} — budget released",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Subject name helper (used in email)
 # ---------------------------------------------------------------------------
@@ -295,7 +343,7 @@ def create_finance_handoff(
     Create a new FinanceHandoff in PENDING status.
 
     Raises:
-        HandoffStateError â€” if an active (pending/sent) handoff already exists
+        HandoffStateError — if an active (pending/sent) handoff already exists
                            for this subject.
 
     Args:
@@ -410,8 +458,8 @@ def send_finance_handoff(
         Updated FinanceHandoff (status=SENT, sent_at set)
 
     Raises:
-        HandoffStateError â€” if handoff is not in PENDING status
-        NoFinanceRecipientsError â€” if no eligible finance recipients can be resolved
+        HandoffStateError — if handoff is not in PENDING status
+        NoFinanceRecipientsError — if no eligible finance recipients can be resolved
     """
     if handoff.status not in (FinanceHandoffStatus.PENDING, FinanceHandoffStatus.SENT):
         raise HandoffStateError(
@@ -455,7 +503,7 @@ def send_finance_handoff(
     # Resolve recipients dynamically (raises NoFinanceRecipientsError for invoices if none found)
     recipients = resolve_finance_recipients_for_handoff(handoff)
 
-    # Send email (mockable) â€” only mark SENT after email succeeds
+    # Send email (mockable) — only mark SENT after email succeeds
     _send_finance_email(
         handoff_id=handoff.pk,
         module=handoff.module,
@@ -486,6 +534,26 @@ def send_finance_handoff(
 
 
 # ---------------------------------------------------------------------------
+# Vendor hold gate for finance handoffs
+# ---------------------------------------------------------------------------
+
+def _assert_handoff_vendor_not_on_hold(handoff) -> None:
+    """Block finance approve/reject if the handoff subject is an invoice with a vendor on hold."""
+    if handoff.subject_type != "invoice":
+        return
+    from apps.invoices.models import Invoice
+    from apps.vendors.models import Vendor
+    from apps.vendors.services import assert_vendor_profile_not_on_hold
+    try:
+        vendor_id = Invoice.objects.filter(pk=handoff.subject_id).values_list("vendor_id", flat=True).first()
+        if vendor_id:
+            vendor = Vendor.objects.only("profile_change_pending", "profile_hold_reason").get(pk=vendor_id)
+            assert_vendor_profile_not_on_hold(vendor)
+    except (Invoice.DoesNotExist, Vendor.DoesNotExist):
+        pass
+
+
+# ---------------------------------------------------------------------------
 # 4. Approve via token
 # ---------------------------------------------------------------------------
 
@@ -507,9 +575,9 @@ def finance_approve_handoff(
         (handoff, decision) tuple
 
     Raises:
-        TokenError       â€” invalid, expired, or already-used token, or wrong action type
-        HandoffStateError â€” handoff is not in a sendable state
-        ValueError       â€” reference_id is empty
+        TokenError       — invalid, expired, or already-used token, or wrong action type
+        HandoffStateError — handoff is not in a sendable state
+        ValueError       — reference_id is empty
     """
     if not reference_id or not reference_id.strip():
         raise ValueError("reference_id is required for finance approval.")
@@ -519,8 +587,10 @@ def finance_approve_handoff(
 
     if handoff.status not in (FinanceHandoffStatus.PENDING, FinanceHandoffStatus.SENT):
         raise HandoffStateError(
-            f"Handoff {handoff.pk} is in '{handoff.status}' â€” cannot approve."
+            f"Handoff {handoff.pk} is in '{handoff.status}' — cannot approve."
         )
+
+    _assert_handoff_vendor_not_on_hold(handoff)
 
     now = timezone.now()
 
@@ -542,6 +612,8 @@ def finance_approve_handoff(
     handoff.status = FinanceHandoffStatus.FINANCE_APPROVED
     handoff.finance_reference_id = reference_id.strip()
     handoff.save(update_fields=["status", "finance_reference_id", "updated_at"])
+
+    _apply_invoice_budget_transition_for_finance(handoff)
 
     # Sync subject status
     sync_subject_on_finance_change(handoff)
@@ -583,16 +655,18 @@ def finance_reject_handoff(
         (handoff, decision) tuple
 
     Raises:
-        TokenError       â€” invalid, expired, or already-used token, or wrong action type
-        HandoffStateError â€” handoff is not in a sendable state
+        TokenError       — invalid, expired, or already-used token, or wrong action type
+        HandoffStateError — handoff is not in a sendable state
     """
     token = _get_valid_finance_token(token_str, expected_action=FinanceActionType.REJECT)
     handoff = token.handoff
 
     if handoff.status not in (FinanceHandoffStatus.PENDING, FinanceHandoffStatus.SENT):
         raise HandoffStateError(
-            f"Handoff {handoff.pk} is in '{handoff.status}' â€” cannot reject."
+            f"Handoff {handoff.pk} is in '{handoff.status}' — cannot reject."
         )
+
+    _assert_handoff_vendor_not_on_hold(handoff)
 
     now = timezone.now()
 
@@ -612,6 +686,8 @@ def finance_reject_handoff(
     # Update handoff
     handoff.status = FinanceHandoffStatus.FINANCE_REJECTED
     handoff.save(update_fields=["status", "updated_at"])
+
+    _apply_invoice_budget_transition_for_finance(handoff)
 
     # Sync subject status
     sync_subject_on_finance_change(handoff)
@@ -663,7 +739,7 @@ def get_handoff_by_token(token_str: str) -> FinanceHandoff:
     Look up a handoff by its action token.
 
     Raises:
-        TokenError â€” token not found
+        TokenError — token not found
     """
     try:
         return FinanceActionToken.objects.select_related("handoff").get(token=token_str).handoff
@@ -683,7 +759,7 @@ def _get_valid_finance_token(
     Fetch and validate a finance action token.
 
     Raises:
-        TokenError â€” not found, wrong action, expired, or already used
+        TokenError — not found, wrong action, expired, or already used
     """
     try:
         token = FinanceActionToken.objects.select_related("handoff").get(token=token_str)
@@ -738,4 +814,3 @@ def _notify_invoice_finance_decision(handoff: FinanceHandoff, decision: FinanceD
             "Invoice finance notification failed for handoff %s, decision %s: %s",
             handoff.pk, decision.pk, exc,
         )
-

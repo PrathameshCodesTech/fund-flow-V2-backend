@@ -3,7 +3,7 @@ Budget analytics selectors for the overview dashboard.
 """
 from django.db.models import Sum, Count
 
-from apps.budgets.models import Budget
+from apps.budgets.models import Budget, BudgetLine
 from apps.campaigns.models import Campaign
 from apps.core.models import ScopeNode
 from apps.access.selectors import get_user_visible_scope_ids
@@ -12,7 +12,7 @@ from apps.access.selectors import get_user_visible_scope_ids
 def get_budgets_overview(user):
     """
     Aggregate budget data for the enterprise marketing budget control dashboard.
-    Returns all data scoped to user-visible scope nodes (parks/cost centers).
+    Returns all data scoped to user-visible scope nodes.
     """
     visible = get_user_visible_scope_ids(user)
 
@@ -39,6 +39,9 @@ def get_budgets_overview(user):
     campaigns_count = Campaign.objects.filter(
         scope_node_id__in=visible, status="internally_approved"
     ).count()
+
+    # Line queryset scoped to user-visible budgets
+    line_qs = BudgetLine.objects.filter(budget__scope_node_id__in=visible)
 
     # ── By Region ────────────────────────────────────────────────────────────
     region_data = {}
@@ -95,9 +98,10 @@ def get_budgets_overview(user):
         util_pct = round((reserv + cons) / alloc * 100, 1) if alloc else 0
 
         top_subcats = []
-        if park_budgets.exists():
+        park_line_qs = line_qs.filter(budget__scope_node_id=park.id)
+        if park_line_qs.filter(subcategory__isnull=False).exists():
             subcat_agg = (
-                park_budgets
+                park_line_qs
                 .filter(subcategory__isnull=False)
                 .values("subcategory__id", "subcategory__name")
                 .annotate(total=Sum("allocated_amount"))
@@ -122,15 +126,14 @@ def get_budgets_overview(user):
             "top_subcategories": top_subcats,
         })
 
-    # ── By Category ─────────────────────────────────────────────────────────
+    # ── By Category (from BudgetLine) ────────────────────────────────────────
     cat_data = []
     category_qs = (
-        Budget.objects
-        .filter(scope_node_id__in=visible, category__isnull=False)
+        line_qs
         .values("category__id", "category__name")
         .annotate(
             allocated_amount=Sum("allocated_amount"),
-            budgets_count=Count("id"),
+            budgets_count=Count("budget", distinct=True),
         )
         .order_by("-allocated_amount")
     )
@@ -148,12 +151,11 @@ def get_budgets_overview(user):
             "campaigns_count": campaigns,
         })
 
-    # ── By Subcategory ──────────────────────────────────────────────────────
+    # ── By Subcategory (from BudgetLine) ────────────────────────────────────
     subcat_data = []
     subcat_qs = (
-        Budget.objects
-        .filter(scope_node_id__in=visible, subcategory__isnull=False)
-        .select_related("category")
+        line_qs
+        .filter(subcategory__isnull=False)
         .values("subcategory__id", "subcategory__name", "category__name")
         .annotate(allocated_amount=Sum("allocated_amount"))
         .order_by("-allocated_amount")[:50]

@@ -50,16 +50,20 @@ class StepKind(models.TextChoices):
     """
     Controls how a step resolves its runtime behavior at activation time.
 
-    NORMAL_APPROVAL  — standard role/scope resolution; one assignee per step
-    SPLIT_BY_SCOPE   — fans out into one branch per resolved scope node;
-                       parent instance pauses until all branches complete
-    JOIN_BRANCHES    — special step that completes only after all branches
-                       from the matching SPLIT_BY_SCOPE have resolved
+    NORMAL_APPROVAL        — standard role/scope resolution; one assignee per step
+    SPLIT_BY_SCOPE         — fans out into one branch per resolved scope node;
+                             parent instance pauses until all branches complete
+    JOIN_BRANCHES          — special step that completes only after all branches
+                             from the matching SPLIT_BY_SCOPE have resolved
+    RUNTIME_SPLIT_ALLOCATION — splitter submits N allocation lines; each becomes a branch
+    SINGLE_ALLOCATION      — splitter submits exactly one allocation line covering the
+                             full invoice amount; no branch fanout, step auto-advances
     """
     NORMAL_APPROVAL = "NORMAL_APPROVAL", "Normal Approval"
     SPLIT_BY_SCOPE = "SPLIT_BY_SCOPE", "Split By Scope"
     JOIN_BRANCHES = "JOIN_BRANCHES", "Join Branches"
     RUNTIME_SPLIT_ALLOCATION = "RUNTIME_SPLIT_ALLOCATION", "Runtime Split Allocation"
+    SINGLE_ALLOCATION = "SINGLE_ALLOCATION", "Single Allocation"
 
 
 class BranchStatus(models.TextChoices):
@@ -70,6 +74,24 @@ class BranchStatus(models.TextChoices):
 
 class JoinPolicy(models.TextChoices):
     ALL_BRANCHES_MUST_COMPLETE = "ALL_BRANCHES_MUST_COMPLETE", "All Branches Must Complete"
+
+
+class BranchApprovalPolicy(models.TextChoices):
+    """
+    Controls whether runtime split allocation branches require explicit approval.
+
+    REQUIRED_FOR_ALL  — every allocation line must have selected_approver;
+                        each creates a PENDING branch; parent step waits for all.
+    OPTIONAL_WHEN_CONFIGURED — only require approver when the split option has
+                        approver_role or allowed_approvers configured. Otherwise
+                        auto-approve. Mixed lines create a mix of PENDING and
+                        APPROVED branches.
+    SKIP_ALL — no approver required for any line; all branches are auto-approved
+                        and the parent step completes immediately.
+    """
+    REQUIRED_FOR_ALL = "REQUIRED_FOR_ALL", "Required For All"
+    OPTIONAL_WHEN_CONFIGURED = "OPTIONAL_WHEN_CONFIGURED", "Optional When Configured"
+    SKIP_ALL = "SKIP_ALL", "Skip All"
 
 
 class InstanceStatus(models.TextChoices):
@@ -118,6 +140,7 @@ class WorkflowEventType(models.TextChoices):
     BRANCHES_JOINED = "BRANCHES_JOINED", "Branches Joined"
     SPLIT_ALLOCATIONS_SUBMITTED = "SPLIT_ALLOCATIONS_SUBMITTED", "Split Allocations Submitted"
     SPLIT_ALLOCATION_CORRECTED = "SPLIT_ALLOCATION_CORRECTED", "Split Allocation Corrected"
+    SINGLE_ALLOCATION_SUBMITTED = "SINGLE_ALLOC_SUBMITTED", "Single Allocation Submitted"
     ALLOCATION_BUDGET_RESERVED = "ALLOCATION_BUDGET_RESERVED", "Allocation Budget Reserved"
     ALLOCATION_BUDGET_RELEASED = "ALLOCATION_BUDGET_RELEASED", "Allocation Budget Released"
     ALLOCATION_BUDGET_CONSUMED = "ALLOCATION_BUDGET_CONSUMED", "Allocation Budget Consumed"
@@ -143,16 +166,29 @@ class AssignmentState(models.TextChoices):
 
 class WorkflowTemplate(models.Model):
     """
-    Identity of a workflow for a given module at a given node.
-    One template per (module, scope_node). Versions are separate rows.
+    Identity of a workflow variant for a given module at a given node.
+    Multiple templates (variants) can exist per (module, scope_node), each with a unique code.
+    Versions are separate rows per template.
+
+    code       — stable slug, unique per (module, scope_node). Auto-generated from name if blank.
+    is_active  — inactive templates are hidden from eligible-workflows and auto-resolution.
+    is_default — at most one default per (module, scope_node). Used by automatic resolve fallback.
     """
     name = models.CharField(max_length=255)
+    code = models.SlugField(
+        max_length=100,
+        blank=True,
+        help_text="Stable slug identifier, unique per module+scope_node. Auto-generated from name if blank.",
+    )
+    description = models.TextField(blank=True, default="")
     module = models.CharField(max_length=50, help_text="e.g. invoice, campaign, vendor, budget")
     scope_node = models.ForeignKey(
         "core.ScopeNode",
         on_delete=models.CASCADE,
         related_name="workflow_templates",
     )
+    is_active = models.BooleanField(default=True)
+    is_default = models.BooleanField(default=False)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -166,10 +202,32 @@ class WorkflowTemplate(models.Model):
         db_table = "workflow_templates"
         constraints = [
             models.UniqueConstraint(
+                fields=["module", "scope_node", "code"],
+                name="unique_template_code_per_module_per_node",
+            ),
+            models.UniqueConstraint(
                 fields=["module", "scope_node"],
-                name="unique_template_per_module_per_node",
+                condition=models.Q(is_default=True),
+                name="unique_default_per_module_per_node",
             ),
         ]
+
+    def save(self, *args, **kwargs):
+        if not self.code and self.scope_node_id:
+            from django.utils.text import slugify
+            base = slugify(self.name)[:90] or "template"
+            existing_codes = set(
+                WorkflowTemplate.objects.filter(
+                    module=self.module, scope_node_id=self.scope_node_id
+                ).exclude(pk=self.pk).values_list("code", flat=True)
+            )
+            code = base
+            i = 1
+            while code in existing_codes:
+                code = f"{base}-{i}"
+                i += 1
+            self.code = code
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.name} [{self.module} @ {self.scope_node}]"
@@ -377,6 +435,15 @@ class WorkflowStep(models.Model):
     allow_multiple_lines_per_entity = models.BooleanField(
         default=False,
         help_text="Allow more than one allocation row for the same entity",
+    )
+    branch_approval_policy = models.CharField(
+        max_length=30,
+        choices=BranchApprovalPolicy.choices,
+        default=BranchApprovalPolicy.REQUIRED_FOR_ALL,
+        help_text=(
+            "Controls whether branches from this split step require explicit approval. "
+            "Only applies when step_kind=RUNTIME_SPLIT_ALLOCATION."
+        ),
     )
     created_at = models.DateTimeField(auto_now_add=True)
 

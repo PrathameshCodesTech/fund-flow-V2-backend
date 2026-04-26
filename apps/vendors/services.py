@@ -30,6 +30,8 @@ from apps.vendors.models import (
     VendorFinanceDecision,
     VendorInvitation,
     VendorOnboardingSubmission,
+    VendorProfileRevision,
+    VendorProfileRevisionStatus,
 )
 
 
@@ -66,54 +68,214 @@ class POMandate(ValueError):
 # ---------------------------------------------------------------------------
 
 _VRF_LABEL_MAP = {
+    # Core identity
     "vendor name": "vendor_name",
+    "vendor_name": "vendor_name",
+    "title": "title",
     "vendor type": "vendor_type",
+    "vendor_type": "vendor_type",
     "gst registered": "gst_registered",
+    "gst_registered": "gst_registered",
     "gstin": "gstin",
     "pan": "pan",
     "email": "email",
     "e-mail": "email",
     "phone": "phone",
     "mobile": "phone",
+    "fax": "fax",
+    "region": "region",
+    "head office no": "head_office_no",
+    # Address
     "address line 1": "address_line1",
     "address line1": "address_line1",
     "address line 2": "address_line2",
     "address line2": "address_line2",
+    "address line 3": "address_line3",
+    "address line3": "address_line3",
     "city": "city",
     "state": "state",
     "country": "country",
     "pincode": "pincode",
     "pin code": "pincode",
     "zip code": "pincode",
+    # Bank — core
     "bank name": "bank_name",
     "bank": "bank_name",
+    "beneficiary name": "beneficiary_name",
     "account number": "account_number",
     "beneficiary account number": "account_number",
     "account no": "account_number",
+    "account type": "bank_account_type",
+    "bank account type": "bank_account_type",
     "ifsc": "ifsc",
     "ifsc code": "ifsc",
+    "preferred payment mode": "preferred_payment_mode",
+    "payment mode": "preferred_payment_mode",
+    "micr code": "micr_code",
+    "micr": "micr_code",
+    "neft code": "neft_code",
+    # Bank — branch contact
+    "bank branch address line 1": "bank_branch_address_line1",
+    "bank branch address line1": "bank_branch_address_line1",
+    "bank branch address line 2": "bank_branch_address_line2",
+    "bank branch address line2": "bank_branch_address_line2",
+    "bank branch city": "bank_branch_city",
+    "bank branch state": "bank_branch_state",
+    "bank branch country": "bank_branch_country",
+    "bank branch pincode": "bank_branch_pincode",
+    "bank phone": "bank_phone",
+    "bank fax": "bank_fax",
+    # MSME / compliance
+    "msme registered": "msme_registered",
+    "msme_registration_number": "msme_registration_number",
+    "udyam registration no": "msme_registration_number",
+    "udyam_reg_no": "msme_registration_number",
+    "enterprise type": "msme_enterprise_type",
+    "enterprise_type": "msme_enterprise_type",
+    "msme_enterprise_type": "msme_enterprise_type",
+    "authorized signatory name": "authorized_signatory_name",
+    "authorized_signatory_name": "authorized_signatory_name",
+    "declaration accepted": "declaration_accepted",
+    "declaration_accepted": "declaration_accepted",
 }
 
 _KNOWN_KEYS = set(_VRF_LABEL_MAP.values())
 
 # Keys that map directly from normalized name to model field
 _NORM_FIELD_MAP = {
+    # Core identity
+    "title": "normalized_title",
     "vendor_name": "normalized_vendor_name",
     "vendor_type": "normalized_vendor_type",
     "email": "normalized_email",
     "phone": "normalized_phone",
+    "fax": "normalized_fax",
+    "region": "normalized_region",
+    "head_office_no": "normalized_head_office_no",
     "gst_registered": "normalized_gst_registered",
     "gstin": "normalized_gstin",
     "pan": "normalized_pan",
+    # Address
     "address_line1": "normalized_address_line1",
     "address_line2": "normalized_address_line2",
+    "address_line3": "normalized_address_line3",
     "city": "normalized_city",
     "state": "normalized_state",
     "country": "normalized_country",
     "pincode": "normalized_pincode",
+    # Bank core
+    "preferred_payment_mode": "normalized_preferred_payment_mode",
+    "beneficiary_name": "normalized_beneficiary_name",
     "bank_name": "normalized_bank_name",
     "account_number": "normalized_account_number",
+    "bank_account_type": "normalized_bank_account_type",
     "ifsc": "normalized_ifsc",
+    "micr_code": "normalized_micr_code",
+    "neft_code": "normalized_neft_code",
+    # Bank branch contact
+    "bank_branch_address_line1": "normalized_bank_branch_address_line1",
+    "bank_branch_address_line2": "normalized_bank_branch_address_line2",
+    "bank_branch_city": "normalized_bank_branch_city",
+    "bank_branch_state": "normalized_bank_branch_state",
+    "bank_branch_country": "normalized_bank_branch_country",
+    "bank_branch_pincode": "normalized_bank_branch_pincode",
+    "bank_phone": "normalized_bank_phone",
+    "bank_fax": "normalized_bank_fax",
+    # MSME / compliance
+    "authorized_signatory_name": "normalized_authorized_signatory_name",
+    "msme_registered": "normalized_msme_registered",
+    "msme_registration_number": "normalized_msme_registration_number",
+    "msme_enterprise_type": "normalized_msme_enterprise_type",
+    "declaration_accepted": "declaration_accepted",
+}
+
+# Snapshot field names — Vendor field names that participate in profile revisions.
+# Key = snapshot dict key (also the field label). Value = Vendor model field name.
+_VENDOR_PROFILE_SNAPSHOT_FIELDS = {
+    "vendor_name": "vendor_name",
+    "email": "email",
+    "phone": "phone",
+    "title": "title",
+    "vendor_type": "vendor_type",
+    "fax": "fax",
+    "region": "region",
+    "head_office_no": "head_office_no",
+    "gst_registered": "gst_registered",
+    "gstin": "gstin",
+    "pan": "pan",
+    "address_line1": "address_line1",
+    "address_line2": "address_line2",
+    "address_line3": "address_line3",
+    "city": "city",
+    "state": "state",
+    "country": "country",
+    "pincode": "pincode",
+    "preferred_payment_mode": "preferred_payment_mode",
+    "beneficiary_name": "beneficiary_name",
+    "bank_name": "bank_name",
+    "account_number": "account_number",
+    "bank_account_type": "bank_account_type",
+    "ifsc": "ifsc",
+    "micr_code": "micr_code",
+    "neft_code": "neft_code",
+    "bank_branch_address_line1": "bank_branch_address_line1",
+    "bank_branch_address_line2": "bank_branch_address_line2",
+    "bank_branch_city": "bank_branch_city",
+    "bank_branch_state": "bank_branch_state",
+    "bank_branch_country": "bank_branch_country",
+    "bank_branch_pincode": "bank_branch_pincode",
+    "bank_phone": "bank_phone",
+    "bank_fax": "bank_fax",
+    "authorized_signatory_name": "authorized_signatory_name",
+    "msme_registered": "msme_registered",
+    "msme_registration_number": "msme_registration_number",
+    "msme_enterprise_type": "msme_enterprise_type",
+    "declaration_accepted": "declaration_accepted",
+    "contact_persons_json": "contact_persons_json",
+    "head_office_address_json": "head_office_address_json",
+    "tax_registration_details_json": "tax_registration_details_json",
+}
+
+_SUBMISSION_TO_VENDOR_FIELD_MAP = {
+    "normalized_title": "title",
+    "normalized_vendor_name": "vendor_name",
+    "normalized_vendor_type": "vendor_type",
+    "normalized_email": "email",
+    "normalized_phone": "phone",
+    "normalized_fax": "fax",
+    "normalized_region": "region",
+    "normalized_head_office_no": "head_office_no",
+    "normalized_gst_registered": "gst_registered",
+    "normalized_gstin": "gstin",
+    "normalized_pan": "pan",
+    "normalized_address_line1": "address_line1",
+    "normalized_address_line2": "address_line2",
+    "normalized_address_line3": "address_line3",
+    "normalized_city": "city",
+    "normalized_state": "state",
+    "normalized_country": "country",
+    "normalized_pincode": "pincode",
+    "normalized_preferred_payment_mode": "preferred_payment_mode",
+    "normalized_beneficiary_name": "beneficiary_name",
+    "normalized_bank_name": "bank_name",
+    "normalized_account_number": "account_number",
+    "normalized_bank_account_type": "bank_account_type",
+    "normalized_ifsc": "ifsc",
+    "normalized_micr_code": "micr_code",
+    "normalized_neft_code": "neft_code",
+    "normalized_bank_branch_address_line1": "bank_branch_address_line1",
+    "normalized_bank_branch_address_line2": "bank_branch_address_line2",
+    "normalized_bank_branch_city": "bank_branch_city",
+    "normalized_bank_branch_state": "bank_branch_state",
+    "normalized_bank_branch_country": "bank_branch_country",
+    "normalized_bank_branch_pincode": "bank_branch_pincode",
+    "normalized_bank_phone": "bank_phone",
+    "normalized_bank_fax": "bank_fax",
+    "normalized_authorized_signatory_name": "authorized_signatory_name",
+    "normalized_msme_registered": "msme_registered",
+    "normalized_msme_registration_number": "msme_registration_number",
+    "normalized_msme_enterprise_type": "msme_enterprise_type",
+    "declaration_accepted": "declaration_accepted",
 }
 
 
@@ -204,22 +366,63 @@ def _apply_normalized_fields(submission: VendorOnboardingSubmission, normalized:
                 setattr(submission, field, str(value).strip() if value is not None else "")
 
 
-def _extract_normalized_from_payload(payload: dict) -> tuple[dict, dict]:
+def _extract_normalized_from_payload(payload: dict) -> tuple[dict, dict, dict, dict, dict]:
     """
-    Split payload into normalized core fields and remaining raw data.
+    Split payload into normalized core fields, remaining raw data,
+    and JSON blocks (contact_persons, head_office_address, tax_registration_details).
 
-    Returns (normalized_dict, remaining_raw_dict).
+    Returns (normalized_dict, raw_dict, contact_persons, head_office_address, tax_registration_details).
     """
     normalized = {}
     raw = {}
+    contact_persons = None
+    head_office_address = None
+    tax_registration_details = None
+
+    JSON_BLOCK_KEYS = {"contact_persons", "head_office_address", "tax_registration_details"}
+
     for key, value in payload.items():
         lower_key = key.strip().lower()
         mapped = _VRF_LABEL_MAP.get(lower_key, lower_key.replace(" ", "_"))
-        if mapped in _KNOWN_KEYS:
+        if mapped in JSON_BLOCK_KEYS and isinstance(value, (dict, list)):
+            if mapped == "contact_persons":
+                contact_persons = value if isinstance(value, list) else [value]
+            elif mapped == "head_office_address":
+                head_office_address = value if isinstance(value, dict) else {}
+            elif mapped == "tax_registration_details":
+                tax_registration_details = value if isinstance(value, dict) else {}
+        elif mapped in _KNOWN_KEYS:
             normalized[mapped] = value
         else:
             raw[key] = value
-    return normalized, raw
+
+    return normalized, raw, contact_persons, head_office_address, tax_registration_details
+
+
+def _apply_normalized_fields(submission: VendorOnboardingSubmission, normalized: dict) -> None:
+    """Write normalized dict values onto submission model fields."""
+    from apps.vendors.models import ALLOWED_MSME_ENTERPRISE_TYPES
+    for key, field in _NORM_FIELD_MAP.items():
+        if key in normalized:
+            value = normalized[key]
+            if key in ("gst_registered", "msme_registered", "declaration_accepted"):
+                if isinstance(value, bool):
+                    pass  # use as-is
+                elif isinstance(value, str):
+                    value = value.strip().lower() in ("yes", "true", "1", "y")
+                else:
+                    value = bool(value)
+            elif key == "msme_enterprise_type":
+                normalized_value = str(value).strip().lower()
+                if normalized_value and normalized_value not in ALLOWED_MSME_ENTERPRISE_TYPES:
+                    raise ValueError(
+                        f"msme_enterprise_type must be one of {sorted(ALLOWED_MSME_ENTERPRISE_TYPES)}; "
+                        f"got '{value}'."
+                    )
+                value = normalized_value
+            else:
+                value = str(value).strip() if value is not None else ""
+            setattr(submission, field, value)
 
 
 def _get_export_dir() -> Path:
@@ -257,6 +460,25 @@ def _build_audit_log(user, action: str, resource_type: str, resource_id: int, me
         )
     except Exception:
         pass  # Audit failure must never block business logic
+
+
+def _build_vendor_defaults_from_submission(submission: VendorOnboardingSubmission, invitation) -> dict:
+    defaults = {
+        "org": invitation.org,
+        "scope_node": invitation.scope_node,
+        "sap_vendor_id": submission.finance_vendor_code or "",
+        "marketing_status": MarketingStatus.PENDING,
+        "operational_status": OperationalStatus.WAITING_MARKETING_APPROVAL,
+        "contact_persons_json": submission.contact_persons_json or [],
+        "head_office_address_json": submission.head_office_address_json or {},
+        "tax_registration_details_json": submission.tax_registration_details_json or {},
+    }
+    for submission_field, vendor_field in _SUBMISSION_TO_VENDOR_FIELD_MAP.items():
+        defaults[vendor_field] = getattr(submission, submission_field, None)
+    defaults["vendor_name"] = defaults.get("vendor_name") or invitation.vendor_name_hint or "Unknown Vendor"
+    defaults["email"] = defaults.get("email") or ""
+    defaults["phone"] = defaults.get("phone") or ""
+    return defaults
 
 
 # ---------------------------------------------------------------------------
@@ -310,29 +532,29 @@ _logger = logging.getLogger(__name__)
 
 def _send_invitation_email(invitation: VendorInvitation, invited_by) -> None:
     """Send the vendor onboarding invitation email. Mocked in tests."""
+    from apps.vendors.email import send_vendor_invitation_email
+
+    portal_base = getattr(settings, "VENDOR_PORTAL_BASE_URL", "http://localhost:5173")
+    onboarding_url = f"{portal_base}/vendor/onboarding/{invitation.token}"
+    if invited_by:
+        invited_by_name = invited_by.get_full_name().strip() or invited_by.email
+    else:
+        invited_by_name = "Fund Flow"
+
     try:
-        from apps.vendors.email import send_vendor_invitation_email
-
-        portal_base = getattr(settings, "VENDOR_PORTAL_BASE_URL", "http://localhost:5173")
-        onboarding_url = f"{portal_base}/vendor/onboarding/{invitation.token}"
-        if invited_by:
-            invited_by_name = invited_by.get_full_name().strip() or invited_by.email
-        else:
-            invited_by_name = "Fund Flow"
-
         send_vendor_invitation_email(
             vendor_email=invitation.vendor_email,
             vendor_name_hint=invitation.vendor_name_hint,
             onboarding_url=onboarding_url,
             invited_by_name=invited_by_name,
         )
-    except Exception as exc:
-        _logger.warning(
-            "Failed to send vendor invitation email for %s (invitation_id=%s): %s",
+    except Exception:
+        _logger.exception(
+            "Failed to send vendor invitation email for %s (invitation_id=%s)",
             invitation.vendor_email,
             invitation.pk,
-            exc,
         )
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -408,14 +630,25 @@ def create_or_update_submission_from_manual(
             f"Submission {submission.pk} is in status '{submission.status}' — cannot edit."
         )
 
-    normalized, remaining_raw = _extract_normalized_from_payload(payload)
+    normalized, remaining_raw, contact_persons, head_office_address, tax_registration_details = _extract_normalized_from_payload(payload)
 
     # Preserve any previously stored raw data and merge
     merged_raw = {**submission.raw_form_data, **payload}
     submission.raw_form_data = merged_raw
     submission.submission_mode = SubmissionMode.MANUAL
 
-    _apply_normalized_fields(submission, normalized)
+    try:
+        _apply_normalized_fields(submission, normalized)
+    except ValueError as exc:
+        raise SubmissionStateError(str(exc)) from exc
+
+    # Store structured JSON blocks
+    if contact_persons is not None:
+        submission.contact_persons_json = contact_persons
+    if head_office_address is not None:
+        submission.head_office_address_json = head_office_address
+    if tax_registration_details is not None:
+        submission.tax_registration_details_json = tax_registration_details
 
     # Persist payload state before finance transition.
     # For new submissions pk is None — save() inserts; for existing drafts it updates.
@@ -479,7 +712,7 @@ def create_or_update_submission_from_excel(
         key = _VRF_LABEL_MAP.get(lower, label_str)
         extracted[key] = value
 
-    normalized, _ = _extract_normalized_from_payload(extracted)
+    normalized, _, _, _, _ = _extract_normalized_from_payload(extracted)
 
     existing_qs = invitation.submissions.filter(
         status__in=[SubmissionStatus.DRAFT, SubmissionStatus.REOPENED]
@@ -543,7 +776,17 @@ def attach_document(
 
     For backward compatibility, file_name + file_url without a file_obj still
     work (metadata-only record).
+
+    Raises:
+        ValueError — document_type is not in ALLOWED_ATTACHMENT_DOCUMENT_TYPES
     """
+    from apps.vendors.models import ALLOWED_ATTACHMENT_DOCUMENT_TYPES
+    if document_type and document_type not in ALLOWED_ATTACHMENT_DOCUMENT_TYPES:
+        raise ValueError(
+            f"document_type '{document_type}' is not allowed. "
+            f"Accepted types: {', '.join(sorted(ALLOWED_ATTACHMENT_DOCUMENT_TYPES))}"
+        )
+
     resolved_name = file_name
     if file_obj and not resolved_name:
         from pathlib import Path
@@ -613,35 +856,118 @@ def generate_vendor_export_excel(submission: VendorOnboardingSubmission) -> str:
 
     # Section 1: Company
     row = _section(row, "SECTION 1: COMPANY INFORMATION")
+    row = _row(row, "Title", submission.normalized_title)
     row = _row(row, "Vendor Name", submission.normalized_vendor_name)
     row = _row(row, "Vendor Type", submission.normalized_vendor_type)
+    row = _row(row, "Region", submission.normalized_region)
+    row = _row(row, "Email", submission.normalized_email)
+    row = _row(row, "Phone", submission.normalized_phone)
+    row = _row(row, "Fax", submission.normalized_fax)
+    row = _row(row, "Head Office No", submission.normalized_head_office_no)
+    row += 1
+
+    # Section 2: GST / Tax
+    row = _section(row, "SECTION 2: GST / TAX REGISTRATION")
     row = _row(row, "GST Registered", "Yes" if submission.normalized_gst_registered else "No" if submission.normalized_gst_registered is False else "")
     row = _row(row, "GSTIN", submission.normalized_gstin)
     row = _row(row, "PAN", submission.normalized_pan)
-    row = _row(row, "Email", submission.normalized_email)
-    row = _row(row, "Phone", submission.normalized_phone)
     row += 1
 
-    # Section 2: Address
-    row = _section(row, "SECTION 2: ADDRESS")
+    # Section 3: Address
+    row = _section(row, "SECTION 3: ADDRESS")
     row = _row(row, "Address Line 1", submission.normalized_address_line1)
     row = _row(row, "Address Line 2", submission.normalized_address_line2)
+    row = _row(row, "Address Line 3", submission.normalized_address_line3)
     row = _row(row, "City", submission.normalized_city)
     row = _row(row, "State", submission.normalized_state)
     row = _row(row, "Country", submission.normalized_country)
     row = _row(row, "Pincode", submission.normalized_pincode)
     row += 1
 
-    # Section 3: Bank
-    row = _section(row, "SECTION 3: BANK DETAILS")
+    # Section 4: Bank core
+    row = _section(row, "SECTION 4: BANK DETAILS")
+    row = _row(row, "Preferred Payment Mode", submission.normalized_preferred_payment_mode)
+    row = _row(row, "Beneficiary Name", submission.normalized_beneficiary_name)
     row = _row(row, "Bank Name", submission.normalized_bank_name)
     row = _row(row, "Account Number", submission.normalized_account_number)
+    row = _row(row, "Account Type", submission.normalized_bank_account_type)
     row = _row(row, "IFSC Code", submission.normalized_ifsc)
+    row = _row(row, "MICR Code", submission.normalized_micr_code)
+    row = _row(row, "NEFT Code", submission.normalized_neft_code)
     row += 1
 
-    # Section 4: Additional raw data
+    # Section 5: Bank branch contact
+    row = _section(row, "SECTION 5: BANK BRANCH CONTACT")
+    row = _row(row, "Branch Address Line 1", submission.normalized_bank_branch_address_line1)
+    row = _row(row, "Branch Address Line 2", submission.normalized_bank_branch_address_line2)
+    row = _row(row, "Branch City", submission.normalized_bank_branch_city)
+    row = _row(row, "Branch State", submission.normalized_bank_branch_state)
+    row = _row(row, "Branch Country", submission.normalized_bank_branch_country)
+    row = _row(row, "Branch Pincode", submission.normalized_bank_branch_pincode)
+    row = _row(row, "Branch Phone", submission.normalized_bank_phone)
+    row = _row(row, "Branch Fax", submission.normalized_bank_fax)
+    row += 1
+
+    # Section 6: MSME
+    row = _section(row, "SECTION 6: MSME / COMPLIANCE")
+    row = _row(row, "MSME Registered", "Yes" if submission.normalized_msme_registered else "No" if submission.normalized_msme_registered is False else "")
+    row = _row(row, "MSME Registration Number", submission.normalized_msme_registration_number)
+    row = _row(row, "MSME Enterprise Type", submission.normalized_msme_enterprise_type)
+    row = _row(row, "Authorized Signatory Name", submission.normalized_authorized_signatory_name)
+    row = _row(row, "Declaration Accepted", "Yes" if submission.declaration_accepted else "No" if submission.declaration_accepted is False else "")
+    row += 1
+
+    # Section 7: Contact persons
+    row = _section(row, "SECTION 7: CONTACT PERSONS")
+    contact_persons = submission.contact_persons_json or []
+    if contact_persons:
+        for cp in contact_persons:
+            cp_type = cp.get("type", "general_queries") or "general_queries"
+            row = _row(row, f"CP [{cp_type}] Name", cp.get("name", ""))
+            row = _row(row, f"CP [{cp_type}] Designation", cp.get("designation", ""))
+            row = _row(row, f"CP [{cp_type}] Email", cp.get("email", ""))
+            row = _row(row, f"CP [{cp_type}] Telephone", cp.get("telephone", ""))
+            row += 1
+    else:
+        row = _row(row, "(none provided)", "")
+        row += 1
+
+    # Section 8: Head office address
+    row = _section(row, "SECTION 8: HEAD OFFICE ADDRESS")
+    hoa = submission.head_office_address_json or {}
+    if hoa:
+        row = _row(row, "Address Line 1", hoa.get("address_line1", ""))
+        row = _row(row, "Address Line 2", hoa.get("address_line2", ""))
+        row = _row(row, "City", hoa.get("city", ""))
+        row = _row(row, "State", hoa.get("state", ""))
+        row = _row(row, "Country", hoa.get("country", ""))
+        row = _row(row, "Pincode", hoa.get("pincode", ""))
+        row = _row(row, "Phone", hoa.get("phone", ""))
+        row = _row(row, "Fax", hoa.get("fax", ""))
+    else:
+        row = _row(row, "(none provided)", "")
+    row += 1
+
+    # Section 9: Tax registration details
+    row = _section(row, "SECTION 9: TAX REGISTRATION DETAILS")
+    taxd = submission.tax_registration_details_json or {}
+    if taxd:
+        row = _row(row, "Tax Registration Nos", taxd.get("tax_registration_nos", ""))
+        row = _row(row, "TIN No", taxd.get("tin_no", ""))
+        row = _row(row, "CST No", taxd.get("cst_no", ""))
+        row = _row(row, "LST No", taxd.get("lst_no", ""))
+        row = _row(row, "ESIC Reg No", taxd.get("esic_reg_no", ""))
+        row = _row(row, "PAN Ref No", taxd.get("pan_ref_no", ""))
+        row = _row(row, "PPF No", taxd.get("ppf_no", ""))
+    else:
+        row = _row(row, "(none provided)", "")
+    row += 1
+
+    # Section 10: Additional raw data
     raw = submission.raw_form_data or {}
-    extra = {k: v for k, v in raw.items() if k not in _NORM_FIELD_MAP and k not in _KNOWN_KEYS}
+    extra = {k: v for k, v in raw.items()
+             if k not in _NORM_FIELD_MAP and k not in _KNOWN_KEYS
+             and k not in ("contact_persons", "head_office_address", "tax_registration_details")}
     if extra:
         row = _section(row, "SECTION 4: ADDITIONAL INFORMATION")
         for k, v in extra.items():
@@ -820,18 +1146,11 @@ def finance_approve_submission(
 
     # Create or upsert Vendor
     invitation = submission.invitation
+    vendor_defaults = _build_vendor_defaults_from_submission(submission, invitation)
+    vendor_defaults["sap_vendor_id"] = sap_vendor_id.strip()
     vendor, _ = Vendor.objects.update_or_create(
         onboarding_submission=submission,
-        defaults={
-            "org": invitation.org,
-            "scope_node": invitation.scope_node,
-            "vendor_name": submission.normalized_vendor_name or invitation.vendor_name_hint,
-            "email": submission.normalized_email,
-            "phone": submission.normalized_phone,
-            "sap_vendor_id": sap_vendor_id.strip(),
-            "marketing_status": MarketingStatus.PENDING,
-            "operational_status": OperationalStatus.WAITING_MARKETING_APPROVAL,
-        },
+        defaults=vendor_defaults,
     )
 
     _build_audit_log(
@@ -1210,14 +1529,16 @@ def assert_vendor_can_submit_invoice(vendor: Vendor, po_number: str = None) -> N
     Gate check before a vendor submits an invoice.
 
     Raises:
-        VendorStateError — vendor is not active
-        POMandate        — vendor requires PO but none supplied
+        VendorStateError        — vendor is not active
+        VendorProfileHoldError  — vendor has an active profile revision hold
+        POMandate               — vendor requires PO but none supplied
     """
     if vendor.operational_status != OperationalStatus.ACTIVE:
         raise VendorStateError(
             f"Vendor {vendor.pk} is not active (status: '{vendor.operational_status}'). "
             "Cannot submit invoice."
         )
+    assert_vendor_profile_not_on_hold(vendor)
     if vendor.po_mandate_enabled and not po_number:
         raise POMandate(
             f"Vendor {vendor.pk} requires a PO number for invoice submission."
@@ -1302,3 +1623,375 @@ def finalize_submission(
     )
 
     return submission
+
+
+# ---------------------------------------------------------------------------
+# Vendor Profile Revision
+# ---------------------------------------------------------------------------
+
+class VendorProfileHoldError(ValueError):
+    """Vendor is on profile hold — operation blocked until revision resolves."""
+
+
+def assert_vendor_profile_not_on_hold(vendor: Vendor) -> None:
+    """
+    Raise VendorProfileHoldError if vendor has an active profile revision hold.
+    Call at invoice submission, workflow approval, and finance action gate points.
+    """
+    if vendor.profile_change_pending:
+        reason = vendor.profile_hold_reason or "A profile revision is pending review."
+        raise VendorProfileHoldError(
+            f"Vendor {vendor.pk} is on profile hold: {reason}"
+        )
+
+
+def build_vendor_live_snapshot(vendor: Vendor) -> dict:
+    """
+    Extract the approved live profile from the Vendor model directly.
+    This is the authoritative source of truth for the vendor's approved profile.
+    Snapshot keys match _VENDOR_PROFILE_SNAPSHOT_FIELDS keys.
+    """
+    snapshot = {key: getattr(vendor, field, None) for key, field in _VENDOR_PROFILE_SNAPSHOT_FIELDS.items()}
+    submission = vendor.onboarding_submission
+    if not submission:
+        return snapshot
+
+    fallback_pairs = {
+        "title": submission.normalized_title,
+        "vendor_name": submission.normalized_vendor_name,
+        "vendor_type": submission.normalized_vendor_type,
+        "email": submission.normalized_email,
+        "phone": submission.normalized_phone,
+        "fax": submission.normalized_fax,
+        "region": submission.normalized_region,
+        "head_office_no": submission.normalized_head_office_no,
+        "gst_registered": submission.normalized_gst_registered,
+        "gstin": submission.normalized_gstin,
+        "pan": submission.normalized_pan,
+        "address_line1": submission.normalized_address_line1,
+        "address_line2": submission.normalized_address_line2,
+        "address_line3": submission.normalized_address_line3,
+        "city": submission.normalized_city,
+        "state": submission.normalized_state,
+        "country": submission.normalized_country,
+        "pincode": submission.normalized_pincode,
+        "preferred_payment_mode": submission.normalized_preferred_payment_mode,
+        "beneficiary_name": submission.normalized_beneficiary_name,
+        "bank_name": submission.normalized_bank_name,
+        "account_number": submission.normalized_account_number,
+        "bank_account_type": submission.normalized_bank_account_type,
+        "ifsc": submission.normalized_ifsc,
+        "micr_code": submission.normalized_micr_code,
+        "neft_code": submission.normalized_neft_code,
+        "bank_branch_address_line1": submission.normalized_bank_branch_address_line1,
+        "bank_branch_address_line2": submission.normalized_bank_branch_address_line2,
+        "bank_branch_city": submission.normalized_bank_branch_city,
+        "bank_branch_state": submission.normalized_bank_branch_state,
+        "bank_branch_country": submission.normalized_bank_branch_country,
+        "bank_branch_pincode": submission.normalized_bank_branch_pincode,
+        "bank_phone": submission.normalized_bank_phone,
+        "bank_fax": submission.normalized_bank_fax,
+        "authorized_signatory_name": submission.normalized_authorized_signatory_name,
+        "msme_registered": submission.normalized_msme_registered,
+        "msme_registration_number": submission.normalized_msme_registration_number,
+        "msme_enterprise_type": submission.normalized_msme_enterprise_type,
+        "declaration_accepted": submission.declaration_accepted,
+        "contact_persons_json": submission.contact_persons_json,
+        "head_office_address_json": submission.head_office_address_json,
+        "tax_registration_details_json": submission.tax_registration_details_json,
+    }
+
+    for key, fallback in fallback_pairs.items():
+        current = snapshot.get(key)
+        if current in ("", None, [], {}) and fallback not in ("", None, [], {}):
+            snapshot[key] = fallback
+    return snapshot
+
+
+def compute_changed_fields(proposed: dict, source: dict) -> list:
+    """Compare two profile snapshots. Return sorted list of differing field keys."""
+    return sorted(
+        key for key in set(proposed) | set(source)
+        if proposed.get(key) != source.get(key)
+    )
+
+
+@transaction.atomic
+def get_or_create_editable_profile_revision(vendor: Vendor, actor=None) -> VendorProfileRevision:
+    """
+    Return the existing editable (draft/reopened) profile revision for vendor,
+    or create a new one seeded with the current live snapshot.
+    Does NOT place the vendor on hold — that happens at submit time.
+    """
+    existing = vendor.profile_revisions.filter(
+        status__in=[VendorProfileRevisionStatus.DRAFT, VendorProfileRevisionStatus.REOPENED]
+    ).order_by("-created_at").first()
+    if existing:
+        return existing
+
+    last = vendor.profile_revisions.order_by("-revision_number").first()
+    revision_number = (last.revision_number + 1) if last else 1
+
+    source_snapshot = build_vendor_live_snapshot(vendor)
+    return VendorProfileRevision.objects.create(
+        vendor=vendor,
+        revision_number=revision_number,
+        status=VendorProfileRevisionStatus.DRAFT,
+        proposed_snapshot_json=source_snapshot.copy(),
+        source_revision_snapshot_json=source_snapshot,
+        changed_fields_json=[],
+        created_by=actor,
+        updated_by=actor,
+    )
+
+
+@transaction.atomic
+def save_draft_profile_revision(
+    revision: VendorProfileRevision,
+    proposed_snapshot: dict,
+    actor=None,
+) -> VendorProfileRevision:
+    """
+    Update proposed_snapshot_json and recompute changed_fields_json.
+    Revision must be draft or reopened.
+    """
+    if revision.status not in (VendorProfileRevisionStatus.DRAFT, VendorProfileRevisionStatus.REOPENED):
+        raise SubmissionStateError(
+            f"Revision {revision.pk} is in '{revision.status}' — cannot edit."
+        )
+    revision.proposed_snapshot_json = proposed_snapshot
+    revision.changed_fields_json = compute_changed_fields(
+        proposed_snapshot, revision.source_revision_snapshot_json
+    )
+    revision.updated_by = actor
+    revision.save(update_fields=["proposed_snapshot_json", "changed_fields_json", "updated_by", "updated_at"])
+    return revision
+
+
+@transaction.atomic
+def submit_profile_revision(revision: VendorProfileRevision, actor=None) -> VendorProfileRevision:
+    """
+    Submit a profile revision for internal review. Places the vendor on hold.
+    Transitions: draft/reopened → submitted.
+    """
+    if revision.status not in (VendorProfileRevisionStatus.DRAFT, VendorProfileRevisionStatus.REOPENED):
+        raise SubmissionStateError(
+            f"Revision {revision.pk} is in '{revision.status}' — cannot submit."
+        )
+    if not revision.changed_fields_json:
+        raise ValueError("No fields have changed — nothing to submit.")
+
+    now = timezone.now()
+    revision.status = VendorProfileRevisionStatus.SUBMITTED
+    revision.submitted_at = now
+    revision.updated_by = actor
+    revision.save(update_fields=["status", "submitted_at", "updated_by", "updated_at"])
+
+    vendor = revision.vendor
+    vendor.profile_change_pending = True
+    vendor.profile_hold_reason = f"Profile revision #{revision.revision_number} submitted for review."
+    vendor.active_profile_revision = revision
+    vendor.profile_hold_started_at = now
+    vendor.save(update_fields=[
+        "profile_change_pending", "profile_hold_reason",
+        "active_profile_revision", "profile_hold_started_at", "updated_at",
+    ])
+
+    _build_audit_log(
+        user=actor,
+        action="vendor_profile_revision_submitted",
+        resource_type="VendorProfileRevision",
+        resource_id=revision.pk,
+        metadata={"vendor_id": vendor.pk, "revision_number": revision.revision_number},
+    )
+    return revision
+
+
+@transaction.atomic
+def finance_approve_profile_revision(revision: VendorProfileRevision, actor=None) -> VendorProfileRevision:
+    """
+    Finance approves a submitted profile revision.
+    Transitions to finance_approved; apply is the only valid final path after that.
+    """
+    if revision.status != VendorProfileRevisionStatus.SUBMITTED:
+        raise SubmissionStateError(
+            f"Revision {revision.pk} is in '{revision.status}' — finance cannot approve."
+        )
+    now = timezone.now()
+    revision.status = VendorProfileRevisionStatus.FINANCE_APPROVED
+    revision.approved_at = now
+    revision.updated_by = actor
+    revision.save(update_fields=["status", "approved_at", "updated_by", "updated_at"])
+
+    _build_audit_log(
+        user=actor,
+        action="vendor_profile_revision_finance_approved",
+        resource_type="VendorProfileRevision",
+        resource_id=revision.pk,
+        metadata={"vendor_id": revision.vendor_id},
+    )
+    return revision
+
+
+@transaction.atomic
+def finance_reject_profile_revision(
+    revision: VendorProfileRevision,
+    actor=None,
+    note: str = "",
+) -> VendorProfileRevision:
+    """
+    Finance rejects a submitted profile revision. Lifts vendor hold.
+    """
+    if revision.status != VendorProfileRevisionStatus.SUBMITTED:
+        raise SubmissionStateError(
+            f"Revision {revision.pk} is in '{revision.status}' — finance cannot reject."
+        )
+    revision.status = VendorProfileRevisionStatus.FINANCE_REJECTED
+    revision.updated_by = actor
+    revision.save(update_fields=["status", "updated_by", "updated_at"])
+
+    _lift_vendor_profile_hold(revision.vendor)
+
+    _build_audit_log(
+        user=actor,
+        action="vendor_profile_revision_finance_rejected",
+        resource_type="VendorProfileRevision",
+        resource_id=revision.pk,
+        metadata={"vendor_id": revision.vendor_id, "note": note},
+    )
+    return revision
+
+
+@transaction.atomic
+def reopen_profile_revision(
+    revision: VendorProfileRevision,
+    actor=None,
+    note: str = "",
+) -> VendorProfileRevision:
+    """
+    Reopen a finance-rejected revision for vendor corrections.
+    Transitions: finance_rejected → reopened. Re-places vendor on hold.
+    """
+    if revision.status != VendorProfileRevisionStatus.FINANCE_REJECTED:
+        raise SubmissionStateError(
+            f"Revision {revision.pk} is in '{revision.status}' — can only reopen from 'finance_rejected'."
+        )
+    now = timezone.now()
+    revision.status = VendorProfileRevisionStatus.REOPENED
+    revision.updated_by = actor
+    revision.save(update_fields=["status", "updated_by", "updated_at"])
+
+    vendor = revision.vendor
+    vendor.profile_change_pending = True
+    vendor.profile_hold_reason = f"Profile revision #{revision.revision_number} reopened for corrections."
+    vendor.active_profile_revision = revision
+    vendor.profile_hold_started_at = now
+    vendor.save(update_fields=[
+        "profile_change_pending", "profile_hold_reason",
+        "active_profile_revision", "profile_hold_started_at", "updated_at",
+    ])
+
+    _build_audit_log(
+        user=actor,
+        action="vendor_profile_revision_reopened",
+        resource_type="VendorProfileRevision",
+        resource_id=revision.pk,
+        metadata={"vendor_id": revision.vendor_id, "note": note},
+    )
+    return revision
+
+
+
+
+@transaction.atomic
+def apply_vendor_profile_revision(revision: VendorProfileRevision, actor=None) -> VendorProfileRevision:
+    """
+    Write proposed_snapshot_json fields directly onto the Vendor model.
+    Vendor is the authoritative approved live profile source of truth.
+    Mark the revision as applied and lift the vendor hold.
+    """
+    if revision.status != VendorProfileRevisionStatus.FINANCE_APPROVED:
+        raise SubmissionStateError(
+            f"Revision {revision.pk} is in '{revision.status}' — cannot apply."
+        )
+    snapshot = revision.proposed_snapshot_json or {}
+    vendor = revision.vendor
+
+    update_fields = ["updated_at"]
+    for snapshot_key, vendor_field in _VENDOR_PROFILE_SNAPSHOT_FIELDS.items():
+        if snapshot_key in snapshot:
+            val = snapshot[snapshot_key]
+            # Normalise booleans for BooleanFields
+            if isinstance(val, str) and vendor._meta.get_field(vendor_field).get_internal_type() == "BooleanField":
+                val = val.strip().lower() in ("yes", "true", "1", "y")
+            elif val is None:
+                val = ""
+            elif not isinstance(val, bool) and not isinstance(val, (dict, list)):
+                val = str(val).strip()
+            current = getattr(vendor, vendor_field, None)
+            if val != current:
+                setattr(vendor, vendor_field, val)
+                update_fields.append(vendor_field)
+
+    now = timezone.now()
+    revision.status = VendorProfileRevisionStatus.APPLIED
+    revision.applied_at = now
+    revision.updated_by = actor
+    revision.save(update_fields=["status", "applied_at", "updated_by", "updated_at"])
+
+    _lift_vendor_profile_hold(vendor, extra_update_fields=update_fields)
+
+    _build_audit_log(
+        user=actor,
+        action="vendor_profile_revision_applied",
+        resource_type="VendorProfileRevision",
+        resource_id=revision.pk,
+        metadata={"vendor_id": vendor.pk, "changed_fields": revision.changed_fields_json},
+    )
+    return revision
+
+
+@transaction.atomic
+def cancel_profile_revision(revision: VendorProfileRevision, actor=None) -> VendorProfileRevision:
+    """
+    Cancel an in-progress profile revision. Lifts vendor hold if held by this revision.
+    """
+    terminal = {
+        VendorProfileRevisionStatus.APPLIED,
+        VendorProfileRevisionStatus.CANCELLED,
+    }
+    if revision.status in terminal:
+        raise SubmissionStateError(
+            f"Revision {revision.pk} is already in terminal state '{revision.status}'."
+        )
+    revision.status = VendorProfileRevisionStatus.CANCELLED
+    revision.updated_by = actor
+    revision.save(update_fields=["status", "updated_by", "updated_at"])
+
+    vendor = revision.vendor
+    if vendor.active_profile_revision_id == revision.pk:
+        _lift_vendor_profile_hold(vendor)
+
+    _build_audit_log(
+        user=actor,
+        action="vendor_profile_revision_cancelled",
+        resource_type="VendorProfileRevision",
+        resource_id=revision.pk,
+        metadata={"vendor_id": vendor.pk},
+    )
+    return revision
+
+
+def _lift_vendor_profile_hold(vendor: Vendor, extra_update_fields: list = None) -> None:
+    """Clear all profile hold fields on the Vendor record."""
+    vendor.profile_change_pending = False
+    vendor.profile_hold_reason = ""
+    vendor.active_profile_revision = None
+    vendor.profile_hold_started_at = None
+    fields = [
+        "profile_change_pending", "profile_hold_reason",
+        "active_profile_revision", "profile_hold_started_at", "updated_at",
+    ]
+    if extra_update_fields:
+        fields = list(set(fields) | set(extra_update_fields))
+    vendor.save(update_fields=fields)

@@ -22,6 +22,296 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Submission validation result
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SubmissionValidationResult:
+    is_valid: bool
+    field_errors: dict[str, list[str]] = field(default_factory=dict)
+    warnings: list[dict[str, str]] = field(default_factory=list)
+
+
+class SubmissionValidationError(ValueError):
+    """Raised when submission validation fails with field-level errors."""
+    def __init__(self, result: SubmissionValidationResult):
+        self.result = result
+        super().__init__("Submission validation failed.")
+
+
+# ---------------------------------------------------------------------------
+# Workflow route validation helpers
+# ---------------------------------------------------------------------------
+
+def _validate_workflow_route_for_submission(submission, send_to_route):
+    """
+    Returns (published_version, first_step) if the route is viable for the
+    submission's scope node, otherwise raises VendorRouteError.
+
+    Checks:
+    1. route.is_active
+    2. route.workflow_template.is_active
+    3. route.workflow_template.module == "invoice"
+    4. Published WorkflowTemplateVersion exists
+    5. Template scope is at or above submission's scope_node (ancestry check)
+    6. First actionable step has at least one eligible actor
+       (default_user active first, else users with required_role at resolved node)
+    """
+    from apps.core.services import get_ancestors
+    from apps.access.selectors import get_users_with_role_at_node
+    from apps.workflow.services import get_first_actionable_step, resolve_step_target_node
+    from apps.workflow.models import VersionStatus
+
+    if not send_to_route.is_active:
+        raise VendorRouteError(
+            f"The selected 'Send To' option '{send_to_route.label}' is not active."
+        )
+
+    template = send_to_route.workflow_template
+    if not template.is_active:
+        raise VendorRouteError(
+            f"Route '{send_to_route.label}' is misconfigured: "
+            "the mapped workflow template is not active. Contact your administrator."
+        )
+
+    if template.module != "invoice":
+        raise VendorRouteError(
+            f"Route '{send_to_route.label}' is misconfigured: "
+            "the mapped workflow template is not an invoice workflow. "
+            "Contact your administrator."
+        )
+
+    published_version = (
+        template.versions.filter(status=VersionStatus.PUBLISHED)
+        .order_by("-version_number")
+        .first()
+    )
+    if published_version is None:
+        raise VendorRouteError(
+            f"Route '{send_to_route.label}' is misconfigured: "
+            "the mapped workflow template has no published version. "
+            "Contact your administrator."
+        )
+
+    # Scope ancestry: template's scope_node must be at or above submission's scope_node
+    template_scope = template.scope_node
+    submission_scope = submission.scope_node
+    if template_scope.pk != submission_scope.pk:
+        ancestor_paths = submission_scope.get_ancestors_from_path()
+        if template_scope.path not in ancestor_paths:
+            raise VendorRouteError(
+                f"Route '{send_to_route.label}' is not available for invoices "
+                f"at '{submission_scope.code}'. The workflow is scoped to "
+                f"'{template_scope.code}' which is not an ancestor of this node."
+            )
+
+    # Actor viability: first actionable step must have an eligible actor
+    first_step = get_first_actionable_step(published_version)
+    if first_step is None:
+        raise VendorRouteError(
+            f"Route '{send_to_route.label}' is misconfigured: "
+            "the workflow has no actionable steps. Contact your administrator."
+        )
+
+    resolved_node = resolve_step_target_node(first_step, submission_scope)
+    if first_step.default_user and first_step.default_user.is_active:
+        pass  # valid — default user takes precedence
+    elif get_users_with_role_at_node(first_step.required_role, resolved_node).exists():
+        pass  # valid — at least one active user has the required role
+    else:
+        raise VendorRouteError(
+            f"Route '{send_to_route.label}' has no eligible approvers configured "
+            f"for the first step ('{first_step.name}'). "
+            "Assign someone with the role to proceed."
+        )
+
+    return published_version, first_step
+
+
+def validate_vendor_submission_for_submit(submission, send_to_route) -> SubmissionValidationResult:
+    """
+    Run full submission validation before submit:
+      - Blocking (A): submission/vendor/normalized_data field checks
+      - Blocking (B): duplicate detection (returned as field_errors)
+      - Blocking (C): workflow route viability (raises VendorRouteError)
+      - Warnings: non-blocking feedback (low confidence, far due date, missing description)
+    Returns SubmissionValidationResult with is_valid, field_errors, warnings.
+    """
+    nd = submission.normalized_data or {}
+    vendor = submission.vendor
+    field_errors: dict[str, list[str]] = {}
+    warnings: list[dict[str, str]] = []
+    invoice_date = None
+
+    # ── A: Submission / vendor / data checks ──────────────────────────────────
+
+    if not nd:
+        field_errors["_normalized_data"] = [
+            "Submission has no extracted data. Please upload a valid invoice document."
+        ]
+
+    if vendor:
+        if vendor.operational_status != "active":
+            field_errors["vendor_status"] = [
+                f"Vendor is currently {vendor.operational_status}. "
+                "Only active vendors can receive invoices."
+            ]
+    else:
+        field_errors["vendor"] = ["No vendor is associated with this submission."]
+
+    # Invoice number
+    if not nd.get("vendor_invoice_number"):
+        field_errors.setdefault("vendor_invoice_number", []).append(
+            "Invoice number is required."
+        )
+
+    # Invoice date
+    invoice_date_str = nd.get("invoice_date", "")
+    if not invoice_date_str:
+        field_errors.setdefault("invoice_date", []).append("Invoice date is required.")
+    else:
+        from django.utils.dateparse import parse_date
+        invoice_date = parse_date(invoice_date_str)
+        if invoice_date is None:
+            field_errors.setdefault("invoice_date", []).append(
+                "Invoice date must be in YYYY-MM-DD format."
+            )
+
+    # Currency
+    currency = nd.get("currency", "")
+    if not currency:
+        field_errors.setdefault("currency", []).append("Currency is required.")
+    elif not re.match(r"^[A-Z]{3}$", currency):
+        field_errors.setdefault("currency", []).append(
+            "Currency must be a 3-letter uppercase code (e.g., INR, USD)."
+        )
+
+    # Total amount
+    total_str = nd.get("total_amount")
+    if not total_str:
+        field_errors.setdefault("total_amount", []).append("Total amount is required.")
+    else:
+        try:
+            total = Decimal(str(total_str))
+            if total <= 0:
+                field_errors.setdefault("total_amount", []).append(
+                    "Total amount must be greater than zero."
+                )
+        except Exception:
+            field_errors.setdefault("total_amount", []).append(
+                "Total amount must be a valid number."
+            )
+
+    # PO mandate
+    if vendor and vendor.po_mandate_enabled and not nd.get("po_number"):
+        field_errors.setdefault("po_number", []).append(
+            "PO number is required for this vendor."
+        )
+
+    # Subtotal + tax vs total consistency
+    sub_str = nd.get("subtotal_amount")
+    tax_str = nd.get("tax_amount")
+    tot_str = nd.get("total_amount")
+    if sub_str and tax_str and tot_str:
+        try:
+            sub = Decimal(str(sub_str))
+            tax = Decimal(str(tax_str))
+            tot = Decimal(str(tot_str))
+            if abs(sub + tax - tot) > Decimal("0.02"):
+                field_errors.setdefault("total_amount", []).append(
+                    "Total amount does not match subtotal + tax. "
+                    "Please review and correct."
+                )
+        except Exception:
+            pass  # already validated as number above
+
+    # Due date
+    due_date_str = nd.get("due_date")
+    if due_date_str:
+        from django.utils.dateparse import parse_date
+        due_date = parse_date(due_date_str)
+        if due_date is None:
+            field_errors.setdefault("due_date", []).append(
+                "Due date must be in YYYY-MM-DD format."
+            )
+        elif invoice_date and due_date < invoice_date:
+            field_errors.setdefault("due_date", []).append(
+                "Due date cannot be before invoice date."
+            )
+
+    # ── B: Duplicate checks (returned as field errors) ───────────────────────
+
+    if nd.get("vendor_invoice_number"):
+        # Check active submissions (exclude cancelled/rejected)
+        dup_sub = VendorInvoiceSubmission.objects.filter(
+            vendor=vendor,
+            normalized_data__vendor_invoice_number=nd["vendor_invoice_number"],
+        ).exclude(
+            status__in=[
+                VendorInvoiceSubmissionStatus.CANCELLED,
+                VendorInvoiceSubmissionStatus.REJECTED,
+            ]
+        ).exclude(pk=submission.pk).exists()
+
+        if dup_sub:
+            field_errors.setdefault("vendor_invoice_number", []).append(
+                "An invoice with this reference has already been submitted."
+            )
+
+        # Check active invoices (exclude rejected/paid)
+        dup_inv = Invoice.objects.filter(
+            vendor=vendor,
+            vendor_invoice_number=nd["vendor_invoice_number"],
+        ).exclude(
+            status__in=[InvoiceStatus.REJECTED, InvoiceStatus.PAID]
+        ).exists()
+
+        if dup_inv:
+            field_errors.setdefault("vendor_invoice_number", []).append(
+                "An invoice with this reference already exists in the system."
+            )
+
+    # ── C: Workflow route viability ─────────────────────────────────────────
+
+    if not field_errors:
+        # Only validate route if no blocking field errors
+        # (route validation raises VendorRouteError which bubbles to caller)
+        _validate_workflow_route_for_submission(submission, send_to_route)
+
+    # ── Warnings (non-blocking) ─────────────────────────────────────────────
+
+    conf = getattr(submission, "confidence_score", None)
+    if conf is not None and conf < 0.7:
+        warnings.append({
+            "code": "low_confidence",
+            "message": "Extraction confidence is low. Please review all fields carefully.",
+        })
+
+    if due_date_str and invoice_date:
+        from django.utils.dateparse import parse_date
+        due_date = parse_date(due_date_str)
+        if due_date and invoice_date:
+            if (due_date - invoice_date).days > 90:
+                warnings.append({
+                    "code": "due_date_far_future",
+                    "message": "Due date is unusually far in the future.",
+                })
+
+    desc = nd.get("description", "").strip()
+    if not desc:
+        warnings.append({
+            "code": "missing_description",
+            "message": "Description is missing.",
+        })
+
+    return SubmissionValidationResult(
+        is_valid=not field_errors,
+        field_errors=field_errors,
+        warnings=warnings,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Core invoice service (preserved from original)
 # ---------------------------------------------------------------------------
 
@@ -217,6 +507,123 @@ def _json_safe_dict(d: dict) -> dict:
     return result
 
 
+PDF_FIELD_SEQUENCE = [
+    "vendor_invoice_number",
+    "invoice_date",
+    "due_date",
+    "currency",
+    "description",
+    "subtotal_amount",
+    "tax_amount",
+    "total_amount",
+    "po_number",
+]
+
+
+def _is_pdf_placeholder_line(line: str) -> bool:
+    text = line.strip()
+    if not text:
+        return True
+    lowered = text.lower()
+    if lowered in {"invoice details", "amounts", "how to submit", "completed sample"}:
+        return True
+    if text in {"1", "2", "3", "4"}:
+        return True
+    return (
+        lowered.startswith("e.g.")
+        or lowered.startswith("yyyy-mm-dd")
+        or lowered.startswith("numeric value")
+        or lowered.startswith("tax portion")
+        or lowered.startswith("grand total")
+        or lowered.startswith("required if")
+        or lowered.startswith("note:")
+        or lowered.startswith("support to confirm")
+        or lowered.startswith("fill in all fields")
+        or lowered.startswith("log in to the vendor portal")
+        or lowered.startswith("attach your invoice file")
+        or lowered.startswith("submit ")
+        or lowered.startswith("fundflow vendor portal")
+        or lowered.startswith("recommended:")
+        or lowered.startswith("brief description")
+    )
+
+
+def _looks_like_invoice_number(value: str) -> bool:
+    text = value.strip()
+    if not text:
+        return False
+    return bool(re.fullmatch(r"[A-Z0-9][A-Z0-9\-\/]{3,}", text, re.IGNORECASE))
+
+
+def _looks_like_currency(value: str) -> bool:
+    return bool(re.fullmatch(r"[A-Z]{3}", value.strip().upper()))
+
+
+def _extract_pdf_template_values(raw_text: str) -> dict[str, Any]:
+    """
+    Extract values from the generated fillable invoice PDF template.
+
+    PyPDF text extraction for this template appends the filled values near the
+    end of the document in field order, after the instructional text. We detect
+    that value block and map it back to invoice fields.
+    """
+    lines = [line.strip() for line in raw_text.splitlines() if line.strip()]
+    if not lines:
+        return {}
+
+    start_idx = None
+    for idx in range(len(lines) - 4):
+        if (
+            _looks_like_invoice_number(lines[idx])
+            and _try_parse_date(lines[idx + 1]) is not None
+            and _try_parse_date(lines[idx + 2]) is not None
+            and _looks_like_currency(lines[idx + 3])
+        ):
+            start_idx = idx
+
+    if start_idx is None:
+        return {}
+
+    value_lines = [
+        line for line in lines[start_idx:]
+        if not _is_pdf_placeholder_line(line)
+    ]
+    if len(value_lines) < 8:
+        return {}
+
+    normalized: dict[str, Any] = {}
+    normalized["vendor_invoice_number"] = value_lines[0]
+    normalized["invoice_date"] = _try_parse_date(value_lines[1])
+    normalized["due_date"] = _try_parse_date(value_lines[2])
+    normalized["currency"] = value_lines[3].upper()
+
+    # Description may span multiple lines until the first numeric amount.
+    cursor = 4
+    description_lines: list[str] = []
+    while cursor < len(value_lines) and _try_parse_decimal(value_lines[cursor]) is None:
+        description_lines.append(value_lines[cursor])
+        cursor += 1
+    if description_lines:
+        normalized["description"] = " ".join(description_lines).strip()
+
+    numeric_fields = ("subtotal_amount", "tax_amount", "total_amount")
+    for field in numeric_fields:
+        if cursor >= len(value_lines):
+            return normalized
+        parsed = _try_parse_decimal(value_lines[cursor])
+        if parsed is None:
+            return normalized
+        normalized[field] = parsed
+        cursor += 1
+
+    if cursor < len(value_lines):
+        po_candidate = value_lines[cursor].strip()
+        if po_candidate and not _is_pdf_placeholder_line(po_candidate):
+            normalized["po_number"] = po_candidate
+
+    return {k: v for k, v in normalized.items() if v not in (None, "")}
+
+
 def extract_excel(file_obj) -> ExtractionResult:
     """
     Extract invoice fields from an Excel workbook (.xlsx/.xls).
@@ -331,6 +738,18 @@ class SubmissionStateError(ValueError):
 
 class DuplicateInvoiceError(ValueError):
     """A submission for the same vendor + invoice number already exists."""
+
+
+class VendorRouteError(ValueError):
+    """
+    The chosen VendorSubmissionRoute is invalid or misconfigured.
+
+    Raised (and transaction rolled back) when:
+    - The route is inactive
+    - The mapped WorkflowTemplate has no published version
+    - The mapped WorkflowTemplate is not active
+    - Workflow activation fails due to unresolved assignees
+    """
 
 
 def _file_hash(file_obj) -> str:
@@ -475,6 +894,39 @@ def _extract_pdf_fallback(submission: VendorInvoiceSubmission) -> ExtractionResu
         warnings.append("PDF text extraction library (PyPDF2) is not installed. Please fill in the details manually.")
     except Exception as exc:
         warnings.append(f"PDF text extraction failed: {exc}")
+
+    raw_cells = {"raw_text": raw_text}
+    normalized = _extract_pdf_template_values(raw_text)
+
+    if not normalized:
+        patterns = {
+            "vendor_invoice_number": r"(?:invoice\s*(?:no\.?|number|#)[:\s]*)([A-Z0-9][A-Z0-9/\-]{3,})",
+            "invoice_date": r"(?:invoice\s*date[:\s]*)([\d]{1,4}[-/][\d]{1,2}[-/][\d]{1,4})",
+            "currency": r"(?:currency[:\s]*)([A-Z]{3})",
+            "po_number": r"(?:po\s*(?:no\.?|number|#)[:\s]*)([A-Z0-9][A-Z0-9/\-]{3,})",
+        }
+        for field, pattern in patterns.items():
+            match = re.search(pattern, raw_text, re.IGNORECASE)
+            if match:
+                normalized[field] = match.group(1).strip()
+
+    required_fields = ["vendor_invoice_number", "invoice_date", "total_amount", "currency"]
+    matched = sum(1 for field in required_fields if normalized.get(field))
+    confidence = matched / len(required_fields) if required_fields else 0.0
+
+    if not normalized:
+        warnings.append("No invoice fields could be extracted from the PDF. Please enter details manually.")
+        errors.append("No fields could be extracted from the PDF.")
+    elif confidence < 0.5:
+        warnings.append("PDF extraction found only partial invoice data. Please review and complete the fields.")
+
+    return ExtractionResult(
+        raw_cells=raw_cells,
+        normalized=normalized,
+        confidence=confidence,
+        warnings=warnings,
+        errors=errors,
+    )
 
     # Try to extract fields via simple regex from raw text
     normalized = {}
@@ -634,9 +1086,146 @@ def submit_vendor_invoice_submission(submission: VendorInvoiceSubmission, user) 
     submission.final_invoice = invoice
     submission.status = VendorInvoiceSubmissionStatus.SUBMITTED
     submission.submitted_at = timezone.now()
-    submission.save(update_fields=["final_invoice", "status", "submitted_at"])
+    submission.correction_note = ""
+    submission.correction_requested_by = None
+    submission.correction_requested_at = None
+    submission.validation_errors = []
+    submission.save(update_fields=[
+        "final_invoice", "status", "submitted_at",
+        "correction_note", "correction_requested_by", "correction_requested_at",
+        "validation_errors",
+    ])
 
     return invoice
+
+
+def submit_vendor_invoice_with_route(
+    submission: VendorInvoiceSubmission,
+    user,
+    send_to_route,
+) -> tuple[Invoice, list[dict]]:
+    """
+    Primary vendor invoice submission path that auto-routes to a workflow.
+
+    Returns (invoice, warnings_list). Validation failures persist submission
+    errors/status. Invoice/workflow creation stays atomic so no orphan records
+    are left behind.
+    """
+    if submission.status not in (
+        VendorInvoiceSubmissionStatus.UPLOADED,
+        VendorInvoiceSubmissionStatus.NEEDS_CORRECTION,
+        VendorInvoiceSubmissionStatus.READY,
+    ):
+        raise SubmissionStateError(
+            f"Cannot submit ??? submission is in status '{submission.status}'."
+        )
+
+    if submission.vendor_id:
+        from apps.vendors.services import assert_vendor_profile_not_on_hold
+        from apps.vendors.models import Vendor as _Vendor
+        try:
+            _vendor = _Vendor.objects.only(
+                "profile_change_pending", "profile_hold_reason"
+            ).get(pk=submission.vendor_id)
+            assert_vendor_profile_not_on_hold(_vendor)
+        except _Vendor.DoesNotExist:
+            pass
+
+    validation_result = validate_vendor_submission_for_submit(submission, send_to_route)
+
+    if not validation_result.is_valid:
+        submission.validation_errors = [
+            {"field": k, "message": v[0]} for k, v in validation_result.field_errors.items()
+        ]
+        submission.status = VendorInvoiceSubmissionStatus.NEEDS_CORRECTION
+        submission.save(update_fields=["validation_errors", "status"])
+        raise SubmissionValidationError(validation_result)
+
+    with transaction.atomic():
+        nd = submission.normalized_data
+
+        total = nd.get("total_amount")
+        if not total:
+            subtotal = float(nd.get("subtotal_amount") or 0)
+            tax = float(nd.get("tax_amount") or 0)
+            total = Decimal(str(subtotal + tax))
+        else:
+            total = Decimal(str(total))
+
+        from django.utils.dateparse import parse_date
+        invoice_date = parse_date(nd["invoice_date"]) if nd.get("invoice_date") else None
+        due_date = parse_date(nd["due_date"]) if nd.get("due_date") else None
+
+        from apps.workflow.models import WorkflowTemplateVersion, VersionStatus
+        published_version = (
+            WorkflowTemplateVersion.objects
+            .select_related("template")
+            .filter(
+                template=send_to_route.workflow_template,
+                status=VersionStatus.PUBLISHED,
+            )
+            .order_by("-version_number")
+            .first()
+        )
+
+        invoice = Invoice.objects.create(
+            scope_node=submission.scope_node,
+            title=nd.get("vendor_invoice_number", "Untitled Invoice"),
+            amount=total,
+            currency=nd.get("currency", "INR"),
+            vendor=submission.vendor,
+            created_by=user,
+            po_number=nd.get("po_number", ""),
+            vendor_invoice_number=nd.get("vendor_invoice_number", ""),
+            invoice_date=invoice_date,
+            due_date=due_date,
+            subtotal_amount=Decimal(str(nd.get("subtotal_amount", 0))),
+            tax_amount=Decimal(str(nd.get("tax_amount", 0))),
+            description=nd.get("description", ""),
+            status=InvoiceStatus.PENDING_WORKFLOW,
+            selected_workflow_template=send_to_route.workflow_template,
+            selected_workflow_version=published_version,
+            workflow_selected_by=user,
+            workflow_selected_at=timezone.now(),
+        )
+
+        for doc in submission.documents.all():
+            doc.invoice = invoice
+            doc.save(update_fields=["invoice"])
+
+        from apps.workflow.services import create_workflow_instance_draft, activate_workflow_instance
+        instance = create_workflow_instance_draft(
+            template_version=published_version,
+            subject_type="invoice",
+            subject_id=invoice.pk,
+            subject_scope_node=invoice.scope_node,
+            started_by=user,
+        )
+
+        try:
+            activate_workflow_instance(instance, activated_by=user)
+        except ValueError as exc:
+            raise VendorRouteError(
+                f"Route '{send_to_route.label}' cannot start: {exc} "
+                "Assign all required approvers before this route can be used."
+            )
+
+        submission.send_to_route = send_to_route
+        submission.final_invoice = invoice
+        submission.status = VendorInvoiceSubmissionStatus.SUBMITTED
+        submission.submitted_at = timezone.now()
+        submission.correction_note = ""
+        submission.correction_requested_by = None
+        submission.correction_requested_at = None
+        submission.validation_errors = []
+        submission.save(update_fields=[
+            "send_to_route", "final_invoice", "status", "submitted_at",
+            "correction_note", "correction_requested_by", "correction_requested_at",
+            "validation_errors",
+        ])
+
+        invoice.refresh_from_db()
+        return invoice, validation_result.warnings
 
 
 def cancel_vendor_invoice_submission(submission: VendorInvoiceSubmission) -> None:
@@ -976,3 +1565,214 @@ def _pdf_template_fallback() -> HttpResponse:
     response = HttpResponse(content, content_type="text/plain")
     response["Content-Disposition"] = "attachment; filename=Vendor_Invoice_Template.txt"
     return response
+
+
+# ---------------------------------------------------------------------------
+# Invoice Payment — post-finance payment recording
+# ---------------------------------------------------------------------------
+
+class PaymentPermissionError(PermissionError):
+    """Raised when user lacks permission to record a payment."""
+    pass
+
+
+class PaymentValidationError(ValueError):
+    """Raised when payment data fails validation."""
+    pass
+
+
+def _now():
+    from django.utils import timezone
+    return timezone.now()
+
+
+def _get_invoice_eligible_for_payment(invoice) -> bool:
+    """
+    Return True if invoice is in a payment-eligible state.
+
+    Eligible: FINANCE_APPROVED only (finance has cleared it, payment can be recorded).
+    Not eligible: all other statuses including PAID.
+    Once PAID, no new payment recording should be initiated.
+    """
+    from apps.invoices.models import InvoiceStatus
+    return invoice.status == InvoiceStatus.FINANCE_APPROVED
+
+
+def _get_workflow_participants(invoice) -> list:
+    """
+    Return all users who acted as participants in the invoice's workflow chain.
+
+    Includes:
+    - started_by on the WorkflowInstance
+    - assigned_user on every WorkflowInstanceStep for every group in the instance
+    """
+    from apps.workflow.models import WorkflowInstance, WorkflowInstanceStep
+
+    participants = set()
+
+    instances = WorkflowInstance.objects.filter(
+        subject_type="invoice",
+        subject_id=invoice.pk,
+    ).select_related("started_by").prefetch_related("instance_groups__instance_steps__assigned_user")
+
+    for instance in instances:
+        if instance.started_by:
+            participants.add(instance.started_by.pk)
+        for group in instance.instance_groups.all():
+            for step in group.instance_steps.all():
+                if step.assigned_user_id:
+                    participants.add(step.assigned_user_id)
+
+    return list(participants)
+
+
+def can_user_record_invoice_payment(user, invoice) -> bool:
+    """
+    Authorization rule for payment recording on an invoice.
+
+    User can record payment if ALL of:
+      1. Invoice is in FINANCE_APPROVED status (payment-eligible)
+      2. User is a participant in the invoice's workflow chain
+         OR is the invoice creator
+         OR is a superuser/org_admin/tenant_admin
+
+    Permission model:
+    - Mere scope visibility is NOT sufficient (many users can see an invoice
+      but only workflow actors + creator + admin can record payment)
+    """
+    if not _get_invoice_eligible_for_payment(invoice):
+        return False
+
+    if user.is_superuser:
+        return True
+
+    # Resolve assigned role codes directly from DB so this check is not dependent
+    # on serializer-populated convenience attributes.
+    from apps.access.models import UserRoleAssignment
+
+    user_roles = set(
+        UserRoleAssignment.objects.filter(user=user, role__is_active=True)
+        .values_list("role__code", flat=True)
+    )
+
+    # Admin-level roles (same pattern as elsewhere in the codebase)
+    if any(r in ("org_admin", "tenant_admin") for r in user_roles):
+        return True
+
+    # Business override for post-finance payment recording:
+    # once finance has approved externally, Marketing Manager and HOD can
+    # record UTR/payment details in-app even if they were not explicit
+    # workflow participants on this invoice instance.
+    if any(r in ("marketing_manager", "hod") for r in user_roles):
+        return True
+
+    # Invoice creator
+    if invoice.created_by_id == user.pk:
+        return True
+
+    # Workflow participants
+    participant_ids = _get_workflow_participants(invoice)
+    if user.pk in participant_ids:
+        return True
+
+    return False
+
+
+def get_or_create_invoice_payment(invoice) -> "InvoicePayment":
+    """Return existing payment record or create a new pending one."""
+    from apps.invoices.models import InvoicePayment, InvoicePaymentStatus
+
+    payment, created = InvoicePayment.objects.get_or_create(
+        invoice=invoice,
+        defaults={"payment_status": InvoicePaymentStatus.PENDING},
+    )
+    return payment
+
+
+def record_invoice_payment(
+    invoice,
+    actor,
+    data: dict,
+) -> "InvoicePayment":
+    """
+    Create or update the payment record for an invoice.
+
+    If no payment record exists yet, creates one in PENDING.
+    Subsequent calls update the existing record.
+
+    Validation (raises PaymentValidationError):
+      - Invoice must be in FINANCE_APPROVED status
+      - When marking PAID: payment_method, payment_date, paid_amount > 0,
+        and at least one of payment_reference_number / utr_number
+
+    Permission (raises PaymentPermissionError):
+      - Actor must pass can_user_record_invoice_payment()
+
+    Side effects: NONE — no workflow mutation, no budget changes.
+    """
+    from apps.invoices.models import InvoicePayment, InvoicePaymentStatus, PaymentMethod
+
+    # Eligibility check FIRST — before permission
+    # This tells the caller WHY payment cannot be recorded
+    if not _get_invoice_eligible_for_payment(invoice):
+        raise PaymentValidationError(
+            "Payment can only be recorded after finance approval. "
+            f"Invoice is in '{invoice.status}' status."
+        )
+
+    # Permission check
+    if not can_user_record_invoice_payment(actor, invoice):
+        raise PaymentPermissionError(
+            "You do not have permission to record payment for this invoice."
+        )
+
+    # Get or create payment record
+    payment = get_or_create_invoice_payment(invoice)
+
+    # Validate PAID status requirements at service layer
+    if data.get("payment_status") == InvoicePaymentStatus.PAID:
+        errors = {}
+        if not data.get("payment_method"):
+            errors.setdefault("payment_method", []).append("Payment method is required when marking as paid.")
+        if not data.get("payment_date"):
+            errors.setdefault("payment_date", []).append("Payment date is required when marking as paid.")
+        amount = data.get("paid_amount")
+        if not amount or amount <= 0:
+            errors.setdefault("paid_amount", []).append("Paid amount must be greater than zero when marking as paid.")
+        ref = (data.get("payment_reference_number") or "").strip()
+        utr = (data.get("utr_number") or "").strip()
+        if not ref and not utr:
+            errors.setdefault("utr_number", []).append(
+                "At least one of payment_reference_number or utr_number is required when marking as paid."
+            )
+        if errors:
+            raise PaymentValidationError(errors)
+
+    # Apply field updates
+    allowed_fields = [
+        "payment_status", "payment_method",
+        "payment_reference_number", "utr_number",
+        "transaction_id", "bank_reference_number",
+        "payer_bank_name", "beneficiary_name", "beneficiary_bank_name",
+        "paid_amount", "currency", "payment_date", "remarks",
+    ]
+    for field in allowed_fields:
+        if field in data:
+            setattr(payment, field, data[field])
+
+    # On first record (recorded_by is null), set audit fields
+    if payment.recorded_by_id is None:
+        payment.recorded_by = actor
+        payment.recorded_at = _now()
+
+    # Always update updated_by
+    payment.updated_by = actor
+
+    payment.save()
+
+    # If marked PAID, update invoice status to PAID
+    if data.get("payment_status") == InvoicePaymentStatus.PAID:
+        invoice.status = "paid"
+        invoice.save(update_fields=["status", "updated_at"])
+
+    return payment

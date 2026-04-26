@@ -24,25 +24,162 @@ from apps.workflow.models import (
     WorkflowInstanceBranch,
     WorkflowInstanceStep,
 )
-from apps.workflow.services import StepActionError, _emit_event
+from apps.workflow.services import (
+    StepActionError,
+    _emit_event,
+    _advance_on_group_complete as _advance_on_group_complete_util,
+    _release_allocation_budgets,
+)
 
 
 # ---------------------------------------------------------------------------
 # get_runtime_split_options
 # ---------------------------------------------------------------------------
 
+def _build_allowed_entities_for_entity(
+    entity,
+    org_id: int,
+) -> dict:
+    """
+    Build the allowed-entity payload for a single ScopeNode.
+    Used both for WorkflowSplitOption-based entities and freeform invoice-scope entities.
+    Returns categories, subcategories, campaigns, budgets, and budget_lines scoped to the entity.
+    """
+    from apps.budgets.models import Budget, BudgetLine, BudgetCategory, BudgetStatus
+    from apps.campaigns.models import Campaign, CampaignStatus
+
+    target_path = entity.path
+    target_scope_filter = {
+        "budget__scope_node__org_id": org_id,
+        "budget__scope_node__path__startswith": target_path,
+    }
+
+    scoped_lines = (
+        BudgetLine.objects.filter(**target_scope_filter, budget__status=BudgetStatus.ACTIVE)
+        .select_related("budget", "budget__scope_node", "category", "subcategory")
+        .order_by("category__name", "subcategory__name")
+    )
+
+    category_ids: set[int] = set()
+    subcategories = []
+    seen_subcategory_ids: set[int] = set()
+
+    for line in scoped_lines:
+        category_ids.add(line.category_id)
+        if (
+            line.subcategory_id
+            and line.subcategory
+            and line.subcategory.is_active
+            and line.subcategory_id not in seen_subcategory_ids
+        ):
+            seen_subcategory_ids.add(line.subcategory_id)
+            subcategories.append({
+                "id": line.subcategory_id,
+                "name": line.subcategory.name,
+                "category_id": line.category_id,
+                "category_name": line.category.name if line.category else None,
+            })
+
+    campaigns = []
+    for c in (
+        Campaign.objects.filter(
+            **target_scope_filter,
+            status__in=[
+                CampaignStatus.INTERNALLY_APPROVED,
+                CampaignStatus.FINANCE_PENDING,
+                CampaignStatus.FINANCE_APPROVED,
+            ],
+        )
+        .select_related("category", "subcategory", "budget")
+        .order_by("name")
+    ):
+        if c.category_id:
+            category_ids.add(c.category_id)
+        campaigns.append({
+            "id": c.id,
+            "name": c.name,
+            "code": c.code,
+            "category_id": c.category_id,
+            "subcategory_id": c.subcategory_id,
+            "budget_id": c.budget_id,
+            "approved_amount": str(c.approved_amount or 0),
+        })
+
+    categories = [
+        {
+            "id": c.id,
+            "name": c.name,
+            "code": c.code,
+        }
+        for c in BudgetCategory.objects.filter(
+            id__in=category_ids, org_id=org_id, is_active=True
+        ).order_by("name")
+    ]
+
+    budget_ids = set()
+    budgets = []
+    budget_lines = []
+    for line in scoped_lines:
+        budget_lines.append({
+            "id": line.id,
+            "budget_id": line.budget_id,
+            "category_id": line.category_id,
+            "category_name": line.category.name if line.category else None,
+            "subcategory_id": line.subcategory_id,
+            "subcategory_name": line.subcategory.name if line.subcategory else None,
+            "allocated_amount": str(line.allocated_amount),
+        })
+        if line.budget_id not in budget_ids:
+            budget_ids.add(line.budget_id)
+            budgets.append({
+                "id": line.budget.id,
+                "name": line.budget.name,
+                "code": line.budget.code,
+                "scope_node_id": line.budget.scope_node_id,
+                "scope_node_name": line.budget.scope_node.name if line.budget.scope_node else None,
+                "allocated_amount": str(line.budget.allocated_amount),
+                "available_amount": str(line.budget.available_amount),
+                "currency": line.budget.currency,
+            })
+
+    return {
+        "split_option_id": None,
+        "entity_id": entity.id,
+        "entity_name": entity.name,
+        "business_unit_id": entity.id,
+        "business_unit_name": entity.name,
+        "eligible_approvers": [],
+        "approval_required": False,
+        "approval_mode": "AUTO_APPROVE",
+        "categories": categories,
+        "subcategories": subcategories,
+        "campaigns": campaigns,
+        "budgets": budgets,
+        "budget_lines": budget_lines,
+        "default_category_id": None,
+        "default_category_name": None,
+        "default_subcategory_id": None,
+        "default_subcategory_name": None,
+        "default_campaign_id": None,
+        "default_campaign_name": None,
+        "default_budget_id": None,
+    }
+
+
 def get_runtime_split_options(instance_step: WorkflowInstanceStep, user) -> dict:
     """
     Return all the data the frontend needs to render the split allocation form:
       - invoice summary (amount, currency, title, vendor)
-      - allowed entities from WorkflowSplitOption config
-      - eligible approvers per entity
+      - allowed entities: from WorkflowSplitOption config, OR (when no options exist)
+        from the invoice's scope hierarchy (invoice scope node + active direct children).
+        The latter enables freeform allocation without pre-configured split options.
+      - eligible approvers per entity (empty when no options are configured)
       - existing draft/correction allocations for this step (if any)
     """
     from apps.workflow.models import WorkflowSplitOption
     from apps.invoices.models import Invoice, InvoiceAllocation
-    from apps.budgets.models import Budget, BudgetCategory, BudgetStatus
-    from apps.campaigns.models import Campaign, CampaignStatus
+    from apps.budgets.models import BudgetStatus
+    from apps.core.models import ScopeNode
 
     step = instance_step.workflow_step
     instance = instance_step.instance_group.instance
@@ -52,7 +189,6 @@ def get_runtime_split_options(instance_step: WorkflowInstanceStep, user) -> dict
             f"Step {step.id} is not a RUNTIME_SPLIT_ALLOCATION step (kind={step.step_kind})."
         )
 
-    # Invoice subject
     if instance.subject_type != "invoice":
         raise StepActionError("Runtime split allocation is only supported for invoice subjects.")
 
@@ -71,7 +207,6 @@ def get_runtime_split_options(instance_step: WorkflowInstanceStep, user) -> dict
         "scope_node_name": invoice.scope_node.name if invoice.scope_node else None,
     }
 
-    # Split options config
     split_options_qs = WorkflowSplitOption.objects.filter(
         workflow_step=step, is_active=True
     ).select_related(
@@ -79,122 +214,150 @@ def get_runtime_split_options(instance_step: WorkflowInstanceStep, user) -> dict
     ).prefetch_related("allowed_approvers").order_by("display_order")
 
     allowed_entities = []
-    for opt in split_options_qs:
-        target_path = opt.entity.path
-        target_scope_filter = {
-            "scope_node__org_id": opt.entity.org_id,
-            "scope_node__path__startswith": target_path,
-        }
+    org_id = invoice.scope_node.org_id
 
-        category_ids = set()
-        subcategories = []
-        seen_subcategory_ids = set()
-        scoped_budgets = (
-            Budget.objects.filter(**target_scope_filter)
-            .select_related("scope_node", "category", "subcategory")
-            .order_by("scope_node__name", "category__name", "subcategory__name")
-        )
-        for b in scoped_budgets:
-            if b.category_id:
-                category_ids.add(b.category_id)
-            if not b.subcategory_id or not b.subcategory or not b.subcategory.is_active:
-                continue
-            if b.subcategory_id in seen_subcategory_ids:
-                continue
-            seen_subcategory_ids.add(b.subcategory_id)
-            subcategories.append({
-                "id": b.subcategory_id,
-                "name": b.subcategory.name,
-                "category_id": b.category_id,
-                "category_name": b.category.name if b.category else None,
-            })
+    if split_options_qs.exists():
+        # Option 1: configured split options (original path)
+        from apps.budgets.models import BudgetLine, BudgetCategory
+        from apps.campaigns.models import Campaign, CampaignStatus
 
-        campaigns = []
-        for c in (
-            Campaign.objects.filter(
-                **target_scope_filter,
-                status__in=[
-                    CampaignStatus.INTERNALLY_APPROVED,
-                    CampaignStatus.FINANCE_PENDING,
-                    CampaignStatus.FINANCE_APPROVED,
-                ],
+        for opt in split_options_qs:
+            target_path = opt.entity.path
+            target_scope_filter = {
+                "budget__scope_node__org_id": opt.entity.org_id,
+                "budget__scope_node__path__startswith": target_path,
+            }
+
+            category_ids = set()
+            subcategories = []
+            seen_subcategory_ids = set()
+            scoped_lines = (
+                BudgetLine.objects.filter(**target_scope_filter, budget__status=BudgetStatus.ACTIVE)
+                .select_related("budget", "budget__scope_node", "category", "subcategory")
+                .order_by("category__name", "subcategory__name")
             )
-            .select_related("category", "subcategory", "budget")
-            .order_by("name")
-        ):
-            if c.category_id:
-                category_ids.add(c.category_id)
-            campaigns.append({
-                "id": c.id,
-                "name": c.name,
-                "code": c.code,
-                "category_id": c.category_id,
-                "subcategory_id": c.subcategory_id,
-                "budget_id": c.budget_id,
-                "approved_amount": str(c.approved_amount or 0),
+            for line in scoped_lines:
+                category_ids.add(line.category_id)
+                if not line.subcategory_id or not line.subcategory or not line.subcategory.is_active:
+                    continue
+                if line.subcategory_id in seen_subcategory_ids:
+                    continue
+                seen_subcategory_ids.add(line.subcategory_id)
+                subcategories.append({
+                    "id": line.subcategory_id,
+                    "name": line.subcategory.name,
+                    "category_id": line.category_id,
+                    "category_name": line.category.name if line.category else None,
+                })
+
+            campaigns = []
+            for c in (
+                Campaign.objects.filter(
+                    **target_scope_filter,
+                    status__in=[
+                        CampaignStatus.INTERNALLY_APPROVED,
+                        CampaignStatus.FINANCE_PENDING,
+                        CampaignStatus.FINANCE_APPROVED,
+                    ],
+                )
+                .select_related("category", "subcategory", "budget")
+                .order_by("name")
+            ):
+                if c.category_id:
+                    category_ids.add(c.category_id)
+                campaigns.append({
+                    "id": c.id,
+                    "name": c.name,
+                    "code": c.code,
+                    "category_id": c.category_id,
+                    "subcategory_id": c.subcategory_id,
+                    "budget_id": c.budget_id,
+                    "approved_amount": str(c.approved_amount or 0),
+                })
+
+            categories = [
+                {
+                    "id": c.id,
+                    "name": c.name,
+                    "code": c.code,
+                }
+                for c in BudgetCategory.objects.filter(
+                    id__in=category_ids,
+                    org_id=opt.entity.org_id,
+                    is_active=True,
+                ).order_by("name")
+            ]
+
+            # Budget headers deduplicated from lines
+            budget_ids = set()
+            budgets = []
+            budget_lines = []
+            for line in scoped_lines:
+                budget_lines.append({
+                    "id": line.id,
+                    "budget_id": line.budget_id,
+                    "category_id": line.category_id,
+                    "category_name": line.category.name if line.category else None,
+                    "subcategory_id": line.subcategory_id,
+                    "subcategory_name": line.subcategory.name if line.subcategory else None,
+                    "allocated_amount": str(line.allocated_amount),
+                })
+                if line.budget_id not in budget_ids:
+                    budget_ids.add(line.budget_id)
+                    budgets.append({
+                        "id": line.budget.id,
+                        "name": line.budget.name,
+                        "code": line.budget.code,
+                        "scope_node_id": line.budget.scope_node_id,
+                        "scope_node_name": line.budget.scope_node.name if line.budget.scope_node else None,
+                        "allocated_amount": str(line.budget.allocated_amount),
+                        "available_amount": str(line.budget.available_amount),
+                        "currency": line.budget.currency,
+                    })
+
+            # Resolve eligible approvers for this entity
+            eligible_approvers = []
+            if opt.allowed_approvers.exists():
+                eligible_approvers = [
+                    {"id": u.id, "email": u.email, "first_name": u.first_name, "last_name": u.last_name}
+                    for u in opt.allowed_approvers.all()
+                ]
+            elif opt.approver_role:
+                users = get_users_with_role_at_node(opt.approver_role, opt.entity)
+                eligible_approvers = [
+                    {"id": u.id, "email": u.email, "first_name": u.first_name, "last_name": u.last_name}
+                    for u in users
+                ]
+
+            # Determine approval requirement based on step's branch_approval_policy
+            approval_required = _is_approval_required_for_option(step, opt)
+
+            allowed_entities.append({
+                "split_option_id": opt.id,
+                "entity_id": opt.entity_id,
+                "entity_name": opt.entity.name,
+                "business_unit_id": opt.entity_id,
+                "business_unit_name": opt.entity.name,
+                "eligible_approvers": eligible_approvers,
+                "approval_required": approval_required,
+                "approval_mode": _get_approval_mode_label(step.branch_approval_policy, opt),
+                "categories": categories,
+                "subcategories": subcategories,
+                "campaigns": campaigns,
+                "budgets": budgets,
+                "budget_lines": budget_lines,
+                "default_category_id": opt.category_id,
+                "default_category_name": opt.category.name if opt.category else None,
+                "default_subcategory_id": opt.subcategory_id,
+                "default_subcategory_name": opt.subcategory.name if opt.subcategory else None,
+                "default_campaign_id": opt.campaign_id,
+                "default_campaign_name": opt.campaign.name if opt.campaign else None,
+                "default_budget_id": opt.budget_id,
             })
-
-        categories = [
-            {
-                "id": c.id,
-                "name": c.name,
-                "code": c.code,
-            }
-            for c in BudgetCategory.objects.filter(
-                id__in=category_ids,
-                org_id=opt.entity.org_id,
-                is_active=True,
-            ).order_by("name")
-        ]
-
-        budgets = [
-            {
-                "id": b.id,
-                "name": str(b),
-                "category_id": b.category_id,
-                "subcategory_id": b.subcategory_id,
-                "scope_node_id": b.scope_node_id,
-                "scope_node_name": b.scope_node.name if b.scope_node else None,
-                "allocated_amount": str(b.allocated_amount),
-                "available_amount": str(b.available_amount),
-                "currency": b.currency,
-            }
-            for b in scoped_budgets.filter(status=BudgetStatus.ACTIVE)
-        ]
-
-        # Resolve eligible approvers for this entity
-        eligible_approvers = []
-        if opt.allowed_approvers.exists():
-            eligible_approvers = [
-                {"id": u.id, "email": u.email, "first_name": u.first_name, "last_name": u.last_name}
-                for u in opt.allowed_approvers.all()
-            ]
-        elif opt.approver_role:
-            users = get_users_with_role_at_node(opt.approver_role, opt.entity)
-            eligible_approvers = [
-                {"id": u.id, "email": u.email, "first_name": u.first_name, "last_name": u.last_name}
-                for u in users
-            ]
-
-        allowed_entities.append({
-            "split_option_id": opt.id,
-            "entity_id": opt.entity_id,
-            "entity_name": opt.entity.name,
-            "business_unit_id": opt.entity_id,
-            "business_unit_name": opt.entity.name,
-            "eligible_approvers": eligible_approvers,
-            "categories": categories,
-            "subcategories": subcategories,
-            "campaigns": campaigns,
-            "budgets": budgets,
-            "default_category_id": opt.category_id,
-            "default_category_name": opt.category.name if opt.category else None,
-            "default_subcategory_id": opt.subcategory_id,
-            "default_subcategory_name": opt.subcategory.name if opt.subcategory else None,
-            "default_campaign_id": opt.campaign_id,
-            "default_campaign_name": opt.campaign.name if opt.campaign else None,
-            "default_budget_id": opt.budget_id,
-        })
+    else:
+        # Freeform path: no WorkflowSplitOption rows configured.
+        # Use the invoice's scope node as the single allowed entity.
+        allowed_entities.append(_build_allowed_entities_for_entity(invoice.scope_node, org_id))
 
     # Existing allocations for correction context
     existing_allocations = []
@@ -230,6 +393,7 @@ def get_runtime_split_options(instance_step: WorkflowInstanceStep, user) -> dict
             "require_campaign": step.require_campaign,
             "allow_multiple_lines_per_entity": step.allow_multiple_lines_per_entity,
             "approver_selection_mode": step.approver_selection_mode,
+            "branch_approval_policy": step.branch_approval_policy,
         },
     }
 
@@ -256,7 +420,7 @@ def submit_runtime_invoice_split(instance_step: WorkflowInstanceStep, actor, all
     from apps.workflow.models import WorkflowSplitOption
     from apps.invoices.models import Invoice, InvoiceAllocation, InvoiceAllocationRevision, InvoiceAllocationStatus
     from apps.budgets.models import Budget, BudgetStatus, SourceType
-    from apps.budgets.services import reserve_budget
+    from apps.budgets.services import reserve_budget_line, resolve_budget_line_for_allocation, BudgetLineNotFoundError
     from django.contrib.auth import get_user_model
     User = get_user_model()
 
@@ -297,6 +461,7 @@ def submit_runtime_invoice_split(instance_step: WorkflowInstanceStep, actor, all
             workflow_step=step, is_active=True
         ).prefetch_related("allowed_approvers").select_related("approver_role")
     }
+    is_freeform = not split_options  # True when no WorkflowSplitOption rows; enables freeform allocation
 
     # --- Validate each allocation line ---
     total = Decimal("0")
@@ -313,8 +478,6 @@ def submit_runtime_invoice_split(instance_step: WorkflowInstanceStep, actor, all
             raise StepActionError(f"Line {i}: 'entity' is required.")
         if amount_raw is None:
             raise StepActionError(f"Line {i}: 'amount' is required.")
-        if approver_id is None:
-            raise StepActionError(f"Line {i}: 'selected_approver' is required.")
 
         try:
             amount = Decimal(str(amount_raw))
@@ -323,33 +486,54 @@ def submit_runtime_invoice_split(instance_step: WorkflowInstanceStep, actor, all
         if amount <= 0:
             raise StepActionError(f"Line {i}: amount must be > 0.")
 
-        if entity_id not in split_options:
-            raise StepActionError(f"Line {i}: entity {entity_id} is not in configured split options.")
+        if is_freeform:
+            # Freeform: no split options configured; entity must be the invoice's scope node
+            if entity_id != invoice.scope_node_id:
+                raise StepActionError(
+                    f"Line {i}: entity {entity_id} is not valid for freeform allocation. "
+                    f"Expected invoice scope node {invoice.scope_node_id}."
+                )
+            opt = None
+            approval_required = False
+        else:
+            if entity_id not in split_options:
+                raise StepActionError(f"Line {i}: entity {entity_id} is not in configured split options.")
+            opt = split_options[entity_id]
+            approval_required = _is_approval_required_for_option(step, opt)
 
         # Duplicate entity check
         entity_counts[entity_id] = entity_counts.get(entity_id, 0) + 1
         if entity_counts[entity_id] > 1 and not step.allow_multiple_lines_per_entity:
             raise StepActionError(f"Line {i}: duplicate entity {entity_id} not allowed (allow_multiple_lines_per_entity=False).")
 
-        opt = split_options[entity_id]
+        approver = None
+        if approval_required:
+            if approver_id is None:
+                raise StepActionError(f"Line {i}: 'selected_approver' is required for entity {entity_id}.")
+            try:
+                approver = User.objects.get(pk=approver_id)
+            except User.DoesNotExist:
+                raise StepActionError(f"Line {i}: approver user {approver_id} not found.")
 
-        # Approver eligibility
-        try:
-            approver = User.objects.get(pk=approver_id)
-        except User.DoesNotExist:
-            raise StepActionError(f"Line {i}: approver user {approver_id} not found.")
-
-        if opt.allowed_approvers.exists():
-            if not opt.allowed_approvers.filter(pk=approver.pk).exists():
-                raise StepActionError(
-                    f"Line {i}: user {approver} is not in the allowed approver pool for entity {entity_id}."
-                )
-        elif opt.approver_role:
-            eligible = get_users_with_role_at_node(opt.approver_role, opt.entity)
-            if not eligible.filter(pk=approver.pk).exists():
-                raise StepActionError(
-                    f"Line {i}: user {approver} does not hold role '{opt.approver_role.name}' at entity {entity_id}."
-                )
+            if opt.allowed_approvers.exists():
+                if not opt.allowed_approvers.filter(pk=approver.pk).exists():
+                    raise StepActionError(
+                        f"Line {i}: user {approver} is not in the allowed approver pool for entity {entity_id}."
+                    )
+            elif opt.approver_role:
+                eligible = get_users_with_role_at_node(opt.approver_role, opt.entity)
+                if not eligible.filter(pk=approver.pk).exists():
+                    raise StepActionError(
+                        f"Line {i}: user {approver} does not hold role '{opt.approver_role.name}' at entity {entity_id}."
+                    )
+        else:
+            # Approval not required — approver may be omitted; we'll auto-approve
+            if approver_id is not None:
+                try:
+                    approver = User.objects.get(pk=approver_id)
+                except User.DoesNotExist:
+                    raise StepActionError(f"Line {i}: approver user {approver_id} not found.")
+                # Permitted but not used for auto-approve lines
 
         # Required field checks
         if step.require_category and not line.get("category"):
@@ -372,7 +556,15 @@ def submit_runtime_invoice_split(instance_step: WorkflowInstanceStep, actor, all
                 raise StepActionError(f"Line {i}: budget {budget.id} is not ACTIVE (status={budget.status}).")
 
         total += amount
-        validated_lines.append({**line, "amount": amount, "approver": approver, "budget_obj": budget, "opt": opt})
+        validated_lines.append({
+            **line,
+            "amount": amount,
+            "approver": approver,
+            "budget_obj": budget,
+            "opt": opt,
+            "approval_required": approval_required,
+            "is_freeform": is_freeform,
+        })
 
     # --- Total validation ---
     from apps.workflow.models import AllocationTotalPolicy
@@ -386,10 +578,11 @@ def submit_runtime_invoice_split(instance_step: WorkflowInstanceStep, actor, all
     now = timezone.now()
     existing_allocs = list(InvoiceAllocation.objects.filter(split_step=instance_step))
     for old in existing_allocs:
-        # Release reserved budget if any
+        # Release reserved budget if any (includes APPROVED — budget stays RESERVED until invoice final approval)
         if old.budget_id and old.status in (
             InvoiceAllocationStatus.SUBMITTED,
             InvoiceAllocationStatus.BRANCH_PENDING,
+            InvoiceAllocationStatus.APPROVED,
             InvoiceAllocationStatus.CORRECTION_REQUIRED,
         ):
             _release_allocation_budget(old, actor)
@@ -398,95 +591,286 @@ def submit_runtime_invoice_split(instance_step: WorkflowInstanceStep, actor, all
         old.status = InvoiceAllocationStatus.CANCELLED
         old.save(update_fields=["status"])
 
-    # Cancel existing pending branches (correction)
-    existing_branches = list(instance_step.branches.filter(status=BranchStatus.PENDING))
-    for branch in existing_branches:
-        branch.status = BranchStatus.REJECTED
-        branch.rejection_reason = "Allocation corrected — branch superseded."
-        branch.acted_at = now
-        branch.save(update_fields=["status", "rejection_reason", "acted_at"])
+    # Delete ALL existing branches so same-entity resubmission doesn't violate
+    # the (parent_instance_step, target_scope_node) unique constraint
+    instance_step.branches.all().delete()
 
     # --- Create allocations and branches ---
     created_allocations = []
     created_branches = []
     budget_results = []
+    any_pending = False
+    freeform_branch = None  # shared branch for all freeform rows (one branch per step+scope_node pair)
 
     for idx, line in enumerate(validated_lines):
         opt = line["opt"]
         approver = line["approver"]
         budget_obj = line["budget_obj"]
+        approval_required = line["approval_required"]
+        line_is_freeform = line.get("is_freeform", False)
+        entity = invoice.scope_node if line_is_freeform else opt.entity
 
-        alloc = InvoiceAllocation.objects.create(
-            invoice=invoice,
-            workflow_instance=instance,
-            split_step=instance_step,
-            entity=opt.entity,
-            category_id=line.get("category"),
-            subcategory_id=line.get("subcategory"),
-            campaign_id=line.get("campaign"),
-            budget=budget_obj,
-            amount=line["amount"],
-            percentage=(line["amount"] / invoice.amount * 100) if invoice.amount else None,
-            selected_approver=approver,
-            status=InvoiceAllocationStatus.SUBMITTED,
-            selected_by=actor,
-            selected_at=now,
-            note=line.get("note", ""),
-            revision_number=1,
-        )
+        if approval_required:
+            # Normal path: pending branch assigned to approver
+            alloc = InvoiceAllocation.objects.create(
+                invoice=invoice,
+                workflow_instance=instance,
+                split_step=instance_step,
+                entity=entity,
+                category_id=line.get("category"),
+                subcategory_id=line.get("subcategory"),
+                campaign_id=line.get("campaign"),
+                budget=budget_obj,
+                amount=line["amount"],
+                percentage=(line["amount"] / invoice.amount * 100) if invoice.amount else None,
+                selected_approver=approver,
+                status=InvoiceAllocationStatus.SUBMITTED,
+                selected_by=actor,
+                selected_at=now,
+                note=line.get("note", ""),
+                revision_number=1,
+            )
 
-        # Reserve budget
-        if budget_obj:
-            source_id = f"invoice:{invoice.id}:allocation:{alloc.id}"
-            try:
-                result = reserve_budget(
-                    budget=budget_obj,
-                    amount=line["amount"],
-                    source_type=SourceType.INVOICE,
-                    source_id=source_id,
-                    requested_by=actor,
-                    note=f"Runtime split allocation for invoice {invoice.id}",
-                )
+            # Reserve budget
+            if budget_obj:
+                source_id = f"invoice:{invoice.id}:allocation:{alloc.id}"
+                try:
+                    budget_line = resolve_budget_line_for_allocation(
+                        budget=budget_obj,
+                        category_id=line.get("category"),
+                        subcategory_id=line.get("subcategory"),
+                    )
+                except BudgetLineNotFoundError as e:
+                    raise StepActionError(f"Budget reservation failed for line {idx}: {e}")
+
+                try:
+                    result = reserve_budget_line(
+                        line=budget_line,
+                        amount=line["amount"],
+                        source_type=SourceType.INVOICE,
+                        source_id=source_id,
+                        requested_by=actor,
+                        note=f"Runtime split allocation for invoice {invoice.id}",
+                    )
+                except Exception as e:
+                    raise StepActionError(f"Budget reservation failed for line {idx}: {e}")
+
+                if result["status"] == "variance_required":
+                    raise StepActionError(
+                        f"Line {idx}: budget {budget_obj.id} requires variance approval "
+                        f"(projected utilization: {result['projected_utilization']:.2f}%). "
+                        "Obtain variance approval and resubmit."
+                    )
+
                 budget_results.append({
                     "allocation_id": alloc.id,
+                    "budget_line_id": budget_line.id,
                     "status": result["status"],
                     "projected_utilization": str(result["projected_utilization"]),
                 })
                 _emit_event(
                     instance, WorkflowEventType.ALLOCATION_BUDGET_RESERVED, actor,
-                    metadata={"allocation_id": alloc.id, "budget_id": budget_obj.id, "amount": str(line["amount"])},
+                    metadata={
+                        "allocation_id": alloc.id,
+                        "budget_id": budget_obj.id,
+                        "budget_line_id": budget_line.id,
+                        "amount": str(line["amount"]),
+                    },
                 )
-            except Exception as e:
-                raise StepActionError(f"Budget reservation failed for line {idx}: {e}")
 
-        # Create branch
-        branch = WorkflowInstanceBranch.objects.create(
-            parent_instance_step=instance_step,
-            instance=instance,
-            target_scope_node=opt.entity,
-            branch_index=idx,
-            status=BranchStatus.PENDING,
-            assigned_user=approver,
-            assignment_state=AssignmentState.ASSIGNED,
-        )
+            # Create pending branch
+            branch = WorkflowInstanceBranch.objects.create(
+                parent_instance_step=instance_step,
+                instance=instance,
+                target_scope_node=entity,
+                branch_index=idx,
+                status=BranchStatus.PENDING,
+                assigned_user=approver,
+                assignment_state=AssignmentState.ASSIGNED,
+            )
+            alloc.branch = branch
+            alloc.status = InvoiceAllocationStatus.BRANCH_PENDING
+            alloc.save(update_fields=["branch", "status"])
 
-        # Link branch to allocation
-        alloc.branch = branch
-        alloc.status = InvoiceAllocationStatus.BRANCH_PENDING
-        alloc.save(update_fields=["branch", "status"])
+            created_allocations.append(alloc)
+            created_branches.append(branch)
+            any_pending = True
 
-        created_allocations.append(alloc)
-        created_branches.append(branch)
+            _emit_event(
+                instance, WorkflowEventType.BRANCH_ASSIGNED, actor,
+                target_user=approver,
+                metadata={"branch_id": branch.id, "allocation_id": alloc.id},
+            )
+        else:
+            # Auto-approve: allocation is immediately approved
+            # Budget reservation still happens
+            alloc = InvoiceAllocation.objects.create(
+                invoice=invoice,
+                workflow_instance=instance,
+                split_step=instance_step,
+                entity=entity,
+                category_id=line.get("category"),
+                subcategory_id=line.get("subcategory"),
+                campaign_id=line.get("campaign"),
+                budget=budget_obj,
+                amount=line["amount"],
+                percentage=(line["amount"] / invoice.amount * 100) if invoice.amount else None,
+                selected_approver=None,
+                status=InvoiceAllocationStatus.APPROVED,
+                selected_by=actor,
+                selected_at=now,
+                approved_by=actor,
+                approved_at=now,
+                note=line.get("note", ""),
+                revision_number=1,
+            )
+            # Budget reservation still happens for auto-approved allocations
+            if budget_obj:
+                source_id = f"invoice:{invoice.id}:allocation:{alloc.id}"
+                try:
+                    budget_line = resolve_budget_line_for_allocation(
+                        budget=budget_obj,
+                        category_id=line.get("category"),
+                        subcategory_id=line.get("subcategory"),
+                    )
+                except BudgetLineNotFoundError as e:
+                    raise StepActionError(f"Budget reservation failed for line {idx}: {e}")
 
+                try:
+                    result = reserve_budget_line(
+                        line=budget_line,
+                        amount=line["amount"],
+                        source_type=SourceType.INVOICE,
+                        source_id=source_id,
+                        requested_by=actor,
+                        note=f"Runtime split allocation for invoice {invoice.id} (auto-approved)",
+                    )
+                except Exception as e:
+                    raise StepActionError(f"Budget reservation failed for line {idx}: {e}")
+
+                if result["status"] == "variance_required":
+                    raise StepActionError(
+                        f"Line {idx}: budget {budget_obj.id} requires variance approval "
+                        f"(projected utilization: {result['projected_utilization']:.2f}%). "
+                        "Obtain variance approval and resubmit."
+                    )
+
+                budget_results.append({
+                    "allocation_id": alloc.id,
+                    "budget_line_id": budget_line.id,
+                    "status": result["status"],
+                    "projected_utilization": str(result["projected_utilization"]),
+                })
+                _emit_event(
+                    instance, WorkflowEventType.ALLOCATION_BUDGET_RESERVED, actor,
+                    metadata={
+                        "allocation_id": alloc.id,
+                        "budget_id": budget_obj.id,
+                        "budget_line_id": budget_line.id,
+                        "amount": str(line["amount"]),
+                    },
+                )
+
+            # Create or reuse an APPROVED branch for audit consistency
+            if line_is_freeform:
+                # Freeform: multiple rows share one branch to satisfy the (step, scope_node)
+                # unique constraint. InvoiceAllocation.branch is OneToOneField — only the first
+                # row links to the branch; subsequent rows leave branch=None.
+                if freeform_branch is None:
+                    freeform_branch = WorkflowInstanceBranch.objects.create(
+                        parent_instance_step=instance_step,
+                        instance=instance,
+                        target_scope_node=entity,
+                        branch_index=0,
+                        status=BranchStatus.APPROVED,
+                        assigned_user=None,
+                        assignment_state=AssignmentState.ASSIGNED,
+                        acted_at=now,
+                        note="Auto-approved: freeform allocation, no branch approver configured.",
+                    )
+                    created_branches.append(freeform_branch)
+                    alloc.branch = freeform_branch
+                    alloc.save(update_fields=["branch"])
+                branch = freeform_branch  # for emit_event below
+            else:
+                branch = WorkflowInstanceBranch.objects.create(
+                    parent_instance_step=instance_step,
+                    instance=instance,
+                    target_scope_node=entity,
+                    branch_index=idx,
+                    status=BranchStatus.APPROVED,
+                    assigned_user=None,
+                    assignment_state=AssignmentState.ASSIGNED,
+                    acted_at=now,
+                    note="Auto-approved: no branch approver configured.",
+                )
+                alloc.branch = branch
+                alloc.save(update_fields=["branch"])
+                created_branches.append(branch)
+
+            created_allocations.append(alloc)
+            # any_pending stays False
+
+            _emit_event(
+                instance, WorkflowEventType.BRANCH_ASSIGNED, actor,
+                metadata={
+                    "branch_id": branch.id,
+                    "allocation_id": alloc.id,
+                    "auto_approved": True,
+                },
+            )
+
+    # --- Update parent split step status ---
+    if any_pending:
+        instance_step.status = StepStatus.WAITING_BRANCHES
+        instance_step.save(update_fields=["status"])
+    else:
+        # All allocations auto-approved — step is immediately complete
+        instance_step.status = StepStatus.APPROVED
+        instance_step.acted_at = now
+        instance_step.note = "All split allocations auto-approved."
+        instance_step.save(update_fields=["status", "acted_at", "note"])
+        # Emit BRANCHES_JOINED so workflow advancement is traceable
         _emit_event(
-            instance, WorkflowEventType.BRANCH_ASSIGNED, actor,
-            target_user=approver,
-            metadata={"branch_id": branch.id, "allocation_id": alloc.id},
+            instance, WorkflowEventType.BRANCHES_JOINED, actor,
+            metadata={
+                "instance_step_id": instance_step.id,
+                "branch_ids": [b.id for b in created_branches],
+                "allocation_ids": [a.id for a in created_allocations],
+                "all_auto_approved": True,
+            },
         )
-
-    # --- Mark split step as WAITING_BRANCHES ---
-    instance_step.status = StepStatus.WAITING_BRANCHES
-    instance_step.save(update_fields=["status"])
+        _advance_on_group_complete_util(instance_step.instance_group, instance, actor)
+        _emit_event(
+            instance, WorkflowEventType.SPLIT_ALLOCATIONS_SUBMITTED, actor,
+            metadata={
+                "instance_step_id": instance_step.id,
+                "allocation_count": len(created_allocations),
+                "allocation_ids": [a.id for a in created_allocations],
+                "branch_ids": [b.id for b in created_branches],
+                "total_amount": str(total),
+                "note": note,
+                "all_auto_approved": True,
+            },
+        )
+        return {
+            "allocations": [
+                {
+                    "id": a.id,
+                    "entity_id": a.entity_id,
+                    "amount": str(a.amount),
+                    "status": a.status,
+                    "branch_id": a.branch_id,
+                    "auto_approved": True,
+                }
+                for a in created_allocations
+            ],
+            "branches": [
+                {"id": b.id, "target_scope_node_id": b.target_scope_node_id, "assigned_user_id": b.assigned_user_id, "status": b.status}
+                for b in created_branches
+            ],
+            "budget_reservation_results": budget_results,
+        }
 
     _emit_event(
         instance, WorkflowEventType.SPLIT_ALLOCATIONS_SUBMITTED, actor,
@@ -512,7 +896,7 @@ def submit_runtime_invoice_split(instance_step: WorkflowInstanceStep, actor, all
             for a in created_allocations
         ],
         "branches": [
-            {"id": b.id, "target_scope_node_id": b.target_scope_node_id, "assigned_user_id": b.assigned_user_id}
+            {"id": b.id, "target_scope_node_id": b.target_scope_node_id, "assigned_user_id": b.assigned_user_id, "status": b.status}
             for b in created_branches
         ],
         "budget_reservation_results": budget_results,
@@ -523,29 +907,108 @@ def submit_runtime_invoice_split(instance_step: WorkflowInstanceStep, actor, all
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _is_approval_required_for_option(step, opt) -> bool:
+    """
+    Returns True when a branch approver is required for the given split option,
+    based on the step's branch_approval_policy.
+    """
+    from apps.workflow.models import BranchApprovalPolicy
+    policy = step.branch_approval_policy
+
+    if policy == BranchApprovalPolicy.REQUIRED_FOR_ALL:
+        return True
+
+    if policy == BranchApprovalPolicy.OPTIONAL_WHEN_CONFIGURED:
+        # Approval required only when the option has an approver configured
+        return bool(opt.approver_role or opt.allowed_approvers.exists())
+
+    # SKIP_ALL — no approval required ever
+    return False
+
+
+def _get_approval_mode_label(policy, opt) -> str:
+    """
+    Returns a human-readable label describing the approval mode for this option.
+    """
+    from apps.workflow.models import BranchApprovalPolicy
+    if policy == BranchApprovalPolicy.REQUIRED_FOR_ALL:
+        return "REQUIRED_FOR_ALL"
+    if policy == BranchApprovalPolicy.SKIP_ALL:
+        return "SKIP_ALL"
+    # OPTIONAL_WHEN_CONFIGURED
+    if opt.approver_role or opt.allowed_approvers.exists():
+        return "REQUIRED_FOR_ALL"  # actually required in this config
+    return "AUTO_APPROVE_NO_APPROVER_CONFIG"
+
+
 def _release_allocation_budget(allocation, actor):
     """Release reserved budget for a single allocation being corrected/cancelled."""
     from apps.budgets.models import SourceType
-    from apps.budgets.services import release_reserved_budget
+    from apps.budgets.services import (
+        release_reserved_budget,
+        release_reserved_budget_line,
+        get_source_reserved_balance,
+        get_source_reserved_balance_for_line,
+        resolve_budget_line_for_allocation,
+        BudgetLineNotFoundError,
+    )
     from apps.workflow.models import WorkflowEventType
 
     if not allocation.budget_id:
         return
     source_id = f"invoice:{allocation.invoice_id}:allocation:{allocation.id}"
+
+    # Try line-level release first (new allocations), fall back to header (legacy)
     try:
-        release_reserved_budget(
+        budget_line = resolve_budget_line_for_allocation(
             budget=allocation.budget,
-            source_type=SourceType.INVOICE,
-            source_id=source_id,
-            released_by=actor,
-            note=f"Allocation {allocation.id} cancelled/corrected",
+            category_id=allocation.category_id,
+            subcategory_id=allocation.subcategory_id,
         )
-        _emit_event(
-            allocation.workflow_instance,
-            WorkflowEventType.ALLOCATION_BUDGET_RELEASED,
-            actor,
-            metadata={"allocation_id": allocation.id, "budget_id": allocation.budget_id},
+        balance = get_source_reserved_balance_for_line(
+            budget_line, SourceType.INVOICE, source_id
         )
+        if balance > 0:
+            release_reserved_budget_line(
+                line=budget_line,
+                amount=balance,
+                source_type=SourceType.INVOICE,
+                source_id=source_id,
+                released_by=actor,
+                note=f"Allocation {allocation.id} cancelled/corrected",
+            )
+            _emit_event(
+                allocation.workflow_instance,
+                WorkflowEventType.ALLOCATION_BUDGET_RELEASED,
+                actor,
+                metadata={
+                    "allocation_id": allocation.id,
+                    "budget_id": allocation.budget_id,
+                    "budget_line_id": budget_line.id,
+                },
+            )
+    except BudgetLineNotFoundError:
+        try:
+            balance = get_source_reserved_balance(
+                allocation.budget, SourceType.INVOICE, source_id
+            )
+            if balance > 0:
+                release_reserved_budget(
+                    budget=allocation.budget,
+                    amount=balance,
+                    source_type=SourceType.INVOICE,
+                    source_id=source_id,
+                    released_by=actor,
+                    note=f"Allocation {allocation.id} cancelled/corrected (legacy)",
+                )
+                _emit_event(
+                    allocation.workflow_instance,
+                    WorkflowEventType.ALLOCATION_BUDGET_RELEASED,
+                    actor,
+                    metadata={"allocation_id": allocation.id, "budget_id": allocation.budget_id},
+                )
+        except Exception:
+            pass  # Budget release failures are non-fatal; ops can correct manually
     except Exception:
         pass  # Budget release failures are non-fatal; ops can correct manually
 
@@ -608,7 +1071,7 @@ def handle_runtime_split_branch_rejection(branch: WorkflowInstanceBranch, acted_
         alloc = None
 
     if rejection_action == RejectionAction.TERMINATE:
-        # Hard terminate — same as before
+        # Hard terminate
         parent_step.status = StepStatus.REJECTED
         parent_step.acted_at = now
         parent_step.save(update_fields=["status", "acted_at"])
@@ -617,23 +1080,8 @@ def handle_runtime_split_branch_rejection(branch: WorkflowInstanceBranch, acted_
         instance.status = "REJECTED"
         instance.completed_at = now
         instance.save(update_fields=["status", "completed_at"])
-        # Release budgets for any allocated-but-not-consumed allocations
-        for a in InvoiceAllocation.objects.filter(workflow_instance=instance).select_related("budget"):
-            if a.budget_id:
-                try:
-                    source_id = f"invoice:{a.invoice_id}:allocation:{a.id}"
-                    from apps.budgets.services import release_reserved_budget
-                    from apps.budgets.models import SourceType
-                    release_reserved_budget(
-                        budget=a.budget,
-                        source_type=SourceType.INVOICE,
-                        source_id=source_id,
-                        released_by=acted_by,
-                        note=f"Instance {instance.id} terminated — budget released",
-                    )
-                except Exception:
-                    pass
-        from apps.workflow.services import _emit_event, _sync_subject_status_on_workflow_change
+        _release_allocation_budgets(instance, acted_by)
+        from apps.workflow.services import _sync_subject_status_on_workflow_change
         _emit_event(instance, WorkflowEventType.INSTANCE_REJECTED, acted_by)
         _sync_subject_status_on_workflow_change(instance)
         return

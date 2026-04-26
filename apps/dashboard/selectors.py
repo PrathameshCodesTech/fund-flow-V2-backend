@@ -500,10 +500,10 @@ def get_insights_category_spend(user):
     )
     rows = list(qs)
     if not rows:
-        from apps.budgets.models import Budget
+        from apps.budgets.models import BudgetLine
         rows = list(
-            Budget.objects
-            .filter(scope_node_id__in=visible, category__isnull=False)
+            BudgetLine.objects
+            .filter(budget__scope_node_id__in=visible, category__isnull=False)
             .values("category__id", "category__name")
             .annotate(amount=DbSum("allocated_amount"), allocation_count=Count("id"))
             .order_by("-amount")[:20]
@@ -540,10 +540,10 @@ def get_insights_subcategory_spend(user):
     )
     rows = list(qs)
     if not rows:
-        from apps.budgets.models import Budget
+        from apps.budgets.models import BudgetLine
         rows = list(
-            Budget.objects
-            .filter(scope_node_id__in=visible, subcategory__isnull=False)
+            BudgetLine.objects
+            .filter(budget__scope_node_id__in=visible, subcategory__isnull=False)
             .values("subcategory__id", "subcategory__name", "category__name")
             .annotate(amount=DbSum("allocated_amount"), allocation_count=Count("id"))
             .order_by("-amount")[:20]
@@ -651,7 +651,7 @@ def get_insights_budget_utilization(user):
         budget_qs = (
             Budget.objects
             .filter(scope_node_id__in=visible)
-            .select_related("scope_node", "category", "subcategory")
+            .select_related("scope_node")
             .order_by("-allocated_amount")[:20]
         )
         for budget in budget_qs:
@@ -661,15 +661,9 @@ def get_insights_budget_utilization(user):
                 util_pct = min(200, round(float(consumed) / float(allocated) * 100, 1)) if allocated else 0
             except (ValueError, ZeroDivisionError):
                 util_pct = 0
-            name_parts = [
-                budget.scope_node.name if budget.scope_node else "Scope",
-                budget.category.name if budget.category else "Budget",
-            ]
-            if budget.subcategory:
-                name_parts.append(budget.subcategory.name)
             results.append({
                 "budget_id": budget.id,
-                "budget_name": " - ".join(name_parts),
+                "budget_name": budget.name or (budget.scope_node.name if budget.scope_node else f"Budget #{budget.id}"),
                 "allocated_amount": str(allocated),
                 "consumed_amount": str(consumed),
                 "remaining_amount": str(max(0, allocated - consumed)),

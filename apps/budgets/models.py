@@ -122,13 +122,13 @@ class BudgetSubCategory(models.Model):
 
 
 # ---------------------------------------------------------------------------
-# Budget
+# Budget (header / named bucket)
 # ---------------------------------------------------------------------------
 
 class Budget(models.Model):
     """
-    Allocates a budget amount to a scope node for a specific category
-    (and optionally subcategory) within a financial period.
+    Named budget bucket for a scope node and financial period.
+    Category/subcategory allocations live on BudgetLine children.
     """
     org = models.ForeignKey(
         "core.Organization",
@@ -144,20 +144,8 @@ class Budget(models.Model):
         null=True,
         blank=True,
     )
-    category = models.ForeignKey(
-        BudgetCategory,
-        on_delete=models.PROTECT,
-        related_name="budgets",
-        null=True,
-        blank=True,
-    )
-    subcategory = models.ForeignKey(
-        BudgetSubCategory,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="budgets",
-    )
+    name = models.CharField(max_length=255, help_text="Human-readable name, e.g. FY27 Marketing - North")
+    code = models.CharField(max_length=100, help_text="Short code, e.g. FY27-MKT-NORTH")
     financial_year = models.CharField(max_length=20, help_text="e.g. 2026-27", null=True, blank=True)
     period_type = models.CharField(
         max_length=20,
@@ -211,41 +199,98 @@ class Budget(models.Model):
         db_table = "budgets"
         constraints = [
             models.UniqueConstraint(
-                fields=[
-                    "scope_node", "category", "subcategory",
-                    "financial_year", "period_type", "period_start", "period_end",
-                ],
-                name="unique_budget_allocation",
+                fields=["scope_node", "financial_year", "code"],
+                name="unique_budget_per_scope_code_year",
             ),
         ]
         indexes = [
             models.Index(fields=["org", "status"]),
             models.Index(fields=["scope_node", "status"]),
-            models.Index(fields=["category", "status"]),
             models.Index(fields=["financial_year"]),
         ]
 
     def __str__(self):
-        sub = f" > {self.subcategory.name}" if self.subcategory else ""
-        return (
-            f"Budget {self.id}: {self.category.name}{sub} "
-            f"@ {self.scope_node.name} [{self.financial_year}] "
-            f"[{self.status}]"
-        )
+        return f"Budget {self.id}: {self.name} [{self.status}]"
 
     @property
     def available_amount(self) -> Decimal:
-        """Amount still available for reservation: allocated - reserved - consumed."""
         result = self.allocated_amount - self.reserved_amount - self.consumed_amount
         return max(result, Decimal("0"))
 
     @property
     def utilization_percent(self) -> Decimal:
-        """Percentage of allocated budget consumed or reserved."""
         if self.allocated_amount == 0:
             return Decimal("0")
         result = ((self.reserved_amount + self.consumed_amount) / self.allocated_amount) * 100
-        return min(result, Decimal("200"))  # cap at 200% for display sanity
+        return min(result, Decimal("200"))
+
+
+# ---------------------------------------------------------------------------
+# BudgetLine
+# ---------------------------------------------------------------------------
+
+class BudgetLine(models.Model):
+    """
+    One category/subcategory allocation line within a Budget header.
+    Reservation and consumption targets the line; the header totals are kept
+    in sync as a denormalised aggregate.
+    """
+    budget = models.ForeignKey(
+        Budget,
+        on_delete=models.CASCADE,
+        related_name="lines",
+    )
+    category = models.ForeignKey(
+        BudgetCategory,
+        on_delete=models.PROTECT,
+        related_name="budget_lines",
+    )
+    subcategory = models.ForeignKey(
+        BudgetSubCategory,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="budget_lines",
+    )
+    allocated_amount = models.DecimalField(
+        max_digits=14, decimal_places=2,
+        default=Decimal("0"),
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+    reserved_amount = models.DecimalField(
+        max_digits=14, decimal_places=2,
+        default=Decimal("0"),
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+    consumed_amount = models.DecimalField(
+        max_digits=14, decimal_places=2,
+        default=Decimal("0"),
+        validators=[MinValueValidator(Decimal("0"))],
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "budget_lines"
+        indexes = [
+            models.Index(fields=["budget", "category"]),
+        ]
+
+    def __str__(self):
+        sub = f" > {self.subcategory.name}" if self.subcategory_id else ""
+        return f"BudgetLine {self.id}: {self.category.name}{sub} [{self.budget_id}]"
+
+    @property
+    def available_amount(self) -> Decimal:
+        result = self.allocated_amount - self.reserved_amount - self.consumed_amount
+        return max(result, Decimal("0"))
+
+    @property
+    def utilization_percent(self) -> Decimal:
+        if self.allocated_amount == 0:
+            return Decimal("0")
+        result = ((self.reserved_amount + self.consumed_amount) / self.allocated_amount) * 100
+        return min(result, Decimal("200"))
 
 
 # ---------------------------------------------------------------------------
@@ -313,12 +358,19 @@ class BudgetRule(models.Model):
 class BudgetConsumption(models.Model):
     """
     Ledger entry tracking each reservation, consumption, release, or adjustment
-    against a budget.
+    against a budget line (and its parent budget header).
     """
     budget = models.ForeignKey(
         Budget,
         on_delete=models.CASCADE,
         related_name="consumptions",
+    )
+    budget_line = models.ForeignKey(
+        BudgetLine,
+        on_delete=models.CASCADE,
+        related_name="consumptions",
+        null=True,
+        blank=True,
     )
     source_type = models.CharField(
         max_length=20,
@@ -355,6 +407,7 @@ class BudgetConsumption(models.Model):
         db_table = "budget_consumptions"
         indexes = [
             models.Index(fields=["budget", "source_type", "source_id"]),
+            models.Index(fields=["budget_line", "source_type", "source_id"]),
             models.Index(fields=["source_type", "source_id"]),
         ]
 
@@ -371,14 +424,21 @@ class BudgetConsumption(models.Model):
 
 class BudgetVarianceRequest(models.Model):
     """
-    Records a request to exceed a budget's approval threshold.
-    Created automatically by reserve_budget() when projected utilization
+    Records a request to exceed a budget line's approval threshold.
+    Created automatically by reserve_budget_line() when projected utilization
     crosses the approval threshold.
     """
     budget = models.ForeignKey(
         Budget,
         on_delete=models.CASCADE,
         related_name="variance_requests",
+    )
+    budget_line = models.ForeignKey(
+        BudgetLine,
+        on_delete=models.CASCADE,
+        related_name="variance_requests",
+        null=True,
+        blank=True,
     )
     source_type = models.CharField(
         max_length=20,
@@ -420,6 +480,7 @@ class BudgetVarianceRequest(models.Model):
         db_table = "budget_variance_requests"
         indexes = [
             models.Index(fields=["budget", "status"]),
+            models.Index(fields=["budget_line", "status"]),
             models.Index(fields=["source_type", "source_id", "status"]),
         ]
 

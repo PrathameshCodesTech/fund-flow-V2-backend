@@ -4,6 +4,7 @@ from apps.budgets.api.views import (
     BudgetCategoryViewSet,
     BudgetSubCategoryViewSet,
     BudgetViewSet,
+    BudgetLineViewSet,
     BudgetRuleViewSet,
     BudgetConsumptionViewSet,
     BudgetVarianceRequestViewSet,
@@ -12,10 +13,10 @@ from apps.budgets.api.views import (
 
 # Register specific prefixes first so they are matched before the greedy
 # BudgetViewSet detail pattern (pk='rules' etc. shadowing).
-# DefaultRouter keeps trailing slashes consistent with the rest of the API.
 router = DefaultRouter()
 router.register("categories", BudgetCategoryViewSet, basename="budgetcategory")
 router.register("subcategories", BudgetSubCategoryViewSet, basename="budgetsubcategory")
+router.register("lines", BudgetLineViewSet, basename="budgetline")
 router.register("rules", BudgetRuleViewSet, basename="budgetrule")
 router.register("consumptions", BudgetConsumptionViewSet, basename="budgetconsumption")
 router.register("variance-requests", BudgetVarianceRequestViewSet, basename="budgetvariancerequest")

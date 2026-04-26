@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from django.db import transaction
 from django.utils import timezone
 
@@ -48,41 +50,227 @@ class StepActionError(ValueError):
     """Raised when a step action is invalid (wrong actor, wrong state, etc.)."""
 
 
+class AllocationCoverageError(ValueError):
+    """
+    Raised when a workflow instance cannot complete internal approval because
+    the invoice's InvoiceAllocation rows do not fully cover the invoice amount.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
+def _has_allocation_capable_step(instance) -> bool:
+    """True when the workflow template version contains at least one allocation step."""
+    return WorkflowStep.objects.filter(
+        group__template_version=instance.template_version,
+        step_kind__in=[StepKind.SINGLE_ALLOCATION, StepKind.RUNTIME_SPLIT_ALLOCATION],
+    ).exists()
+
+
+def _check_allocation_coverage_or_raise(instance):
+    """
+    For invoice subjects whose workflow has an allocation-capable step, validate
+    that InvoiceAllocation rows sum exactly to invoice.amount.
+
+    Active statuses that count toward coverage:
+        SUBMITTED       — single allocation submitted by actor (budget reserved)
+        BRANCH_PENDING  — runtime split branch awaiting approver (budget reserved)
+        APPROVED        — approved by branch approver or auto-approved
+
+    Cancelled, rejected, draft, and correction-required rows are excluded.
+
+    Raises AllocationCoverageError if coverage is incomplete.
+    Silently passes if the workflow has no allocation-capable steps (non-invasive).
+    """
+    if not _has_allocation_capable_step(instance):
+        return
+
+    from apps.invoices.models import Invoice, InvoiceAllocation, InvoiceAllocationStatus
+    from django.db.models import Sum
+
+    try:
+        invoice = Invoice.objects.get(pk=instance.subject_id)
+    except Invoice.DoesNotExist:
+        return  # Can't validate without invoice record — let the handoff layer catch it
+
+    active_statuses = (
+        InvoiceAllocationStatus.SUBMITTED,
+        InvoiceAllocationStatus.BRANCH_PENDING,
+        InvoiceAllocationStatus.APPROVED,
+    )
+    coverage = (
+        InvoiceAllocation.objects.filter(
+            invoice=invoice,
+            workflow_instance=instance,
+            status__in=active_statuses,
+        ).aggregate(total=Sum("amount"))["total"]
+        or Decimal("0")
+    )
+
+    if coverage != invoice.amount:
+        gap = invoice.amount - coverage
+        raise AllocationCoverageError(
+            f"Invoice {invoice.id} allocation coverage is incomplete: "
+            f"{coverage} allocated of {invoice.amount} required "
+            f"(gap: {gap}). Submit full allocation before approving."
+        )
+
+
+def _release_allocation_budgets(instance, actor, note=""):
+    """
+    Release any outstanding reserved budget for every InvoiceAllocation tied to
+    this workflow instance.
+
+    Uses line-level resolution (resolve_budget_line_for_allocation + release_reserved_budget_line)
+    for allocations created after the BudgetLine refactor. Falls back to header-level release
+    only for legacy allocations where the original BudgetLine cannot be determined from
+    (category_id, subcategory_id) context.
+
+    No-op for non-invoice subjects or allocations with no budget.
+    Failures are swallowed so a budget accounting problem never blocks workflow state.
+    """
+    if instance.subject_type != "invoice":
+        return
+
+    from apps.invoices.models import InvoiceAllocation
+    from apps.budgets.models import SourceType
+    from apps.budgets.services import release_reserved_budget, release_reserved_budget_line
+    from apps.budgets.services import resolve_budget_line_for_allocation, get_source_reserved_balance_for_line, BudgetLineNotFoundError
+
+    for alloc in InvoiceAllocation.objects.filter(
+        workflow_instance=instance,
+    ).select_related("budget", "category", "subcategory"):
+        if not alloc.budget_id:
+            continue
+        source_id = f"invoice:{alloc.invoice_id}:allocation:{alloc.id}"
+
+        # Try line-level release first (new allocation path)
+        try:
+            budget_line = resolve_budget_line_for_allocation(
+                budget=alloc.budget,
+                category_id=alloc.category_id,
+                subcategory_id=alloc.subcategory_id,
+            )
+            balance = get_source_reserved_balance_for_line(
+                budget_line, SourceType.INVOICE, source_id
+            )
+            if balance <= Decimal("0"):
+                continue
+            release_reserved_budget_line(
+                line=budget_line,
+                amount=balance,
+                source_type=SourceType.INVOICE,
+                source_id=source_id,
+                released_by=actor,
+                note=note or f"Workflow instance {instance.id} terminated — budget released",
+            )
+            _emit_event(
+                instance,
+                WorkflowEventType.ALLOCATION_BUDGET_RELEASED,
+                actor,
+                metadata={
+                    "allocation_id": alloc.id,
+                    "budget_id": alloc.budget_id,
+                    "budget_line_id": budget_line.id,
+                    "released_amount": str(balance),
+                },
+            )
+        except BudgetLineNotFoundError:
+            # Legacy allocation without matching BudgetLine — fall back to header release
+            try:
+                from apps.budgets.services import get_source_reserved_balance
+                balance = get_source_reserved_balance(alloc.budget, SourceType.INVOICE, source_id)
+                if balance <= Decimal("0"):
+                    continue
+                release_reserved_budget(
+                    budget=alloc.budget,
+                    amount=balance,
+                    source_type=SourceType.INVOICE,
+                    source_id=source_id,
+                    released_by=actor,
+                    note=note or f"Workflow instance {instance.id} terminated — budget released (legacy)",
+                )
+                _emit_event(
+                    instance,
+                    WorkflowEventType.ALLOCATION_BUDGET_RELEASED,
+                    actor,
+                    metadata={
+                        "allocation_id": alloc.id,
+                        "budget_id": alloc.budget_id,
+                        "released_amount": str(balance),
+                        "legacy": True,
+                    },
+                )
+            except Exception:
+                pass  # Non-fatal; ops can reconcile manually
+        except Exception:
+            pass  # Non-fatal; ops can reconcile manually
+
+
 def _consume_allocation_budgets(instance, actor):
-    """Consume reserved budget for all approved allocations when instance is finally approved."""
+    """
+    Consume reserved budget for all approved allocations when instance is finally approved.
+
+    Uses line-level resolution (resolve_budget_line_for_allocation + consume_reserved_budget_line)
+    for allocations created after the BudgetLine refactor. Falls back to header-level consume
+    only for legacy allocations where the original BudgetLine cannot be determined from
+    (category_id, subcategory_id) context.
+    """
     from apps.invoices.models import InvoiceAllocation, InvoiceAllocationStatus
     from apps.budgets.models import SourceType
-    from apps.budgets.services import consume_reserved_budget
+    from apps.budgets.services import consume_reserved_budget, consume_reserved_budget_line
+    from apps.budgets.services import resolve_budget_line_for_allocation, BudgetLineNotFoundError
     from apps.workflow.models import WorkflowEventType
 
     for alloc in InvoiceAllocation.objects.filter(
         workflow_instance=instance,
         status=InvoiceAllocationStatus.APPROVED,
-    ).select_related("budget"):
+    ).select_related("budget", "category", "subcategory"):
         if not alloc.budget_id:
             continue
         source_id = f"invoice:{alloc.invoice_id}:allocation:{alloc.id}"
+        legacy_fallback = False
+
+        # Try line-level consume first for new allocation data.
         try:
-            consume_reserved_budget(
+            budget_line = resolve_budget_line_for_allocation(
                 budget=alloc.budget,
-                source_type=SourceType.INVOICE,
-                source_id=source_id,
-                consumed_by=actor,
-                note=f"Final invoice approval — allocation {alloc.id}",
+                category_id=alloc.category_id,
+                subcategory_id=alloc.subcategory_id,
             )
-            _emit_event(
-                instance,
-                WorkflowEventType.ALLOCATION_BUDGET_CONSUMED,
-                actor,
-                metadata={"allocation_id": alloc.id, "budget_id": alloc.budget_id},
+            from apps.budgets.services import get_source_reserved_balance_for_line
+            balance = get_source_reserved_balance_for_line(
+                budget_line, SourceType.INVOICE, source_id
             )
+            if balance > Decimal("0"):
+                consume_reserved_budget_line(
+                    line=budget_line,
+                    amount=balance,
+                    source_type=SourceType.INVOICE,
+                    source_id=source_id,
+                    consumed_by=actor,
+                    note=f"Final invoice approval — allocation {alloc.id}",
+                )
+                consumed_line_level = True
+                _emit_event(
+                    instance,
+                    WorkflowEventType.ALLOCATION_BUDGET_CONSUMED,
+                    actor,
+                    metadata={
+                        "allocation_id": alloc.id,
+                        "budget_id": alloc.budget_id,
+                        "budget_line_id": budget_line.id,
+                    },
+                )
+            continue
+        except BudgetLineNotFoundError:
+            # Legacy allocation without matching BudgetLine — fall back to header consume.
+            legacy_fallback = True
         except Exception as e:
-            # Record failure in allocation metadata for finance visibility
-            alloc.metadata = {**alloc.metadata, "budget_consume_error": str(e)}
+            # New data should not silently fall back to header-level accounting.
+            alloc.metadata = {**(alloc.metadata or {}), "budget_consume_error": str(e)}
             alloc.save(update_fields=["metadata"])
             _emit_event(
                 instance,
@@ -95,6 +283,116 @@ def _consume_allocation_budgets(instance, actor):
                     "error": str(e),
                 },
             )
+            continue
+
+        if legacy_fallback:
+            try:
+                consume_reserved_budget(
+                    budget=alloc.budget,
+                    source_type=SourceType.INVOICE,
+                    source_id=source_id,
+                    consumed_by=actor,
+                    note=f"Final invoice approval — allocation {alloc.id} (legacy)",
+                )
+                _emit_event(
+                    instance,
+                    WorkflowEventType.ALLOCATION_BUDGET_CONSUMED,
+                    actor,
+                    metadata={"allocation_id": alloc.id, "budget_id": alloc.budget_id, "legacy": True},
+                )
+            except Exception as e:
+                # Record failure in allocation metadata for finance visibility
+                alloc.metadata = {**(alloc.metadata or {}), "budget_consume_error": str(e)}
+                alloc.save(update_fields=["metadata"])
+                _emit_event(
+                    instance,
+                    WorkflowEventType.ALLOCATION_BUDGET_RELEASED,  # reuse event for failure signal
+                    actor,
+                    metadata={
+                        "allocation_id": alloc.id,
+                        "budget_id": alloc.budget_id,
+                        "consume_failed": True,
+                        "error": str(e),
+                        "legacy": True,
+                    },
+                )
+
+
+def _reverse_consumed_allocation_budgets(instance, actor, note=""):
+    """
+    Reverse consumed budget amounts for invoice allocations.
+
+    Used as a compatibility repair path when finance rejects an invoice that
+    had already been consumed by the older internal-approval logic.
+    """
+    if instance.subject_type != "invoice":
+        return
+
+    from apps.invoices.models import InvoiceAllocation, InvoiceAllocationStatus
+    from apps.budgets.models import (
+        SourceType,
+        BudgetConsumption,
+        ConsumptionType,
+        ConsumptionStatus,
+    )
+    from apps.budgets.services import resolve_budget_line_for_allocation, BudgetLineNotFoundError
+    from django.db.models import Sum
+
+    for alloc in InvoiceAllocation.objects.filter(
+        workflow_instance=instance,
+        status=InvoiceAllocationStatus.APPROVED,
+    ).select_related("budget", "category", "subcategory"):
+        if not alloc.budget_id:
+            continue
+
+        source_id = f"invoice:{alloc.invoice_id}:allocation:{alloc.id}"
+        try:
+            budget_line = resolve_budget_line_for_allocation(
+                budget=alloc.budget,
+                category_id=alloc.category_id,
+                subcategory_id=alloc.subcategory_id,
+            )
+            consumed = (
+                BudgetConsumption.objects.filter(
+                    budget_line=budget_line,
+                    source_type=SourceType.INVOICE,
+                    source_id=source_id,
+                    consumption_type=ConsumptionType.CONSUMED,
+                    status=ConsumptionStatus.APPLIED,
+                ).aggregate(t=Sum("amount"))["t"] or Decimal("0")
+            )
+            if consumed > Decimal("0"):
+                budget_line.consumed_amount -= consumed
+                budget_line.save(update_fields=["consumed_amount", "updated_at"])
+                alloc.budget.consumed_amount -= consumed
+                alloc.budget.save(update_fields=["consumed_amount", "updated_at"])
+                BudgetConsumption.objects.create(
+                    budget=alloc.budget,
+                    budget_line=budget_line,
+                    source_type=SourceType.INVOICE,
+                    source_id=source_id,
+                    amount=consumed,
+                    consumption_type=ConsumptionType.ADJUSTED,
+                    status=ConsumptionStatus.APPLIED,
+                    created_by=actor,
+                    note=note or f"Finance rejection reversal for allocation {alloc.id}",
+                )
+                _emit_event(
+                    instance,
+                    WorkflowEventType.ALLOCATION_BUDGET_RELEASED,
+                    actor,
+                    metadata={
+                        "allocation_id": alloc.id,
+                        "budget_id": alloc.budget_id,
+                        "budget_line_id": budget_line.id,
+                        "reversed_consumed_amount": str(consumed),
+                    },
+                )
+        except BudgetLineNotFoundError:
+            continue
+        except Exception as e:
+            alloc.metadata = {**(alloc.metadata or {}), "budget_reverse_error": str(e)}
+            alloc.save(update_fields=["metadata"])
 
 
 def _emit_event(instance, event_type, actor_user, target_user=None, metadata=None):
@@ -113,6 +411,25 @@ def _emit_event(instance, event_type, actor_user, target_user=None, metadata=Non
             status=NotificationStatus.PENDING,
         )
     return event
+
+
+def _assert_workflow_subject_vendor_not_on_hold(instance) -> None:
+    """
+    If the workflow instance's subject is an invoice with a vendor on hold,
+    raise VendorProfileHoldError to freeze step/branch approvals.
+    """
+    if instance.subject_type != "invoice":
+        return
+    from apps.invoices.models import Invoice
+    from apps.vendors.models import Vendor
+    from apps.vendors.services import assert_vendor_profile_not_on_hold
+    try:
+        vendor_id = Invoice.objects.filter(pk=instance.subject_id).values_list("vendor_id", flat=True).first()
+        if vendor_id:
+            vendor = Vendor.objects.only("profile_change_pending", "profile_hold_reason").get(pk=vendor_id)
+            assert_vendor_profile_not_on_hold(vendor)
+    except (Invoice.DoesNotExist, Vendor.DoesNotExist):
+        pass
 
 
 def _assert_step_actionable(instance_step):
@@ -165,13 +482,16 @@ def _advance_on_group_complete(group, instance, acted_by):
 
         _activate_group_entry_steps(next_group, instance, acted_by)
     else:
+        # Allocation coverage gate: invoice workflows with an allocation step must
+        # have full coverage before the instance can reach APPROVED.
+        if instance.subject_type == "invoice":
+            _check_allocation_coverage_or_raise(instance)
+
         instance.status = InstanceStatus.APPROVED
         instance.completed_at = timezone.now()
         instance.save(update_fields=["status", "completed_at"])
         _emit_event(instance, WorkflowEventType.INSTANCE_APPROVED, acted_by)
         _sync_subject_status_on_workflow_change(instance)
-        # Consume budgets for all approved allocations on final approval
-        _consume_allocation_budgets(instance, acted_by)
 
 
 def _activate_group_entry_steps(group, instance, actor_user):
@@ -187,15 +507,16 @@ def _activate_group_entry_steps(group, instance, actor_user):
             split_instance_step(ist)
             continue
 
-        # RUNTIME_SPLIT_ALLOCATION waits for the assigned splitter — emit assignment event
-        if ist.workflow_step.step_kind == StepKind.RUNTIME_SPLIT_ALLOCATION:
+        # RUNTIME_SPLIT_ALLOCATION and SINGLE_ALLOCATION wait for the assigned splitter
+        if ist.workflow_step.step_kind in (StepKind.RUNTIME_SPLIT_ALLOCATION, StepKind.SINGLE_ALLOCATION):
+            kind = ist.workflow_step.step_kind
             if ist.assigned_user_id:
                 _emit_event(
                     instance,
                     WorkflowEventType.STEP_ASSIGNED,
                     actor_user,
                     target_user=ist.assigned_user,
-                    metadata={"instance_step_id": ist.id, "workflow_step_id": ist.workflow_step_id, "kind": "RUNTIME_SPLIT_ALLOCATION"},
+                    metadata={"instance_step_id": ist.id, "workflow_step_id": ist.workflow_step_id, "kind": kind},
                 )
             continue
 
@@ -332,6 +653,56 @@ def _sync_subject_status_on_workflow_change(instance):
                 pass
 
 
+def _return_vendor_submission_for_correction(instance, acted_by, note="") -> bool:
+    """
+    If this workflow instance belongs to a vendor-submitted invoice and the
+    rejection happened at the first group, return the submission to the vendor
+    for correction instead of leaving only a dead rejected invoice.
+
+    Returns True if a submission was updated, else False.
+    """
+    if instance.subject_type != "invoice":
+        return False
+
+    from apps.invoices.models import Invoice, VendorInvoiceSubmissionStatus
+
+    try:
+        invoice = Invoice.objects.select_related("submission").get(pk=instance.subject_id)
+    except Invoice.DoesNotExist:
+        return False
+
+    try:
+        submission = invoice.submission
+    except Exception:
+        return False
+
+    first_group = (
+        instance.instance_groups.order_by("step_group__display_order").first()
+    )
+    if not first_group or instance.current_group_id != first_group.id:
+        return False
+
+    message = (note or "").strip() or "Your invoice was returned for correction during internal review."
+    submission.status = VendorInvoiceSubmissionStatus.NEEDS_CORRECTION
+    submission.correction_note = message
+    submission.correction_requested_by = acted_by
+    submission.correction_requested_at = timezone.now()
+    submission.validation_errors = [
+        {"field": "_workflow", "message": message},
+    ]
+    submission.save(
+        update_fields=[
+            "status",
+            "correction_note",
+            "correction_requested_by",
+            "correction_requested_at",
+            "validation_errors",
+            "updated_at",
+        ]
+    )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Template / Version resolution  (Gap #1 fix)
 # ---------------------------------------------------------------------------
@@ -343,13 +714,19 @@ def resolve_workflow_template_version(module, scope_node):
     Contract:
         1. Gate on module activation. Module must be active for subject node.
         2. Walk up from subject_scope_node toward org root (nearest wins).
-        3. First node with a WorkflowTemplate for this module AND a published
-           version returns that version.
-        4. No matching template found anywhere → WorkflowNotConfiguredError.
+        3. At each node, only active (is_active=True) templates are considered.
+        4. Resolution order per node:
+             a. If a default (is_default=True) template has a published version → return it.
+             b. If no default, but exactly one active template has a published version → return it.
+             c. If no default and multiple active templates have published versions → raise
+                WorkflowNotConfiguredError (explicit selection is required).
+             d. Otherwise → continue walking up.
+        5. No matching template found anywhere → WorkflowNotConfiguredError.
 
     Raises:
-        ModuleInactiveError   — module is not active for this node/ancestor chain.
-        WorkflowNotConfiguredError — no published template in the walk-up chain.
+        ModuleInactiveError        — module is not active for this node/ancestor chain.
+        WorkflowNotConfiguredError — no published template found, or ambiguous non-default
+                                     templates exist and explicit selection is required.
     """
     from apps.modules.services import resolve_module_activation
 
@@ -361,15 +738,42 @@ def resolve_workflow_template_version(module, scope_node):
 
     nodes_to_check = [scope_node] + list(get_ancestors(scope_node).order_by("-depth"))
     for node in nodes_to_check:
-        try:
-            template = WorkflowTemplate.objects.get(module=module, scope_node=node)
-        except WorkflowTemplate.DoesNotExist:
+        active_templates = list(
+            WorkflowTemplate.objects.filter(module=module, scope_node=node, is_active=True)
+        )
+        if not active_templates:
             continue
-        version = WorkflowTemplateVersion.objects.filter(
-            template=template, status=VersionStatus.PUBLISHED
-        ).first()
-        if version:
-            return version
+
+        # Prefer the designated default template if it has a published version.
+        default_templates = [t for t in active_templates if t.is_default]
+        if default_templates:
+            default = default_templates[0]
+            version = WorkflowTemplateVersion.objects.filter(
+                template=default, status=VersionStatus.PUBLISHED
+            ).first()
+            if version:
+                return version
+            # Default exists but has no published version — skip this node, keep walking.
+            continue
+
+        # No default — collect all active templates that have a published version.
+        templates_with_published = []
+        for template in active_templates:
+            version = WorkflowTemplateVersion.objects.filter(
+                template=template, status=VersionStatus.PUBLISHED
+            ).first()
+            if version:
+                templates_with_published.append((template, version))
+
+        if len(templates_with_published) == 1:
+            return templates_with_published[0][1]
+        elif len(templates_with_published) > 1:
+            raise WorkflowNotConfiguredError(
+                f"Multiple active workflow templates with published versions exist for module "
+                f"'{module}' at node {node.id} but none is marked as default. "
+                "Explicit workflow selection is required."
+            )
+        # Zero published versions at this node — continue walking up.
 
     raise WorkflowNotConfiguredError(
         f"No published workflow template found for module '{module}' "
@@ -547,6 +951,19 @@ def create_workflow_instance_draft(
                 # Split parent steps are system steps. Branch records get their
                 # own assignees when the group becomes active.
                 state = AssignmentState.ASSIGNED
+            elif step.step_kind == StepKind.SINGLE_ALLOCATION:
+                # Single-allocation steps follow the same user resolution as
+                # RUNTIME_SPLIT_ALLOCATION — the splitter must be an eligible user.
+                eligible = list(get_eligible_users_for_step(step, subject_scope_node))
+                if step.default_user_id and any(u.pk == step.default_user_id for u in eligible):
+                    assigned = step.default_user
+                    state = AssignmentState.ASSIGNED
+                if assigned is None:
+                    if len(eligible) == 1:
+                        assigned = eligible[0]
+                        state = AssignmentState.ASSIGNED
+                    elif len(eligible) == 0:
+                        state = AssignmentState.NO_ELIGIBLE_USERS
             else:
                 eligible = list(get_eligible_users_for_step(step, subject_scope_node))
                 if step.default_user_id and any(u.pk == step.default_user_id for u in eligible):
@@ -635,6 +1052,71 @@ def activate_workflow_instance(instance, activated_by):
 
 
 # ---------------------------------------------------------------------------
+# First-step resolution (used by pending-review / begin-review)
+# ---------------------------------------------------------------------------
+
+def get_first_actionable_step(template_version):
+    """
+    Return the first WorkflowStep in template_version that requires a human actor.
+
+    SPLIT_BY_SCOPE and JOIN_BRANCHES are system steps with no direct human
+    assignee — they are skipped. NORMAL_APPROVAL and RUNTIME_SPLIT_ALLOCATION
+    both require a human and count as the first actionable step.
+
+    Returns None if the template has no human steps.
+    """
+    for group in template_version.step_groups.prefetch_related("steps").order_by("display_order"):
+        for step in group.steps.order_by("display_order"):
+            if step.step_kind not in (StepKind.SPLIT_BY_SCOPE, StepKind.JOIN_BRANCHES):
+                return step
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Allocation coverage (public accessor used by tests and API)
+# ---------------------------------------------------------------------------
+
+def check_invoice_allocation_coverage(invoice, instance) -> dict:
+    """
+    Return a coverage summary for an invoice workflow instance.
+
+    Returns a dict with keys:
+        covered          — bool: True iff sum of active allocations == invoice.amount
+        coverage_amount  — Decimal
+        invoice_amount   — Decimal
+        gap              — Decimal (invoice_amount - coverage_amount; negative = over-allocated)
+        allocation_count — int
+        detail           — str
+    """
+    from apps.invoices.models import InvoiceAllocation, InvoiceAllocationStatus
+    from django.db.models import Sum, Count
+
+    active_statuses = (
+        InvoiceAllocationStatus.SUBMITTED,
+        InvoiceAllocationStatus.BRANCH_PENDING,
+        InvoiceAllocationStatus.APPROVED,
+    )
+    agg = InvoiceAllocation.objects.filter(
+        invoice=invoice,
+        workflow_instance=instance,
+        status__in=active_statuses,
+    ).aggregate(total=Sum("amount"), count=Count("id"))
+
+    coverage = agg["total"] or Decimal("0")
+    count = agg["count"] or 0
+    gap = invoice.amount - coverage
+
+    return {
+        "covered": coverage == invoice.amount,
+        "coverage_amount": coverage,
+        "invoice_amount": invoice.amount,
+        "gap": gap,
+        "allocation_count": count,
+        "detail": f"{coverage} of {invoice.amount} covered across {count} allocation(s)",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Runtime: Approve step
 # ---------------------------------------------------------------------------
 
@@ -663,6 +1145,8 @@ def approve_workflow_step(instance_step, acted_by, note=""):
         raise StepActionError(
             f"User {acted_by} is not the assigned user for step {instance_step.id}."
         )
+
+    _assert_workflow_subject_vendor_not_on_hold(instance_step.instance_group.instance)
 
     now = timezone.now()
     instance_step.status = StepStatus.APPROVED
@@ -757,8 +1241,10 @@ def reject_workflow_step(instance_step, acted_by, note=""):
         instance.status = InstanceStatus.REJECTED
         instance.completed_at = timezone.now()
         instance.save(update_fields=["status", "completed_at"])
+        _release_allocation_budgets(instance, acted_by)
         _emit_event(instance, WorkflowEventType.INSTANCE_REJECTED, acted_by)
         _sync_subject_status_on_workflow_change(instance)
+        _return_vendor_submission_for_correction(instance, acted_by, note)
 
     elif rejection_action == RejectionAction.GO_TO_GROUP:
         target_step_group = group.step_group.on_rejection_goto_group
@@ -1106,6 +1592,8 @@ def approve_workflow_branch(branch: WorkflowInstanceBranch, acted_by, note=""):
         raise StepActionError(
             f"User {acted_by} is not the assigned user for branch {branch.id}."
         )
+
+    _assert_workflow_subject_vendor_not_on_hold(instance)
 
     now = timezone.now()
     branch.status = BranchStatus.APPROVED

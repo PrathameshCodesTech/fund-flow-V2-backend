@@ -7,6 +7,7 @@ User = get_user_model()
 
 class UserSerializer(serializers.ModelSerializer):
     assigned_roles = serializers.SerializerMethodField()
+    capabilities = serializers.SerializerMethodField()
     is_vendor_portal_user = serializers.SerializerMethodField()
     vendor_id = serializers.SerializerMethodField()
     vendor_name = serializers.SerializerMethodField()
@@ -16,7 +17,7 @@ class UserSerializer(serializers.ModelSerializer):
         fields = (
             "id", "email", "first_name", "last_name", "employee_id",
             "is_active", "is_staff", "is_superuser", "date_joined",
-            "assigned_roles",
+            "assigned_roles", "capabilities",
             "is_vendor_portal_user", "vendor_id", "vendor_name",
         )
         read_only_fields = ("id", "date_joined")
@@ -35,6 +36,10 @@ class UserSerializer(serializers.ModelSerializer):
                 seen.add(a.role.code)
                 result.append({"code": a.role.code, "name": a.role.name})
         return result
+
+    def get_capabilities(self, obj):
+        from apps.access.capabilities import get_user_capabilities
+        return get_user_capabilities(obj)
 
     def get_is_vendor_portal_user(self, obj):
         from apps.vendors.models import UserVendorAssignment
@@ -93,6 +98,45 @@ class UserCreateSerializer(serializers.ModelSerializer):
             password = User.objects.make_random_password()
         user = User.objects.create_user(password=password, **validated_data)
         return user
+
+
+class UserListSerializer(serializers.ModelSerializer):
+    """Serializer for user list endpoint — excludes sensitive fields."""
+    assigned_roles = serializers.SerializerMethodField()
+    capabilities = serializers.SerializerMethodField()
+    is_vendor_portal_user = serializers.SerializerMethodField()
+
+    class Meta:
+        model = User
+        fields = (
+            "id", "email", "first_name", "last_name", "employee_id",
+            "is_active", "is_staff", "date_joined",
+            "assigned_roles", "capabilities", "is_vendor_portal_user",
+        )
+        read_only_fields = ("id", "date_joined")
+
+    def get_assigned_roles(self, obj):
+        from apps.access.models import UserRoleAssignment
+        assignments = (
+            UserRoleAssignment.objects
+            .select_related("role")
+            .filter(user=obj, role__is_active=True)
+        )
+        seen = set()
+        result = []
+        for a in assignments:
+            if a.role.code not in seen:
+                seen.add(a.role.code)
+                result.append({"code": a.role.code, "name": a.role.name})
+        return result
+
+    def get_capabilities(self, obj):
+        from apps.access.capabilities import get_user_capabilities
+        return get_user_capabilities(obj)
+
+    def get_is_vendor_portal_user(self, obj):
+        from apps.vendors.models import UserVendorAssignment
+        return UserVendorAssignment.objects.filter(user=obj, is_active=True).exists()
 
 
 class UserUpdateSerializer(serializers.ModelSerializer):

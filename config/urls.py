@@ -1,5 +1,7 @@
 from django.contrib import admin
 from django.urls import path, include
+from django.conf import settings
+from django.conf.urls.static import static
 
 urlpatterns = [
     path("django-admin/", admin.site.urls),
@@ -15,4 +17,8 @@ urlpatterns = [
     path("api/v1/budgets/", include("apps.budgets.api.urls")),
     path("api/v1/finance/", include("apps.finance.api.urls")),
     path("api/v1/dashboard/", include("apps.dashboard.api.urls")),
+    path("api/v1/manual-expenses/", include("apps.manual_expenses.api.urls")),
 ]
+
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

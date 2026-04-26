@@ -13,7 +13,7 @@ from apps.campaigns.services import (
     CampaignStateError,
 )
 from apps.budgets.models import (
-    BudgetCategory, BudgetSubCategory, Budget, BudgetRule,
+    BudgetCategory, BudgetSubCategory, Budget, BudgetLine, BudgetRule,
     BudgetConsumption, BudgetVarianceRequest,
     BudgetStatus, PeriodType, ConsumptionType, ConsumptionStatus,
     VarianceStatus,
@@ -58,12 +58,20 @@ def user(db):
 @pytest.fixture
 def active_budget(org, node, category, subcategory, user):
     b = Budget.objects.create(
-        org=org, scope_node=node, category=category, subcategory=subcategory,
+        org=org, scope_node=node,
+        name="FY27 Marketing HQ",
+        code="FY27-MKT-HQ",
         financial_year="2026-27", period_type=PeriodType.YEARLY,
         period_start="2026-04-01", period_end="2027-03-31",
         allocated_amount=Decimal("10000000.00"),
         reserved_amount=Decimal("0"), consumed_amount=Decimal("0"),
         currency="INR", status=BudgetStatus.ACTIVE, created_by=user,
+    )
+    BudgetLine.objects.create(
+        budget=b,
+        category=category,
+        subcategory=subcategory,
+        allocated_amount=Decimal("10000000.00"),
     )
     BudgetRule.objects.create(
         budget=b,

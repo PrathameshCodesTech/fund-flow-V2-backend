@@ -48,14 +48,22 @@ from apps.vendors.api.serializers import (
     PublicFinanceTokenSerializer,
     PublicInvitationSerializer,
     ReopenSubmissionSerializer,
+    RejectRevisionSerializer,
+    SaveDraftRevisionSerializer,
     SendToFinanceSerializer,
     VendorAttachmentCreateSerializer,
     VendorAttachmentSerializer,
     VendorInvitationCreateSerializer,
     VendorInvitationSerializer,
+    VendorProfileRevisionListSerializer,
+    VendorProfileRevisionSerializer,
     VendorSerializer,
     VendorSubmissionSerializer,
     VendorUpdateSerializer,
+    VendorSubmissionRouteSerializer,
+    VendorSubmissionRouteCreateSerializer,
+    VendorSubmissionRouteUpdateSerializer,
+    VendorSubmissionRouteVendorSerializer,
 )
 
 
@@ -343,6 +351,26 @@ class PublicInvitationView(APIView):
         except InvitationExpiredError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_410_GONE)
         return Response(PublicInvitationSerializer(invitation).data)
+
+
+class PublicInvitationSubmissionView(APIView):
+    """GET /api/v1/vendors/public/invitations/{token}/submission/"""
+
+    permission_classes = [AllowAny]
+
+    def get(self, request, token, *args, **kwargs):
+        try:
+            invitation = get_invitation_by_token(token)
+        except InvitationNotFoundError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except InvitationExpiredError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_410_GONE)
+
+        submission = invitation.submissions.order_by("-created_at").first()
+        if not submission:
+            return Response({"detail": "No submission found for this invitation."}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response(VendorSubmissionSerializer(submission).data)
 
 
 class PublicInvitationSubmitManualView(APIView):
@@ -737,3 +765,397 @@ class MyVendorView(APIView):
 
         from apps.vendors.api.serializers import VendorSerializer
         return Response(VendorSerializer(assignment.vendor).data)
+
+
+# ---------------------------------------------------------------------------
+# VendorSubmissionRoute — internal CRUD
+# ---------------------------------------------------------------------------
+
+class VendorSubmissionRouteViewSet(viewsets.ModelViewSet):
+    """
+    Internal admin/config CRUD for VendorSubmissionRoute.
+
+    Access gate: user must have a visible-scope assignment that covers the
+    workflow_template's scope_node (list/retrieve), and an actionable-scope
+    assignment for write operations (create/update).  Vendor portal users have
+    no internal scope assignments, so they are implicitly excluded.
+
+    GET    /api/v1/vendors/send-to-options/       — list (filter ?org=, ?is_active=)
+    POST   /api/v1/vendors/send-to-options/       — create
+    GET    /api/v1/vendors/send-to-options/{id}/  — retrieve
+    PATCH  /api/v1/vendors/send-to-options/{id}/  — update / deactivate
+    """
+    permission_classes = [IsAuthenticated]
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def get_queryset(self):
+        from apps.vendors.models import VendorSubmissionRoute
+        visible_scope_ids = get_user_visible_scope_ids(self.request.user)
+        qs = VendorSubmissionRoute.objects.select_related(
+            "org", "workflow_template", "workflow_template__scope_node"
+        ).filter(
+            workflow_template__scope_node_id__in=visible_scope_ids
+        ).order_by("display_order", "label")
+
+        params = self.request.query_params
+        if org_id := params.get("org"):
+            qs = qs.filter(org_id=org_id)
+        if is_active := params.get("is_active"):
+            qs = qs.filter(is_active=(is_active.lower() in ("true", "1", "yes")))
+        return qs
+
+    def get_serializer_class(self):
+        if self.action == "create":
+            return VendorSubmissionRouteCreateSerializer
+        if self.action == "partial_update":
+            return VendorSubmissionRouteUpdateSerializer
+        return VendorSubmissionRouteSerializer
+
+    def create(self, request, *args, **kwargs):
+        serializer = VendorSubmissionRouteCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        template = serializer.validated_data["workflow_template"]
+        if err := user_can_act_on_scope_response(
+            request.user, template.scope_node_id,
+            "create send-to route config",
+        ):
+            return err
+        route = serializer.save()
+        return Response(
+            VendorSubmissionRouteSerializer(route).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    def partial_update(self, request, *args, **kwargs):
+        route = self.get_object()
+        # Gate on the existing template's scope node before accepting any payload
+        if err := user_can_act_on_scope_response(
+            request.user, route.workflow_template.scope_node_id,
+            "update send-to route config",
+        ):
+            return err
+        serializer = VendorSubmissionRouteUpdateSerializer(
+            route, data=request.data, partial=True
+        )
+        serializer.is_valid(raise_exception=True)
+        route = serializer.save()
+        return Response(VendorSubmissionRouteSerializer(route).data)
+
+
+# ---------------------------------------------------------------------------
+# VendorSendToOptionsView — vendor-facing read-only list
+# ---------------------------------------------------------------------------
+
+class VendorSendToOptionsView(APIView):
+    """
+    GET /api/v1/vendors/vendor-send-to-options/
+
+    Returns active VendorSubmissionRoute options visible to the authenticated
+    vendor user (filtered to their org).  Only id, code, label, display_order
+    are returned — no template internals are exposed.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from apps.vendors.models import UserVendorAssignment, VendorSubmissionRoute
+        assignment = (
+            UserVendorAssignment.objects
+            .filter(user=request.user, is_active=True)
+            .select_related("vendor__org")
+            .first()
+        )
+        if not assignment:
+            return Response(
+                {"detail": "No active vendor account found."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        routes = VendorSubmissionRoute.objects.filter(
+            org=assignment.vendor.org,
+            is_active=True,
+        ).order_by("display_order", "label")
+        return Response(VendorSubmissionRouteVendorSerializer(routes, many=True).data)
+
+
+# ---------------------------------------------------------------------------
+# Vendor Portal — profile revision endpoints (vendor user)
+# ---------------------------------------------------------------------------
+
+class VendorPortalProfileView(APIView):
+    """
+    GET /api/v1/vendors/portal/profile/
+    Returns the live profile snapshot for the authenticated vendor.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from apps.vendors.models import UserVendorAssignment
+        from apps.vendors.services import build_vendor_live_snapshot
+        assignment = (
+            UserVendorAssignment.objects
+            .filter(user=request.user, is_active=True)
+            .select_related("vendor__onboarding_submission")
+            .first()
+        )
+        if not assignment:
+            return Response({"detail": "No vendor account linked."}, status=status.HTTP_404_NOT_FOUND)
+        vendor = assignment.vendor
+        snapshot = build_vendor_live_snapshot(vendor)
+        return Response({
+            "vendor_id": vendor.pk,
+            "vendor_name": vendor.vendor_name,
+            "profile_change_pending": vendor.profile_change_pending,
+            "profile_hold_reason": vendor.profile_hold_reason,
+            "snapshot": snapshot,
+        })
+
+
+class VendorPortalProfileRevisionView(APIView):
+    """
+    GET  /api/v1/vendors/portal/profile/revision/   — get or create editable revision
+    POST /api/v1/vendors/portal/profile/revision/save-draft/   — save draft
+    POST /api/v1/vendors/portal/profile/revision/submit/       — submit
+    """
+    permission_classes = [IsAuthenticated]
+
+    def _get_vendor(self, request):
+        from apps.vendors.models import UserVendorAssignment
+        assignment = (
+            UserVendorAssignment.objects
+            .filter(user=request.user, is_active=True)
+            .select_related("vendor__onboarding_submission")
+            .first()
+        )
+        if not assignment:
+            return None
+        return assignment.vendor
+
+    def get(self, request):
+        from apps.vendors.services import get_or_create_editable_profile_revision
+        vendor = self._get_vendor(request)
+        if not vendor:
+            return Response({"detail": "No vendor account linked."}, status=status.HTTP_404_NOT_FOUND)
+        revision = get_or_create_editable_profile_revision(vendor, actor=request.user)
+        return Response(VendorProfileRevisionSerializer(revision).data)
+
+
+class VendorPortalSaveDraftRevisionView(APIView):
+    """POST /api/v1/vendors/portal/profile/revision/save-draft/"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.vendors.models import UserVendorAssignment, VendorProfileRevisionStatus
+        from apps.vendors.services import get_or_create_editable_profile_revision, save_draft_profile_revision
+        assignment = (
+            UserVendorAssignment.objects
+            .filter(user=request.user, is_active=True)
+            .select_related("vendor__onboarding_submission")
+            .first()
+        )
+        if not assignment:
+            return Response({"detail": "No vendor account linked."}, status=status.HTTP_404_NOT_FOUND)
+        vendor = assignment.vendor
+        serializer = SaveDraftRevisionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        revision = get_or_create_editable_profile_revision(vendor, actor=request.user)
+        try:
+            updated = save_draft_profile_revision(
+                revision,
+                proposed_snapshot=serializer.validated_data["proposed_snapshot"],
+                actor=request.user,
+            )
+        except Exception as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(VendorProfileRevisionSerializer(updated).data)
+
+
+class VendorPortalSubmitRevisionView(APIView):
+    """POST /api/v1/vendors/portal/profile/revision/submit/"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        from apps.vendors.models import UserVendorAssignment, VendorProfileRevisionStatus
+        from apps.vendors.services import (
+            get_or_create_editable_profile_revision, submit_profile_revision, SubmissionStateError
+        )
+        assignment = (
+            UserVendorAssignment.objects
+            .filter(user=request.user, is_active=True)
+            .select_related("vendor__onboarding_submission")
+            .first()
+        )
+        if not assignment:
+            return Response({"detail": "No vendor account linked."}, status=status.HTTP_404_NOT_FOUND)
+        vendor = assignment.vendor
+        from apps.vendors.models import VendorProfileRevision
+        revision = vendor.profile_revisions.filter(
+            status__in=[VendorProfileRevisionStatus.DRAFT, VendorProfileRevisionStatus.REOPENED]
+        ).order_by("-created_at").first()
+        if not revision:
+            return Response({"detail": "No editable revision found. Save a draft first."}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            updated = submit_profile_revision(revision, actor=request.user)
+        except (SubmissionStateError, ValueError) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(VendorProfileRevisionSerializer(updated).data)
+
+
+class VendorPortalRevisionHistoryView(APIView):
+    """GET /api/v1/vendors/portal/profile/revisions/"""
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from apps.vendors.models import UserVendorAssignment
+        assignment = (
+            UserVendorAssignment.objects
+            .filter(user=request.user, is_active=True)
+            .select_related("vendor")
+            .first()
+        )
+        if not assignment:
+            return Response({"detail": "No vendor account linked."}, status=status.HTTP_404_NOT_FOUND)
+        revisions = assignment.vendor.profile_revisions.order_by("-created_at")
+        return Response(VendorProfileRevisionListSerializer(revisions, many=True).data)
+
+
+# ---------------------------------------------------------------------------
+# Internal — profile revision review endpoints
+# ---------------------------------------------------------------------------
+
+class VendorProfileRevisionViewSet(viewsets.ViewSet):
+    """
+    Internal endpoints for reviewing vendor profile revisions.
+
+    GET    /api/v1/vendors/{vendor_pk}/profile-revisions/         — list
+    GET    /api/v1/vendors/{vendor_pk}/profile-revisions/{pk}/    — detail
+    POST   .../finance-approve/                                   — finance approve
+    POST   .../finance-reject/                                    — finance reject
+    POST   .../reopen/                                            — reopen (back to vendor)
+    POST   .../apply/                                             — apply approved revision
+    POST   .../apply/                                             — apply directly (skip marketing)
+    POST   .../cancel/                                            — cancel
+    """
+    permission_classes = [IsAuthenticated]
+
+    def _get_vendor(self, request, vendor_pk):
+        visible_scope_ids = get_user_visible_scope_ids(request.user)
+        try:
+            return Vendor.objects.get(pk=vendor_pk, scope_node_id__in=visible_scope_ids)
+        except Vendor.DoesNotExist:
+            return None
+
+    def _get_revision(self, vendor, pk):
+        from apps.vendors.models import VendorProfileRevision
+        try:
+            return VendorProfileRevision.objects.select_related("vendor").get(pk=pk, vendor=vendor)
+        except VendorProfileRevision.DoesNotExist:
+            return None
+
+    def list(self, request, vendor_pk=None):
+        vendor = self._get_vendor(request, vendor_pk)
+        if not vendor:
+            return Response({"detail": "Vendor not found."}, status=status.HTTP_404_NOT_FOUND)
+        revisions = vendor.profile_revisions.order_by("-created_at")
+        return Response(VendorProfileRevisionListSerializer(revisions, many=True).data)
+
+    def retrieve(self, request, vendor_pk=None, pk=None):
+        vendor = self._get_vendor(request, vendor_pk)
+        if not vendor:
+            return Response({"detail": "Vendor not found."}, status=status.HTTP_404_NOT_FOUND)
+        revision = self._get_revision(vendor, pk)
+        if not revision:
+            return Response({"detail": "Revision not found."}, status=status.HTTP_404_NOT_FOUND)
+        return Response(VendorProfileRevisionSerializer(revision).data)
+
+    @action(detail=True, methods=["post"], url_path="finance-approve")
+    def finance_approve(self, request, vendor_pk=None, pk=None):
+        from apps.vendors.services import finance_approve_profile_revision, SubmissionStateError
+        vendor = self._get_vendor(request, vendor_pk)
+        if not vendor:
+            return Response({"detail": "Vendor not found."}, status=status.HTTP_404_NOT_FOUND)
+        if err := user_can_act_on_scope_response(request.user, vendor.scope_node_id, "finance approve profile revision"):
+            return err
+        revision = self._get_revision(vendor, pk)
+        if not revision:
+            return Response({"detail": "Revision not found."}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            updated = finance_approve_profile_revision(revision, actor=request.user)
+        except SubmissionStateError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(VendorProfileRevisionSerializer(updated).data)
+
+    @action(detail=True, methods=["post"], url_path="finance-reject")
+    def finance_reject(self, request, vendor_pk=None, pk=None):
+        from apps.vendors.services import finance_reject_profile_revision, SubmissionStateError
+        vendor = self._get_vendor(request, vendor_pk)
+        if not vendor:
+            return Response({"detail": "Vendor not found."}, status=status.HTTP_404_NOT_FOUND)
+        if err := user_can_act_on_scope_response(request.user, vendor.scope_node_id, "finance reject profile revision"):
+            return err
+        revision = self._get_revision(vendor, pk)
+        if not revision:
+            return Response({"detail": "Revision not found."}, status=status.HTTP_404_NOT_FOUND)
+        serializer = RejectRevisionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            updated = finance_reject_profile_revision(
+                revision, actor=request.user, note=serializer.validated_data.get("note", "")
+            )
+        except SubmissionStateError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(VendorProfileRevisionSerializer(updated).data)
+
+    @action(detail=True, methods=["post"], url_path="reopen")
+    def reopen(self, request, vendor_pk=None, pk=None):
+        from apps.vendors.services import reopen_profile_revision, SubmissionStateError
+        vendor = self._get_vendor(request, vendor_pk)
+        if not vendor:
+            return Response({"detail": "Vendor not found."}, status=status.HTTP_404_NOT_FOUND)
+        if err := user_can_act_on_scope_response(request.user, vendor.scope_node_id, "reopen profile revision"):
+            return err
+        revision = self._get_revision(vendor, pk)
+        if not revision:
+            return Response({"detail": "Revision not found."}, status=status.HTTP_404_NOT_FOUND)
+        serializer = RejectRevisionSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            updated = reopen_profile_revision(
+                revision, actor=request.user, note=serializer.validated_data.get("note", "")
+            )
+        except SubmissionStateError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(VendorProfileRevisionSerializer(updated).data)
+
+
+    @action(detail=True, methods=["post"], url_path="apply")
+    def apply(self, request, vendor_pk=None, pk=None):
+        from apps.vendors.services import apply_vendor_profile_revision, SubmissionStateError
+        vendor = self._get_vendor(request, vendor_pk)
+        if not vendor:
+            return Response({"detail": "Vendor not found."}, status=status.HTTP_404_NOT_FOUND)
+        if err := user_can_act_on_scope_response(request.user, vendor.scope_node_id, "apply profile revision"):
+            return err
+        revision = self._get_revision(vendor, pk)
+        if not revision:
+            return Response({"detail": "Revision not found."}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            updated = apply_vendor_profile_revision(revision, actor=request.user)
+        except SubmissionStateError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(VendorProfileRevisionSerializer(updated).data)
+
+    @action(detail=True, methods=["post"], url_path="cancel")
+    def cancel(self, request, vendor_pk=None, pk=None):
+        from apps.vendors.services import cancel_profile_revision, SubmissionStateError
+        vendor = self._get_vendor(request, vendor_pk)
+        if not vendor:
+            return Response({"detail": "Vendor not found."}, status=status.HTTP_404_NOT_FOUND)
+        if err := user_can_act_on_scope_response(request.user, vendor.scope_node_id, "cancel profile revision"):
+            return err
+        revision = self._get_revision(vendor, pk)
+        if not revision:
+            return Response({"detail": "Revision not found."}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            updated = cancel_profile_revision(revision, actor=request.user)
+        except SubmissionStateError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(VendorProfileRevisionSerializer(updated).data)

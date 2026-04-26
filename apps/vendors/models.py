@@ -58,6 +58,42 @@ class OperationalStatus(models.TextChoices):
     SUSPENDED = "suspended", "Suspended"
 
 
+class VendorProfileRevisionStatus(models.TextChoices):
+    DRAFT = "draft", "Draft"
+    SUBMITTED = "submitted", "Submitted"
+    FINANCE_APPROVED = "finance_approved", "Finance Approved"
+    FINANCE_REJECTED = "finance_rejected", "Finance Rejected"
+    REOPENED = "reopened", "Reopened"
+    APPLIED = "applied", "Applied"
+    CANCELLED = "cancelled", "Cancelled"
+
+
+# ---------------------------------------------------------------------------
+# Attachment document type constants
+# ---------------------------------------------------------------------------
+
+#: Allowed document_type values for VendorAttachment on the vendor portal.
+ALLOWED_ATTACHMENT_DOCUMENT_TYPES: set[str] = {
+    "msme_declaration_form",
+    "msme_registration_certificate",
+    "cancelled_cheque",
+    "pan_copy",
+    "gst_certificate",
+    "bank_proof",
+    "supporting_document",
+    # Legacy/generic types already stored in production
+    "kyc_proof",
+    "address_proof",
+    "gst",
+    "pan",
+    "other",
+}
+
+
+#: Allowed msme_enterprise_type values.
+ALLOWED_MSME_ENTERPRISE_TYPES: set[str] = {"micro", "small", "medium"}
+
+
 # ---------------------------------------------------------------------------
 # Models
 # ---------------------------------------------------------------------------
@@ -129,26 +165,58 @@ class VendorOnboardingSubmission(models.Model):
     raw_form_data = models.JSONField(default=dict, blank=True)
 
     # Normalized core fields
+    normalized_title = models.CharField(max_length=100, blank=True)
     normalized_vendor_name = models.CharField(max_length=255, blank=True)
     normalized_vendor_type = models.CharField(max_length=100, blank=True)
     normalized_email = models.EmailField(blank=True)
     normalized_phone = models.CharField(max_length=50, blank=True)
+    normalized_fax = models.CharField(max_length=50, blank=True)
     normalized_gst_registered = models.BooleanField(null=True, blank=True)
     normalized_gstin = models.CharField(max_length=20, blank=True)
     normalized_pan = models.CharField(max_length=20, blank=True)
+    normalized_region = models.CharField(max_length=100, blank=True)
+    normalized_head_office_no = models.CharField(max_length=50, blank=True)
 
     # Address
     normalized_address_line1 = models.CharField(max_length=255, blank=True)
     normalized_address_line2 = models.CharField(max_length=255, blank=True)
+    normalized_address_line3 = models.CharField(max_length=255, blank=True)
     normalized_city = models.CharField(max_length=100, blank=True)
     normalized_state = models.CharField(max_length=100, blank=True)
     normalized_country = models.CharField(max_length=100, blank=True)
     normalized_pincode = models.CharField(max_length=20, blank=True)
 
-    # Bank
+    # Bank — core
+    normalized_preferred_payment_mode = models.CharField(max_length=100, blank=True)
+    normalized_beneficiary_name = models.CharField(max_length=255, blank=True)
     normalized_bank_name = models.CharField(max_length=255, blank=True)
     normalized_account_number = models.CharField(max_length=50, blank=True)
+    normalized_bank_account_type = models.CharField(max_length=100, blank=True)
     normalized_ifsc = models.CharField(max_length=20, blank=True)
+    normalized_micr_code = models.CharField(max_length=20, blank=True)
+    normalized_neft_code = models.CharField(max_length=50, blank=True)
+
+    # Bank — branch contact
+    normalized_bank_branch_address_line1 = models.CharField(max_length=255, blank=True)
+    normalized_bank_branch_address_line2 = models.CharField(max_length=255, blank=True)
+    normalized_bank_branch_city = models.CharField(max_length=100, blank=True)
+    normalized_bank_branch_state = models.CharField(max_length=100, blank=True)
+    normalized_bank_branch_country = models.CharField(max_length=100, blank=True)
+    normalized_bank_branch_pincode = models.CharField(max_length=20, blank=True)
+    normalized_bank_phone = models.CharField(max_length=50, blank=True)
+    normalized_bank_fax = models.CharField(max_length=50, blank=True)
+
+    # MSME / compliance
+    normalized_authorized_signatory_name = models.CharField(max_length=255, blank=True)
+    normalized_msme_registered = models.BooleanField(null=True, blank=True)
+    normalized_msme_registration_number = models.CharField(max_length=100, blank=True)
+    normalized_msme_enterprise_type = models.CharField(max_length=50, blank=True)
+    declaration_accepted = models.BooleanField(null=True, blank=True)
+
+    # Structured JSON blocks (secondary data, display/export only)
+    contact_persons_json = models.JSONField(default=list, blank=True)
+    head_office_address_json = models.JSONField(default=dict, blank=True)
+    tax_registration_details_json = models.JSONField(default=dict, blank=True)
 
     # File references (paths)
     source_excel_file = models.CharField(max_length=500, blank=True)
@@ -290,6 +358,57 @@ class Vendor(models.Model):
     vendor_name = models.CharField(max_length=255)
     email = models.EmailField(blank=True)
     phone = models.CharField(max_length=50, blank=True)
+
+    # ── Approved live profile fields ───────────────────────────────────────────
+    # Authoritative approved vendor profile. OnboardingSubmission is the
+    # source for onboarding-time data; Vendor holds the current approved state.
+    # build_vendor_live_snapshot() and apply_vendor_profile_revision() use these.
+    title = models.CharField(max_length=100, blank=True)
+    vendor_type = models.CharField(max_length=100, blank=True)
+    fax = models.CharField(max_length=50, blank=True)
+    region = models.CharField(max_length=100, blank=True)
+    head_office_no = models.CharField(max_length=50, blank=True)
+    gst_registered = models.BooleanField(null=True, blank=True)
+    gstin = models.CharField(max_length=20, blank=True)
+    pan = models.CharField(max_length=20, blank=True)
+    # Address
+    address_line1 = models.CharField(max_length=255, blank=True)
+    address_line2 = models.CharField(max_length=255, blank=True)
+    address_line3 = models.CharField(max_length=255, blank=True)
+    city = models.CharField(max_length=100, blank=True)
+    state = models.CharField(max_length=100, blank=True)
+    country = models.CharField(max_length=100, blank=True)
+    pincode = models.CharField(max_length=20, blank=True)
+    # Bank core
+    preferred_payment_mode = models.CharField(max_length=100, blank=True)
+    beneficiary_name = models.CharField(max_length=255, blank=True)
+    bank_name = models.CharField(max_length=255, blank=True)
+    account_number = models.CharField(max_length=50, blank=True)
+    bank_account_type = models.CharField(max_length=100, blank=True)
+    ifsc = models.CharField(max_length=20, blank=True)
+    micr_code = models.CharField(max_length=20, blank=True)
+    neft_code = models.CharField(max_length=50, blank=True)
+    # Bank branch contact
+    bank_branch_address_line1 = models.CharField(max_length=255, blank=True)
+    bank_branch_address_line2 = models.CharField(max_length=255, blank=True)
+    bank_branch_city = models.CharField(max_length=100, blank=True)
+    bank_branch_state = models.CharField(max_length=100, blank=True)
+    bank_branch_country = models.CharField(max_length=100, blank=True)
+    bank_branch_pincode = models.CharField(max_length=20, blank=True)
+    bank_phone = models.CharField(max_length=50, blank=True)
+    bank_fax = models.CharField(max_length=50, blank=True)
+    # MSME / compliance
+    authorized_signatory_name = models.CharField(max_length=255, blank=True)
+    msme_registered = models.BooleanField(null=True, blank=True)
+    msme_registration_number = models.CharField(max_length=100, blank=True)
+    msme_enterprise_type = models.CharField(max_length=50, blank=True)
+    declaration_accepted = models.BooleanField(null=True, blank=True)
+    # JSON blocks
+    contact_persons_json = models.JSONField(default=list, blank=True)
+    head_office_address_json = models.JSONField(default=dict, blank=True)
+    tax_registration_details_json = models.JSONField(default=dict, blank=True)
+    # ── end approved profile fields ───────────────────────────────────────────
+
     sap_vendor_id = models.CharField(max_length=100)
     po_mandate_enabled = models.BooleanField(default=False)
     marketing_status = models.CharField(
@@ -323,6 +442,18 @@ class Vendor(models.Model):
         blank=True,
         help_text="Cached portal user email for display",
     )
+    # Profile revision hold state
+    profile_change_pending = models.BooleanField(default=False)
+    profile_hold_reason = models.CharField(max_length=500, blank=True)
+    active_profile_revision = models.ForeignKey(
+        "VendorProfileRevision",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="holding_vendor",
+    )
+    profile_hold_started_at = models.DateTimeField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -337,6 +468,70 @@ class Vendor(models.Model):
 
     def __str__(self):
         return f"Vendor {self.id}: {self.vendor_name} [{self.operational_status}]"
+
+
+# ---------------------------------------------------------------------------
+# Vendor Profile Revision
+# ---------------------------------------------------------------------------
+
+class VendorProfileRevision(models.Model):
+    """
+    Tracks a proposed change to a Vendor's profile fields.
+
+    While a revision is active (submitted through applied), the Vendor is placed
+    on hold: new invoice submissions are blocked and in-flight workflow/finance
+    approvals are frozen until the revision is applied or cancelled.
+    """
+    vendor = models.ForeignKey(
+        Vendor,
+        on_delete=models.CASCADE,
+        related_name="profile_revisions",
+    )
+    revision_number = models.PositiveIntegerField()
+    status = models.CharField(
+        max_length=30,
+        choices=VendorProfileRevisionStatus.choices,
+        default=VendorProfileRevisionStatus.DRAFT,
+    )
+    proposed_snapshot_json = models.JSONField(default=dict)
+    changed_fields_json = models.JSONField(default=list)
+    source_revision_snapshot_json = models.JSONField(default=dict)
+    finance_sent_at = models.DateTimeField(null=True, blank=True)
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    approved_at = models.DateTimeField(null=True, blank=True)
+    applied_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="created_vendor_profile_revisions",
+    )
+    updated_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="updated_vendor_profile_revisions",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "vendor_profile_revisions"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["vendor", "revision_number"],
+                name="unique_revision_number_per_vendor",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["vendor", "status"]),
+        ]
+
+    def __str__(self):
+        return f"VendorProfileRevision {self.id}: vendor={self.vendor_id} rev={self.revision_number} [{self.status}]"
 
 
 # ---------------------------------------------------------------------------
@@ -445,3 +640,60 @@ class VendorActivationToken(models.Model):
 
     def is_valid(self) -> bool:
         return not self.is_expired() and not self.is_used()
+
+
+# ---------------------------------------------------------------------------
+# Vendor Submission Route (Send-To config)
+# ---------------------------------------------------------------------------
+
+class VendorSubmissionRoute(models.Model):
+    """
+    Maps a vendor-visible label (e.g. "Tarun") to a WorkflowTemplate.
+
+    Scoped to org — all active routes in an org are available for any vendor
+    invoice submission within that org.
+
+    At submit time the template's currently published version is resolved.
+    If no published version exists the submission is blocked, forcing proper
+    enterprise configuration rather than silently falling back.
+    """
+    org = models.ForeignKey(
+        "core.Organization",
+        on_delete=models.CASCADE,
+        related_name="vendor_submission_routes",
+    )
+    code = models.CharField(
+        max_length=100,
+        help_text="Stable internal key, unique within org. Never shown to vendor.",
+    )
+    label = models.CharField(
+        max_length=255,
+        help_text="What the vendor sees, e.g. 'Tarun'.",
+    )
+    description = models.TextField(blank=True)
+    display_order = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+    workflow_template = models.ForeignKey(
+        "workflow.WorkflowTemplate",
+        on_delete=models.PROTECT,
+        related_name="vendor_submission_routes",
+        help_text="Published version is resolved at submit time.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "vendor_submission_routes"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["org", "code"],
+                name="unique_route_code_per_org",
+            ),
+        ]
+        ordering = ["display_order", "label"]
+        indexes = [
+            models.Index(fields=["org", "is_active"]),
+        ]
+
+    def __str__(self):
+        return f"Route {self.code} → '{self.label}' (template={self.workflow_template_id})"

@@ -33,14 +33,30 @@ invoice_attach_workflow = InvoiceViewSet.as_view({
 invoice_control_tower = InvoiceViewSet.as_view({
     "get": "control_tower",
 })
+invoice_pending_review = InvoiceViewSet.as_view({
+    "get": "pending_review",
+})
+invoice_begin_review = InvoiceViewSet.as_view({
+    "post": "begin_review",
+})
+invoice_get_payment = InvoiceViewSet.as_view({
+    "get": "get_payment",
+})
+invoice_record_payment = InvoiceViewSet.as_view({
+    "post": "record_payment",
+})
 
 urlpatterns = [
     path("", invoice_list, name="invoice-list"),
     path("", include(submission_router.urls)),
+    path("pending-review/", invoice_pending_review, name="invoice-pending-review"),
     path("<str:pk>/", invoice_detail, name="invoice-detail"),
     path("<str:pk>/submit/", invoice_submit, name="invoice-submit"),
     path("<str:pk>/eligible-workflows/", invoice_eligible_workflows, name="invoice-eligible-workflows"),
     path("<str:pk>/attach-workflow/", invoice_attach_workflow, name="invoice-attach-workflow"),
+    path("<str:pk>/begin-review/", invoice_begin_review, name="invoice-begin-review"),
     path("<str:pk>/control-tower/", invoice_control_tower, name="invoice-control-tower"),
     path("<str:pk>/allocations/", invoice_allocations, name="invoice-allocations"),
+    path("<str:pk>/payment/", invoice_get_payment, name="invoice-payment"),
+    path("<str:pk>/record-payment/", invoice_record_payment, name="invoice-record-payment"),
 ]

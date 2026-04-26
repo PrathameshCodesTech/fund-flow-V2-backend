@@ -55,6 +55,89 @@ def user_can_update_invoice(user, invoice):
     )
 
 
+def user_can_begin_invoice_review(user, invoice, template_version):
+    """
+    Return True if user is allowed to begin review for this invoice+route.
+
+    Authorization rule (permission-based):
+      1. User has START_WORKFLOW permission on INVOICE at invoice's scope node
+         or any ancestor.  This covers org_admin (which has all permissions
+         via its role grant), tenant_admin, and any future role granted
+         START_WORKFLOW:INVOICE — no role names are hardcoded.
+      OR
+      2. User is eligible for the first actionable human step of
+         template_version resolved at the invoice's scope node.
+
+    Roles are configurable bundles.  Permissions are the stable enterprise
+    authorization contract.  Grant a role START_WORKFLOW:INVOICE to allow it
+    to claim pending invoices; do not hardcode role names.
+    """
+    from apps.access.services import user_has_permission_including_ancestors
+    from apps.workflow.services import get_first_actionable_step, get_eligible_users_for_step
+
+    if user_has_permission_including_ancestors(
+        user,
+        PermissionAction.START_WORKFLOW,
+        PermissionResource.INVOICE,
+        invoice.scope_node,
+    ):
+        return True
+
+    first_step = get_first_actionable_step(template_version)
+    if not first_step:
+        return False
+    return get_eligible_users_for_step(first_step, invoice.scope_node).filter(pk=user.pk).exists()
+
+
+def get_invoice_eligible_workflow_routes(invoice, user=None):
+    """
+    Return all active published workflow routes for an invoice (walks scope ancestors).
+
+    Each route dict includes:
+        template_id, template_name, template_code, version_id, version_number,
+        first_step_name, user_can_begin (None when user not supplied).
+
+    Mirrors the logic of eligible_workflows but adds first-step metadata and
+    per-user begin eligibility.
+    """
+    from apps.workflow.models import WorkflowTemplate, WorkflowTemplateVersion, VersionStatus
+    from apps.core.services import get_ancestors
+    from apps.workflow.services import get_first_actionable_step
+
+    nodes_to_check = [invoice.scope_node] + list(get_ancestors(invoice.scope_node).order_by("-depth"))
+    version_ids_seen = set()
+    routes = []
+
+    for node in nodes_to_check:
+        templates = WorkflowTemplate.objects.filter(module="invoice", scope_node=node, is_active=True)
+        for template in templates:
+            published = (
+                WorkflowTemplateVersion.objects
+                .filter(template=template, status=VersionStatus.PUBLISHED)
+                .order_by("-version_number")
+                .first()
+            )
+            if not published or published.id in version_ids_seen:
+                continue
+            version_ids_seen.add(published.id)
+
+            first_step = get_first_actionable_step(published)
+            can_begin = (
+                user_can_begin_invoice_review(user, invoice, published) if user is not None else None
+            )
+            routes.append({
+                "template_id": template.id,
+                "template_name": template.name,
+                "template_code": template.code,
+                "version_id": published.id,
+                "version_number": published.version_number,
+                "first_step_name": first_step.name if first_step else None,
+                "user_can_begin": can_begin,
+            })
+
+    return routes
+
+
 def filter_invoices_readable_for_user(user, qs):
     """
     Filter a queryset of Invoices to only those the user can read.
@@ -76,3 +159,9 @@ def filter_invoices_readable_for_user(user, qs):
             readable_ids.append(invoice.pk)
 
     return qs.filter(pk__in=readable_ids)
+
+
+def user_can_record_invoice_payment(user, invoice):
+    """Alias for service-level check — delegates to services."""
+    from apps.invoices.services import can_user_record_invoice_payment
+    return can_user_record_invoice_payment(user, invoice)

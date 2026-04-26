@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
 from apps.vendors.models import (
+    ALLOWED_ATTACHMENT_DOCUMENT_TYPES,
     FinanceActionType,
     Vendor,
     VendorAttachment,
@@ -8,6 +9,8 @@ from apps.vendors.models import (
     VendorFinanceDecision,
     VendorInvitation,
     VendorOnboardingSubmission,
+    VendorProfileRevision,
+    VendorSubmissionRoute,
 )
 
 
@@ -45,12 +48,32 @@ class VendorSubmissionSerializer(serializers.ModelSerializer):
         fields = [
             "id", "invitation", "submission_mode", "status",
             "raw_form_data",
+            # Core identity
+            "normalized_title",
             "normalized_vendor_name", "normalized_vendor_type",
-            "normalized_email", "normalized_phone",
+            "normalized_email", "normalized_phone", "normalized_fax",
             "normalized_gst_registered", "normalized_gstin", "normalized_pan",
-            "normalized_address_line1", "normalized_address_line2",
+            "normalized_region", "normalized_head_office_no",
+            # Address
+            "normalized_address_line1", "normalized_address_line2", "normalized_address_line3",
             "normalized_city", "normalized_state", "normalized_country", "normalized_pincode",
-            "normalized_bank_name", "normalized_account_number", "normalized_ifsc",
+            # Bank core
+            "normalized_preferred_payment_mode",
+            "normalized_beneficiary_name",
+            "normalized_bank_name", "normalized_account_number", "normalized_bank_account_type",
+            "normalized_ifsc", "normalized_micr_code", "normalized_neft_code",
+            # Bank branch contact
+            "normalized_bank_branch_address_line1", "normalized_bank_branch_address_line2",
+            "normalized_bank_branch_city", "normalized_bank_branch_state",
+            "normalized_bank_branch_country", "normalized_bank_branch_pincode",
+            "normalized_bank_phone", "normalized_bank_fax",
+            # MSME / compliance
+            "normalized_authorized_signatory_name",
+            "normalized_msme_registered", "normalized_msme_registration_number",
+            "normalized_msme_enterprise_type", "declaration_accepted",
+            # Structured JSON blocks
+            "contact_persons_json", "head_office_address_json", "tax_registration_details_json",
+            # File tracking
             "has_source_excel", "has_exported_excel",
             "finance_sent_at", "finance_vendor_code",
             "submitted_at", "created_at", "updated_at",
@@ -93,6 +116,14 @@ class VendorAttachmentSerializer(serializers.ModelSerializer):
 class VendorAttachmentCreateSerializer(serializers.Serializer):
     title = serializers.CharField(max_length=255)
     document_type = serializers.CharField(max_length=100, required=False, allow_blank=True, default="")
+
+    def validate_document_type(self, value):
+        if value and value not in ALLOWED_ATTACHMENT_DOCUMENT_TYPES:
+            raise serializers.ValidationError(
+                f"document_type '{value}' is not allowed. "
+                f"Accepted types: {', '.join(sorted(ALLOWED_ATTACHMENT_DOCUMENT_TYPES))}"
+            )
+        return value
 
 
 # ---------------------------------------------------------------------------
@@ -148,20 +179,63 @@ class VendorSerializer(serializers.ModelSerializer):
         fields = [
             "id", "org", "org_name", "scope_node", "scope_node_name",
             "onboarding_submission",
-            "vendor_name", "email", "phone", "sap_vendor_id",
-            "po_mandate_enabled",
+            # Core identity
+            "vendor_name", "email", "phone",
+            # Approved live profile (read-only — updated via profile revision)
+            "title", "vendor_type", "fax", "region", "head_office_no",
+            "gst_registered", "gstin", "pan",
+            # Address
+            "address_line1", "address_line2", "address_line3",
+            "city", "state", "country", "pincode",
+            # Bank
+            "preferred_payment_mode", "beneficiary_name", "bank_name",
+            "account_number", "bank_account_type", "ifsc", "micr_code", "neft_code",
+            # Bank branch
+            "bank_branch_address_line1", "bank_branch_address_line2",
+            "bank_branch_city", "bank_branch_state",
+            "bank_branch_country", "bank_branch_pincode",
+            "bank_phone", "bank_fax",
+            # MSME / compliance
+            "authorized_signatory_name", "msme_registered",
+            "msme_registration_number", "msme_enterprise_type",
+            "declaration_accepted",
+            # JSON blocks
+            "contact_persons_json", "head_office_address_json",
+            "tax_registration_details_json",
+            # System fields
+            "sap_vendor_id", "po_mandate_enabled",
             "marketing_status", "operational_status",
             "approved_by_marketing", "approved_at",
             "portal_email", "portal_activation_sent_at", "portal_user_id",
             "portal_activated",
+            "profile_change_pending", "profile_hold_reason",
+            "active_profile_revision", "profile_hold_started_at",
             "created_at", "updated_at",
         ]
         read_only_fields = [
             "id", "org", "scope_node", "onboarding_submission",
+            # All profile fields are read-only here
+            "title", "vendor_type", "fax", "region", "head_office_no",
+            "gst_registered", "gstin", "pan",
+            "address_line1", "address_line2", "address_line3",
+            "city", "state", "country", "pincode",
+            "preferred_payment_mode", "beneficiary_name", "bank_name",
+            "account_number", "bank_account_type", "ifsc", "micr_code", "neft_code",
+            "bank_branch_address_line1", "bank_branch_address_line2",
+            "bank_branch_city", "bank_branch_state",
+            "bank_branch_country", "bank_branch_pincode",
+            "bank_phone", "bank_fax",
+            "authorized_signatory_name", "msme_registered",
+            "msme_registration_number", "msme_enterprise_type",
+            "declaration_accepted",
+            "contact_persons_json", "head_office_address_json",
+            "tax_registration_details_json",
             "sap_vendor_id", "marketing_status", "operational_status",
             "approved_by_marketing", "approved_at",
             "portal_email", "portal_activation_sent_at", "portal_user_id",
             "portal_activated",
+            "profile_change_pending", "profile_hold_reason",
+            "active_profile_revision", "profile_hold_started_at",
             "created_at", "updated_at",
         ]
 
@@ -219,9 +293,131 @@ class ManualSubmissionSerializer(serializers.Serializer):
     data = serializers.DictField(child=serializers.JSONField(), default=dict)
     finalize = serializers.BooleanField(default=False)
 
+    def validate_data(self, value):
+        from apps.vendors.models import ALLOWED_MSME_ENTERPRISE_TYPES
+        et = (
+            value.get("msme_enterprise_type")
+            or value.get("msme_enterprise_type".replace("_", " "))
+            or value.get("enterprise_type")
+            or value.get("enterprise_type".replace("_", " "))
+            or value.get("enterprise type")
+            or value.get("enterprise  type")
+            or ""
+        )
+        et = str(et).strip().lower()
+        if et and et not in ALLOWED_MSME_ENTERPRISE_TYPES:
+            raise serializers.ValidationError(
+                f"msme_enterprise_type must be one of {sorted(ALLOWED_MSME_ENTERPRISE_TYPES)}; "
+                f"got '{et}'."
+            )
+        return value
+
 
 class FinalizeSerializer(serializers.Serializer):
     pass  # Finalize is a standalone action with no extra body
+
+
+# ---------------------------------------------------------------------------
+# VendorSubmissionRoute
+# ---------------------------------------------------------------------------
+
+class VendorSubmissionRouteSerializer(serializers.ModelSerializer):
+    """Full representation for internal admin CRUD."""
+    workflow_template_name = serializers.CharField(
+        source="workflow_template.name", read_only=True
+    )
+    workflow_template_code = serializers.CharField(
+        source="workflow_template.code", read_only=True
+    )
+    published_version_id = serializers.SerializerMethodField()
+    published_version_number = serializers.SerializerMethodField()
+
+    class Meta:
+        model = VendorSubmissionRoute
+        fields = [
+            "id", "org", "code", "label", "description", "display_order",
+            "is_active", "workflow_template",
+            "workflow_template_name", "workflow_template_code",
+            "published_version_id", "published_version_number",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["id", "created_at", "updated_at"]
+
+    def get_published_version_id(self, obj):
+        from apps.workflow.models import WorkflowTemplateVersion, VersionStatus
+        v = WorkflowTemplateVersion.objects.filter(
+            template=obj.workflow_template, status=VersionStatus.PUBLISHED
+        ).order_by("-version_number").first()
+        return v.id if v else None
+
+    def get_published_version_number(self, obj):
+        from apps.workflow.models import WorkflowTemplateVersion, VersionStatus
+        v = WorkflowTemplateVersion.objects.filter(
+            template=obj.workflow_template, status=VersionStatus.PUBLISHED
+        ).order_by("-version_number").first()
+        return v.version_number if v else None
+
+
+class VendorSubmissionRouteCreateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = VendorSubmissionRoute
+        fields = [
+            "org", "code", "label", "description", "display_order",
+            "is_active", "workflow_template",
+        ]
+
+    def validate(self, data):
+        template = data.get("workflow_template")
+        org = data.get("org")
+        if template:
+            if template.module != "invoice":
+                raise serializers.ValidationError({
+                    "workflow_template": (
+                        f"The workflow template has module '{template.module}'. "
+                        "Only 'invoice' templates may be mapped to a send-to route."
+                    ),
+                })
+            if org and template.scope_node.org_id != org.id:
+                raise serializers.ValidationError({
+                    "workflow_template": (
+                        "The workflow template belongs to a different org than the route. "
+                        "Template and route must share the same org."
+                    ),
+                })
+        return data
+
+
+class VendorSubmissionRouteUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = VendorSubmissionRoute
+        fields = ["label", "description", "display_order", "is_active", "workflow_template"]
+
+    def validate_workflow_template(self, value):
+        if value.module != "invoice":
+            raise serializers.ValidationError(
+                f"The workflow template has module '{value.module}'. "
+                "Only 'invoice' templates may be mapped to a send-to route."
+            )
+        return value
+
+    def validate(self, data):
+        template = data.get("workflow_template")
+        if template and self.instance:
+            if template.scope_node.org_id != self.instance.org_id:
+                raise serializers.ValidationError({
+                    "workflow_template": (
+                        "The workflow template belongs to a different org than the route. "
+                        "Template and route must share the same org."
+                    ),
+                })
+        return data
+
+
+class VendorSubmissionRouteVendorSerializer(serializers.ModelSerializer):
+    """Minimal representation shown to vendors — no template internals exposed."""
+    class Meta:
+        model = VendorSubmissionRoute
+        fields = ["id", "code", "label", "display_order"]
 
 
 # ---------------------------------------------------------------------------
@@ -352,3 +548,53 @@ class PublicFinanceTokenSerializer(serializers.ModelSerializer):
                 .first()
             )
         return None
+
+
+# ---------------------------------------------------------------------------
+# VendorProfileRevision
+# ---------------------------------------------------------------------------
+
+class VendorProfileRevisionSerializer(serializers.ModelSerializer):
+    created_by_name = serializers.SerializerMethodField()
+    updated_by_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = VendorProfileRevision
+        fields = [
+            "id", "vendor", "revision_number", "status",
+            "proposed_snapshot_json", "changed_fields_json", "source_revision_snapshot_json",
+            "finance_sent_at", "submitted_at", "approved_at", "applied_at",
+            "created_by", "created_by_name", "updated_by", "updated_by_name",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = fields
+
+    def get_created_by_name(self, obj):
+        if obj.created_by:
+            return obj.created_by.get_full_name() or obj.created_by.email
+        return None
+
+    def get_updated_by_name(self, obj):
+        if obj.updated_by:
+            return obj.updated_by.get_full_name() or obj.updated_by.email
+        return None
+
+
+class VendorProfileRevisionListSerializer(serializers.ModelSerializer):
+    """Compact representation for list views."""
+    class Meta:
+        model = VendorProfileRevision
+        fields = [
+            "id", "vendor", "revision_number", "status",
+            "changed_fields_json", "submitted_at", "applied_at",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = fields
+
+
+class SaveDraftRevisionSerializer(serializers.Serializer):
+    proposed_snapshot = serializers.DictField(required=True)
+
+
+class RejectRevisionSerializer(serializers.Serializer):
+    note = serializers.CharField(required=False, allow_blank=True, default="")
