@@ -526,24 +526,45 @@ class Command(BaseCommand):
 
         marketing, _ = ScopeNode.objects.get_or_create(
             org=org,
-            name="Marketing",
-            defaults={"node_type": "department", "parent": None, "is_active": True},
+            code="marketing",
+            defaults={
+                "name": "Marketing",
+                "node_type": "department",
+                "parent": None,
+                "path": f"/horizon/marketing",
+                "depth": 0,
+                "is_active": True,
+            },
         )
+        marketing.name = "Marketing"
         marketing.node_type = "department"
         marketing.parent = None
+        marketing.path = f"/horizon/marketing"
+        marketing.depth = 0
         marketing.is_active = True
-        marketing.save(update_fields=["node_type", "parent", "is_active"])
+        marketing.save(update_fields=["name", "node_type", "parent", "path", "depth", "is_active"])
 
         for name in ("Corporate", "North", "South", "West", "Incity"):
+            code = name.lower()
             node, _ = ScopeNode.objects.get_or_create(
                 org=org,
-                name=name,
-                defaults={"node_type": "region", "parent": marketing, "is_active": True},
+                code=code,
+                defaults={
+                    "name": name,
+                    "node_type": "region",
+                    "parent": marketing,
+                    "path": f"/horizon/marketing/{code}",
+                    "depth": 1,
+                    "is_active": True,
+                },
             )
+            node.name = name
             node.node_type = "region"
             node.parent = marketing
+            node.path = f"/horizon/marketing/{code}"
+            node.depth = 1
             node.is_active = True
-            node.save(update_fields=["node_type", "parent", "is_active"])
+            node.save(update_fields=["name", "node_type", "parent", "path", "depth", "is_active"])
         return org
 
     def _ensure_roles(self, org):
