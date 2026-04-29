@@ -46,7 +46,40 @@ class VarianceStatus(models.TextChoices):
 class SourceType(models.TextChoices):
     CAMPAIGN = "campaign", "Campaign"
     INVOICE = "invoice", "Invoice"
+    INVOICE_ALLOCATION = "invoice_allocation", "Invoice Allocation"
+    MANUAL_EXPENSE = "manual_expense", "Manual Expense"
     MANUAL_ADJUSTMENT = "manual_adjustment", "Manual Adjustment"
+
+
+class ImportBatchStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    VALIDATED = "validated", "Validated"
+    COMMITTED = "committed", "Committed"
+    FAILED = "failed", "Failed"
+
+
+class ImportMode(models.TextChoices):
+    """
+    Controls what the import batch is allowed to do to existing records.
+
+    SETUP_ONLY       — Only create new Budget/BudgetLine records.
+                       Existing records are skipped silently.
+    SAFE_UPDATE      — Create new records AND update non-operational existing records.
+                       Records with any ledger history or active usage are SKIPPED.
+    FULL             — Create new records AND update ALL existing records.
+                       Only use for bulk corrections with explicit operator intent.
+    """
+    SETUP_ONLY = "setup_only", "Setup Only (Create Only)"
+    SAFE_UPDATE = "safe_update", "Safe Update (Skip In-Use)"
+    FULL = "full", "Full Update"
+
+
+class ImportRowStatus(models.TextChoices):
+    PENDING = "pending", "Pending"
+    VALID = "valid", "Valid"
+    ERROR = "error", "Error"
+    COMMITTED = "committed", "Committed"
+    SKIPPED = "skipped", "Skipped"
 
 
 # ---------------------------------------------------------------------------
@@ -489,3 +522,161 @@ class BudgetVarianceRequest(models.Model):
             f"VarianceRequest {self.id}: {self.status} "
             f"[{self.source_type}:{self.source_id}] {self.requested_amount}"
         )
+
+
+# ---------------------------------------------------------------------------
+# BudgetImportBatch
+# ---------------------------------------------------------------------------
+
+class BudgetImportBatch(models.Model):
+    """
+    Tracks a single Excel bulk-import of budget data.
+    Lifecycle: pending → validated → committed | failed.
+
+    import_mode controls operational safety:
+      - SETUP_ONLY: only create new records; skip existing
+      - SAFE_UPDATE: update non-operational records; skip in-use ones
+      - FULL: update all records (requires explicit intent)
+    """
+    org = models.ForeignKey(
+        "core.Organization",
+        on_delete=models.CASCADE,
+        related_name="budget_import_batches",
+    )
+    file_name = models.CharField(max_length=500)
+    financial_year = models.CharField(max_length=20, blank=True)
+    status = models.CharField(
+        max_length=20,
+        choices=ImportBatchStatus.choices,
+        default=ImportBatchStatus.PENDING,
+    )
+    import_mode = models.CharField(
+        max_length=20,
+        choices=ImportMode.choices,
+        default=ImportMode.SAFE_UPDATE,
+    )
+    # Row counts
+    total_rows = models.PositiveIntegerField(default=0)
+    valid_rows = models.PositiveIntegerField(default=0)
+    error_rows = models.PositiveIntegerField(default=0)
+    skipped_rows = models.PositiveIntegerField(default=0)
+    committed_rows = models.PositiveIntegerField(default=0)
+    validation_errors = models.JSONField(default=list, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="created_budget_import_batches",
+    )
+    committed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="committed_budget_import_batches",
+    )
+    committed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "budget_import_batches"
+        indexes = [
+            models.Index(fields=["org", "status"]),
+            models.Index(fields=["created_by"]),
+        ]
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"ImportBatch {self.id}: {self.file_name} [{self.status}, {self.import_mode}]"
+
+
+# ---------------------------------------------------------------------------
+# BudgetImportRow
+# ---------------------------------------------------------------------------
+
+class BudgetImportRow(models.Model):
+    """
+    One data row within a BudgetImportBatch. Tracks raw parsed values,
+    validation errors, and resolved FK references after validation.
+    """
+    batch = models.ForeignKey(
+        BudgetImportBatch,
+        on_delete=models.CASCADE,
+        related_name="rows",
+    )
+    row_number = models.PositiveIntegerField()
+    status = models.CharField(
+        max_length=20,
+        choices=ImportRowStatus.choices,
+        default=ImportRowStatus.PENDING,
+    )
+
+    # Raw values from Excel
+    raw_scope_node_code = models.CharField(max_length=200, blank=True)
+    raw_budget_code = models.CharField(max_length=200, blank=True)
+    raw_budget_name = models.CharField(max_length=500, blank=True)
+    raw_financial_year = models.CharField(max_length=50, blank=True)
+    raw_period_type = models.CharField(max_length=50, blank=True)
+    raw_period_start = models.CharField(max_length=50, blank=True)
+    raw_period_end = models.CharField(max_length=50, blank=True)
+    raw_category_code = models.CharField(max_length=200, blank=True)
+    raw_subcategory_code = models.CharField(max_length=200, blank=True)
+    raw_allocated_amount = models.CharField(max_length=50, blank=True)
+    raw_currency = models.CharField(max_length=20, blank=True)
+
+    # Resolved references (populated after successful validation)
+    resolved_scope_node = models.ForeignKey(
+        "core.ScopeNode",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="budget_import_rows",
+    )
+    resolved_category = models.ForeignKey(
+        BudgetCategory,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="budget_import_rows",
+    )
+    resolved_subcategory = models.ForeignKey(
+        BudgetSubCategory,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="budget_import_rows",
+    )
+    resolved_budget = models.ForeignKey(
+        Budget,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="import_rows",
+    )
+    resolved_budget_line = models.ForeignKey(
+        BudgetLine,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="import_rows",
+    )
+
+    # Validation errors (list of error strings)
+    errors = models.JSONField(default=list, blank=True)
+    # Human-readable reason why a VALID row was skipped during commit
+    skipped_reason = models.TextField(blank=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "budget_import_rows"
+        indexes = [
+            models.Index(fields=["batch", "status"]),
+            models.Index(fields=["batch", "row_number"]),
+        ]
+        ordering = ["row_number"]
+
+    def __str__(self):
+        return f"ImportRow {self.id} (batch={self.batch_id}, row={self.row_number}, {self.status})"

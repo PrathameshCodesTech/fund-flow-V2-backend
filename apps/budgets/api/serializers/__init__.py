@@ -9,12 +9,17 @@ from apps.budgets.models import (
     BudgetRule,
     BudgetConsumption,
     BudgetVarianceRequest,
+    BudgetImportBatch,
+    BudgetImportRow,
     PeriodType,
     BudgetStatus,
     ConsumptionType,
     ConsumptionStatus,
     VarianceStatus,
     SourceType,
+    ImportBatchStatus,
+    ImportRowStatus,
+    ImportMode,
 )
 
 
@@ -55,6 +60,21 @@ class BudgetSubCategorySerializer(serializers.ModelSerializer):
 
 
 class BudgetSubCategoryCreateSerializer(serializers.ModelSerializer):
+    def validate(self, data):
+        category = data.get("category", getattr(self.instance, "category", None))
+        if self.instance and category and category.id != self.instance.category_id:
+            from apps.budgets.services import get_budget_subcategory_in_use_summary
+
+            summary = get_budget_subcategory_in_use_summary(self.instance)
+            if summary["is_in_use"]:
+                raise serializers.ValidationError({
+                    "category": (
+                        "Cannot move this subcategory to a different category because it has "
+                        "operational history or active usage."
+                    )
+                })
+        return data
+
     class Meta:
         model = BudgetSubCategory
         fields = ("category", "name", "code")
@@ -168,6 +188,7 @@ class BudgetLineUpdateSerializer(serializers.Serializer):
     )
 
     def validate(self, data):
+        line = getattr(self, "instance", None)
         category = data.get("category")
         subcategory = data.get("subcategory")
 
@@ -177,6 +198,24 @@ class BudgetLineUpdateSerializer(serializers.Serializer):
                 raise serializers.ValidationError({
                     "subcategory": "Subcategory does not belong to the selected category."
                 })
+        if line:
+            incoming_category = category or line.category
+            incoming_subcategory = subcategory if "subcategory" in data else line.subcategory
+            category_changed = incoming_category.id != line.category_id
+            subcategory_changed = (
+                (incoming_subcategory.id if incoming_subcategory else None) != line.subcategory_id
+            )
+            if category_changed or subcategory_changed:
+                from apps.budgets.services import get_budget_line_in_use_summary
+
+                summary = get_budget_line_in_use_summary(line)
+                if summary["is_in_use"]:
+                    raise serializers.ValidationError({
+                        "category": (
+                            "Cannot change category/subcategory on a budget line with "
+                            "operational history or active usage."
+                        )
+                    })
         return data
 
 
@@ -474,3 +513,68 @@ class ReleaseBudgetLineSerializer(serializers.Serializer):
     source_type = serializers.ChoiceField(choices=SourceType.choices)
     source_id = serializers.CharField(max_length=100)
     note = serializers.CharField(required=False, default="", allow_blank=True)
+
+
+# ---------------------------------------------------------------------------
+# Budget import
+# ---------------------------------------------------------------------------
+
+class BudgetImportRowSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = BudgetImportRow
+        fields = (
+            "id", "row_number", "status",
+            "raw_scope_node_code", "raw_budget_code", "raw_budget_name",
+            "raw_financial_year", "raw_period_type", "raw_period_start", "raw_period_end",
+            "raw_category_code", "raw_subcategory_code",
+            "raw_allocated_amount", "raw_currency",
+            "resolved_scope_node", "resolved_category", "resolved_subcategory",
+            "resolved_budget", "resolved_budget_line",
+            "errors", "skipped_reason",
+        )
+        read_only_fields = fields
+
+
+class BudgetImportBatchSerializer(serializers.ModelSerializer):
+    rows = BudgetImportRowSerializer(many=True, read_only=True)
+    created_by_email = serializers.CharField(source="created_by.email", read_only=True, allow_null=True)
+    committed_by_email = serializers.CharField(source="committed_by.email", read_only=True, allow_null=True)
+
+    class Meta:
+        model = BudgetImportBatch
+        fields = (
+            "id", "org", "file_name", "financial_year", "status", "import_mode",
+            "total_rows", "valid_rows", "error_rows", "skipped_rows", "committed_rows",
+            "validation_errors",
+            "created_by", "created_by_email",
+            "committed_by", "committed_by_email", "committed_at",
+            "created_at", "updated_at",
+            "rows",
+        )
+        read_only_fields = fields
+
+
+class BudgetImportBatchListSerializer(serializers.ModelSerializer):
+    """Lightweight list serializer (no rows)."""
+    created_by_email = serializers.CharField(source="created_by.email", read_only=True, allow_null=True)
+
+    class Meta:
+        model = BudgetImportBatch
+        fields = (
+            "id", "org", "file_name", "financial_year", "status", "import_mode",
+            "total_rows", "valid_rows", "error_rows", "skipped_rows", "committed_rows",
+            "created_by", "created_by_email",
+            "committed_at", "created_at", "updated_at",
+        )
+        read_only_fields = fields
+
+
+class BudgetImportUploadSerializer(serializers.Serializer):
+    """Input for POST /import-batches/upload/"""
+    file = serializers.FileField()
+    financial_year = serializers.CharField(max_length=20, required=False, allow_blank=True, default="")
+    import_mode = serializers.ChoiceField(
+        choices=ImportMode.choices,
+        required=False,
+        default=ImportMode.SAFE_UPDATE,
+    )

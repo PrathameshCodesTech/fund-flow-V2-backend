@@ -1,5 +1,6 @@
 from django.utils import timezone
 from apps.manual_expenses.models import ManualExpenseEntry, ManualExpenseAttachment, ExpenseStatus
+from apps.budgets.models import SourceType
 
 
 class ExpenseValidationError(ValueError):
@@ -95,29 +96,142 @@ def submit_expense(expense: ManualExpenseEntry) -> ManualExpenseEntry:
 # Settle / Cancel (privileged actors — enforced at view level)
 # ---------------------------------------------------------------------------
 
-def mark_expense_settled(expense: ManualExpenseEntry) -> ManualExpenseEntry:
-    """Move expense from SUBMITTED to SETTLED."""
+def mark_expense_settled(expense: ManualExpenseEntry, settled_by=None) -> ManualExpenseEntry:
+    """
+    Move expense from SUBMITTED to SETTLED.
+    Records a CONSUMED BudgetConsumption entry against the expense's budget line.
+    """
     if expense.status != ExpenseStatus.SUBMITTED:
         raise ExpenseValidationError(
             f"Cannot settle expense in status '{expense.status}'. Only SUBMITTED expenses can be settled."
         )
+
     expense.status = ExpenseStatus.SETTLED
     expense.settled_at = _now()
     expense.save()
+
+    # Record consumption against the budget ledger
+    if expense.budget_id and expense.amount and expense.amount > 0:
+        _consume_expense_budget(expense, settled_by or expense.created_by)
+
     return expense
 
 
-def cancel_expense(expense: ManualExpenseEntry) -> ManualExpenseEntry:
+def _consume_expense_budget(expense: ManualExpenseEntry, actor) -> None:
+    """Record a CONSUMED ledger entry for a settled manual expense."""
+    from apps.budgets.services import (
+        consume_reserved_budget_line,
+        get_source_reserved_balance_for_line,
+        BudgetStatus,
+    )
+    from apps.budgets.models import (
+        BudgetConsumption, ConsumptionType, ConsumptionStatus, Budget
+    )
+
+    source_type = SourceType.MANUAL_EXPENSE
+    source_id = str(expense.id)
+
+    budget_line = expense.budget_line
+    budget = expense.budget
+
+    # If no reserved balance exists for this expense (expense was never reserved),
+    # create a direct CONSUMED entry rather than going through consume_reserved.
+    if budget_line and budget.status in (BudgetStatus.ACTIVE, BudgetStatus.EXHAUSTED):
+        reserved_balance = get_source_reserved_balance_for_line(budget_line, source_type, source_id)
+        if reserved_balance > 0:
+            consume_amount = min(reserved_balance, expense.amount)
+            consume_reserved_budget_line(
+                line=budget_line,
+                amount=consume_amount,
+                source_type=source_type,
+                source_id=source_id,
+                consumed_by=actor,
+                note=f"Manual expense #{expense.id} settled",
+            )
+            return
+
+    # No prior reservation — direct consume entry
+    if budget.status in (BudgetStatus.ACTIVE, BudgetStatus.EXHAUSTED):
+        BudgetConsumption.objects.create(
+            budget=budget,
+            budget_line=budget_line,
+            source_type=source_type,
+            source_id=source_id,
+            amount=expense.amount,
+            consumption_type=ConsumptionType.CONSUMED,
+            status=ConsumptionStatus.APPLIED,
+            created_by=actor,
+            note=f"Manual expense #{expense.id} settled (direct consume)",
+        )
+        budget.refresh_from_db()
+        budget.consumed_amount = (budget.consumed_amount or 0) + expense.amount
+        budget.save(update_fields=["consumed_amount", "updated_at"])
+        if budget_line:
+            budget_line.refresh_from_db()
+            budget_line.consumed_amount = (budget_line.consumed_amount or 0) + expense.amount
+            budget_line.save(update_fields=["consumed_amount", "updated_at"])
+
+
+def cancel_expense(expense: ManualExpenseEntry, cancelled_by=None) -> ManualExpenseEntry:
     """
     Move expense from DRAFT or SUBMITTED to CANCELLED.
+    If SUBMITTED, releases any reserved budget associated with this expense.
     Cannot cancel SETTLED expenses.
     """
     if expense.status == ExpenseStatus.SETTLED:
         raise ExpenseValidationError("Cannot cancel a SETTLED expense.")
+
+    was_submitted = expense.status == ExpenseStatus.SUBMITTED
     expense.status = ExpenseStatus.CANCELLED
     expense.cancelled_at = _now()
     expense.save()
+
+    if was_submitted and expense.budget_id and expense.amount and expense.amount > 0:
+        _release_expense_budget(expense, cancelled_by or expense.created_by)
+
     return expense
+
+
+def _release_expense_budget(expense: ManualExpenseEntry, actor) -> None:
+    """Release any reserved budget when a submitted expense is cancelled."""
+    from apps.budgets.services import (
+        release_reserved_budget_line,
+        get_source_reserved_balance_for_line,
+        release_reserved_budget,
+        get_source_reserved_balance,
+        BudgetStatus,
+    )
+
+    source_type = SourceType.MANUAL_EXPENSE
+    source_id = str(expense.id)
+    budget = expense.budget
+    budget_line = expense.budget_line
+
+    if budget.status not in (BudgetStatus.ACTIVE, BudgetStatus.EXHAUSTED):
+        return
+
+    if budget_line:
+        balance = get_source_reserved_balance_for_line(budget_line, source_type, source_id)
+        if balance > 0:
+            release_reserved_budget_line(
+                line=budget_line,
+                amount=balance,
+                source_type=source_type,
+                source_id=source_id,
+                released_by=actor,
+                note=f"Manual expense #{expense.id} cancelled",
+            )
+    else:
+        balance = get_source_reserved_balance(budget, source_type, source_id)
+        if balance > 0:
+            release_reserved_budget(
+                budget=budget,
+                amount=balance,
+                source_type=source_type,
+                source_id=source_id,
+                released_by=actor,
+                note=f"Manual expense #{expense.id} cancelled",
+            )
 
 
 # ---------------------------------------------------------------------------

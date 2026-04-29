@@ -8,6 +8,7 @@ from apps.budgets.api.views import (
     BudgetRuleViewSet,
     BudgetConsumptionViewSet,
     BudgetVarianceRequestViewSet,
+    BudgetImportBatchViewSet,
     BudgetOverviewView,
 )
 
@@ -20,6 +21,7 @@ router.register("lines", BudgetLineViewSet, basename="budgetline")
 router.register("rules", BudgetRuleViewSet, basename="budgetrule")
 router.register("consumptions", BudgetConsumptionViewSet, basename="budgetconsumption")
 router.register("variance-requests", BudgetVarianceRequestViewSet, basename="budgetvariancerequest")
+router.register("import-batches", BudgetImportBatchViewSet, basename="budgetimportbatch")
 router.register("", BudgetViewSet, basename="budget")
 
 urlpatterns = [
