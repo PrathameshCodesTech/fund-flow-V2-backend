@@ -5,6 +5,7 @@ from apps.manual_expenses.models import ManualExpenseEntry, ManualExpenseAttachm
 
 
 class ManualExpenseAttachmentSerializer(serializers.ModelSerializer):
+    file_name = serializers.SerializerMethodField()
     download_url = serializers.SerializerMethodField()
 
     class Meta:
@@ -21,17 +22,15 @@ class ManualExpenseAttachmentSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["id", "file_name", "download_url", "uploaded_by", "created_at"]
 
+    def get_file_name(self, obj):
+        return obj.file.name.split("/")[-1] if obj.file else ""
+
     def get_download_url(self, obj):
         if obj.file:
             request = self.context.get("request")
             if request:
                 return request.build_absolute_uri(obj.file.url)
         return None
-
-    def to_representation(self, obj):
-        rep = super().to_representation(obj)
-        rep["file_name"] = obj.file.name.split("/")[-1] if obj.file else ""
-        return rep
 
 
 class ManualExpenseListSerializer(serializers.ModelSerializer):

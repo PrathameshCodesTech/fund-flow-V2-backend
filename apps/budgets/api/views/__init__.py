@@ -1,4 +1,5 @@
 from django.db import transaction
+from django.db.models import Q
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
@@ -72,6 +73,7 @@ from apps.access.selectors import (
     get_user_visible_org_ids,
 )
 from apps.access.services import user_can_act_on_scope_or_ancestors_response
+from apps.core.models import ScopeNode
 
 
 # ---------------------------------------------------------------------------
@@ -231,10 +233,29 @@ class BudgetViewSet(ModelViewSet):
         )
         qs = qs.order_by("-created_at")
 
-        for filter_field in ("org", "scope_node", "status"):
+        for filter_field in ("org", "status"):
             val = self.request.query_params.get(filter_field)
             if val:
                 qs = qs.filter(**{filter_field: val})
+
+        scope_node_id = self.request.query_params.get("scope_node")
+        if scope_node_id:
+            try:
+                selected_node = ScopeNode.objects.get(pk=scope_node_id)
+            except ScopeNode.DoesNotExist:
+                return qs.none()
+
+            ancestor_paths = selected_node.get_ancestors_from_path() + [selected_node.path]
+            ancestor_ids = list(
+                ScopeNode.objects.filter(
+                    org=selected_node.org,
+                    path__in=ancestor_paths,
+                ).values_list("id", flat=True)
+            )
+            qs = qs.filter(
+                Q(scope_node_id__in=ancestor_ids)
+                | Q(scope_node__path__startswith=selected_node.path)
+            )
 
         fy = self.request.query_params.get("financial_year")
         if fy:

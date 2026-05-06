@@ -35,7 +35,7 @@ def send_finance_handoff_email(
         return
 
     expiry_hours = getattr(settings, "FINANCE_ACTION_TOKEN_EXPIRY_HOURS", 72)
-    subject = f"[Fund Flow] Finance Review Required — {subject_name}"
+    subject = f"[VIMS] Finance Review Required — {subject_name}"
 
     html_body = f"""<!DOCTYPE html>
 <html lang="en">
@@ -51,11 +51,12 @@ def send_finance_handoff_email(
 
         <!-- Header bar -->
         <tr>
-          <td style="background:linear-gradient(135deg,#1e40af 0%,#3b82f6 100%);padding:28px 36px;">
-            <p style="margin:0;font-size:11px;font-weight:600;letter-spacing:1.5px;color:#bfdbfe;text-transform:uppercase;">
-              Fund Flow
+          <td style="background:linear-gradient(135deg,#fff7ed 0%,#fffbeb 50%,#fff7ed 100%);
+                     border-bottom:2px solid #fed7aa;padding:28px 36px;">
+            <p style="margin:0;font-size:11px;font-weight:700;letter-spacing:1.5px;color:#c2410c;text-transform:uppercase;">
+              VIMS &mdash; Vendor Invoice Management System
             </p>
-            <h1 style="margin:6px 0 0;font-size:20px;font-weight:700;color:#ffffff;line-height:1.3;">
+            <h1 style="margin:6px 0 0;font-size:20px;font-weight:700;color:#7c2d12;line-height:1.3;">
               Finance Review Required
             </h1>
           </td>
@@ -67,39 +68,13 @@ def send_finance_handoff_email(
 
             <p style="margin:0 0 20px;font-size:14px;color:#374151;line-height:1.6;">
               Dear Finance Team,<br><br>
-              A new <strong>{module}</strong> has been submitted and requires your review.
-              Please examine the details below and take action.
+              A new invoice submission (<strong>{subject_name}</strong>) has been submitted and requires your review.
             </p>
 
-            <!-- Handoff info card -->
-            <table cellpadding="0" cellspacing="0" width="100%"
-                   style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;margin-bottom:24px;">
-              <tr>
-                <td style="padding:16px 20px;">
-                  <table cellpadding="0" cellspacing="0">
-                    <tr>
-                      <td style="padding:4px 12px 4px 0;color:#6b7280;font-size:13px;white-space:nowrap;">Subject</td>
-                      <td style="padding:4px 0;font-size:13px;font-weight:600;color:#111827;">{subject_name}</td>
-                    </tr>
-                    <tr>
-                      <td style="padding:4px 12px 4px 0;color:#6b7280;font-size:13px;white-space:nowrap;">Module</td>
-                      <td style="padding:4px 0;font-size:13px;color:#111827;text-transform:capitalize;">{module}</td>
-                    </tr>
-                    <tr>
-                      <td style="padding:4px 12px 4px 0;color:#6b7280;font-size:13px;white-space:nowrap;">Submitted at</td>
-                      <td style="padding:4px 0;font-size:13px;color:#111827;">{export_file_path}</td>
-                    </tr>
-                  </table>
-                </td>
-              </tr>
-            </table>
-
-            <!-- Divider -->
-            <hr style="border:none;border-top:1px solid #e5e7eb;margin:28px 0;">
-
-            <p style="margin:0 0 20px;font-size:14px;color:#374151;line-height:1.6;">
-              Review the details above, then use the buttons below to record your decision.
-              Each button opens a secure, one-time review page — <strong>no login required</strong>.
+            <p style="margin:0 0 24px;font-size:14px;color:#374151;line-height:1.6;">
+              Please click one of the buttons below to review the complete submission details
+              and record your decision. Each link opens a secure, one-time review page with all
+              supporting documents and vendor information.
             </p>
 
             <!-- Action buttons -->
@@ -107,18 +82,18 @@ def send_finance_handoff_email(
               <tr>
                 <td align="center" style="padding:0 8px 0 0;" width="50%">
                   <a href="{approve_url}"
-                     style="display:block;padding:14px 0;background:#16a34a;color:#ffffff;
-                            font-size:15px;font-weight:700;text-align:center;text-decoration:none;
+                     style="display:block;padding:14px 20px;background:#16a34a;color:#ffffff;
+                            font-size:14px;font-weight:700;text-align:center;text-decoration:none;
                             border-radius:8px;letter-spacing:0.3px;">
-                    &#10003;&nbsp;&nbsp;Approve
+                    Review Invoice Submission
                   </a>
                 </td>
                 <td align="center" style="padding:0 0 0 8px;" width="50%">
                   <a href="{reject_url}"
-                     style="display:block;padding:14px 0;background:#dc2626;color:#ffffff;
-                            font-size:15px;font-weight:700;text-align:center;text-decoration:none;
+                     style="display:block;padding:14px 20px;background:#dc2626;color:#ffffff;
+                            font-size:14px;font-weight:700;text-align:center;text-decoration:none;
                             border-radius:8px;letter-spacing:0.3px;">
-                    &#10007;&nbsp;&nbsp;Reject
+                    Reject Invoice Submission
                   </a>
                 </td>
               </tr>
@@ -135,7 +110,7 @@ def send_finance_handoff_email(
         <tr>
           <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 36px;">
             <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
-              This email was sent by Fund Flow · Do not reply to this email
+              VIMS &middot; Vendor Invoice Management System &middot; Do not reply to this email
             </p>
           </td>
         </tr>

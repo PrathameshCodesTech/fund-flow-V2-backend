@@ -83,7 +83,7 @@ EMAIL_USE_SSL = config("EMAIL_USE_SSL", default=False, cast=bool)
 EMAIL_TIMEOUT = config("EMAIL_TIMEOUT", default=30, cast=int)
 EMAIL_HOST_USER = config("EMAIL_HOST_USER", default="")
 EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD", default="")
-DEFAULT_FROM_EMAIL = config("DEFAULT_FROM_EMAIL", default="no-reply@fundflow.local")
+DEFAULT_FROM_EMAIL = config("DEFAULT_FROM_EMAIL", default="VIMS <no-reply@vims.local>")
 
 # Vendor settings
 VENDOR_FINANCE_RECIPIENTS = config(

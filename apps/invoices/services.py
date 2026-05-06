@@ -1659,13 +1659,6 @@ def can_user_record_invoice_payment(user, invoice) -> bool:
     if any(r in ("org_admin", "tenant_admin") for r in user_roles):
         return True
 
-    # Business override for post-finance payment recording:
-    # once finance has approved externally, Marketing Manager and HOD can
-    # record UTR/payment details in-app even if they were not explicit
-    # workflow participants on this invoice instance.
-    if any(r in ("marketing_manager", "hod") for r in user_roles):
-        return True
-
     # Invoice creator
     if invoice.created_by_id == user.pk:
         return True

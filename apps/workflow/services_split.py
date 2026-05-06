@@ -32,6 +32,45 @@ from apps.workflow.services import (
 )
 
 
+def _enrich_with_live_balances(budgets: list, budget_lines: list) -> None:
+    """
+    Mutate budgets[] and budget_lines[] in-place: staple ledger-derived
+    reserved_amount, consumed_amount, available_amount onto each dict.
+    Replaces the denormalized available_amount on budgets with the ledger figure.
+    """
+    from apps.budgets.selectors import _ledger_balances_for_budgets, _ledger_balances_for_lines
+
+    budget_ids = [b["id"] for b in budgets]
+    line_ids = [ln["id"] for ln in budget_lines]
+
+    budget_balances = _ledger_balances_for_budgets(budget_ids)
+    line_balances = _ledger_balances_for_lines(line_ids)
+
+    zero = {"reserved": Decimal("0"), "consumed": Decimal("0"), "available": Decimal("0")}
+    for b in budgets:
+        bal = budget_balances.get(b["id"], zero)
+        b["reserved_amount"] = str(bal["reserved"])
+        b["consumed_amount"] = str(bal["consumed"])
+        b["available_amount"] = str(bal["available"])  # overwrite denormalized
+
+    for ln in budget_lines:
+        bal = line_balances.get(ln["id"], zero)
+        ln["reserved_amount"] = str(bal["reserved"])
+        ln["consumed_amount"] = str(bal["consumed"])
+        ln["available_amount"] = str(bal["available"])
+
+
+def _scope_matches_entity_or_ancestor(entity, scope_node) -> bool:
+    """
+    Accept budgets scoped either:
+      - at the entity itself or within its subtree, OR
+      - at an ancestor node of the entity (e.g. Marketing owning North allocations)
+    """
+    if not scope_node:
+        return False
+    return scope_node.path.startswith(entity.path) or entity.path.startswith(scope_node.path)
+
+
 # ---------------------------------------------------------------------------
 # get_runtime_split_options
 # ---------------------------------------------------------------------------
@@ -48,17 +87,12 @@ def _build_allowed_entities_for_entity(
     from apps.budgets.models import Budget, BudgetLine, BudgetCategory, BudgetStatus
     from apps.campaigns.models import Campaign, CampaignStatus
 
-    target_path = entity.path
-    target_scope_filter = {
-        "budget__scope_node__org_id": org_id,
-        "budget__scope_node__path__startswith": target_path,
-    }
-
     scoped_lines = (
-        BudgetLine.objects.filter(**target_scope_filter, budget__status=BudgetStatus.ACTIVE)
+        BudgetLine.objects.filter(budget__scope_node__org_id=org_id, budget__status=BudgetStatus.ACTIVE)
         .select_related("budget", "budget__scope_node", "category", "subcategory")
         .order_by("category__name", "subcategory__name")
     )
+    scoped_lines = [line for line in scoped_lines if _scope_matches_entity_or_ancestor(entity, line.budget.scope_node)]
 
     category_ids: set[int] = set()
     subcategories = []
@@ -80,19 +114,20 @@ def _build_allowed_entities_for_entity(
                 "category_name": line.category.name if line.category else None,
             })
 
-    campaigns = []
-    for c in (
+    scoped_campaigns = (
         Campaign.objects.filter(
-            **target_scope_filter,
+            budget__scope_node__org_id=org_id,
             status__in=[
                 CampaignStatus.INTERNALLY_APPROVED,
                 CampaignStatus.FINANCE_PENDING,
                 CampaignStatus.FINANCE_APPROVED,
             ],
         )
-        .select_related("category", "subcategory", "budget")
+        .select_related("category", "subcategory", "budget", "budget__scope_node")
         .order_by("name")
-    ):
+    )
+    campaigns = []
+    for c in [c for c in scoped_campaigns if c.budget and _scope_matches_entity_or_ancestor(entity, c.budget.scope_node)]:
         if c.category_id:
             category_ids.add(c.category_id)
         campaigns.append({
@@ -141,6 +176,8 @@ def _build_allowed_entities_for_entity(
                 "available_amount": str(line.budget.available_amount),
                 "currency": line.budget.currency,
             })
+
+    _enrich_with_live_balances(budgets, budget_lines)
 
     return {
         "split_option_id": None,
@@ -222,20 +259,15 @@ def get_runtime_split_options(instance_step: WorkflowInstanceStep, user) -> dict
         from apps.campaigns.models import Campaign, CampaignStatus
 
         for opt in split_options_qs:
-            target_path = opt.entity.path
-            target_scope_filter = {
-                "budget__scope_node__org_id": opt.entity.org_id,
-                "budget__scope_node__path__startswith": target_path,
-            }
-
             category_ids = set()
             subcategories = []
             seen_subcategory_ids = set()
             scoped_lines = (
-                BudgetLine.objects.filter(**target_scope_filter, budget__status=BudgetStatus.ACTIVE)
+                BudgetLine.objects.filter(budget__scope_node__org_id=opt.entity.org_id, budget__status=BudgetStatus.ACTIVE)
                 .select_related("budget", "budget__scope_node", "category", "subcategory")
                 .order_by("category__name", "subcategory__name")
             )
+            scoped_lines = [line for line in scoped_lines if _scope_matches_entity_or_ancestor(opt.entity, line.budget.scope_node)]
             for line in scoped_lines:
                 category_ids.add(line.category_id)
                 if not line.subcategory_id or not line.subcategory or not line.subcategory.is_active:
@@ -250,19 +282,20 @@ def get_runtime_split_options(instance_step: WorkflowInstanceStep, user) -> dict
                     "category_name": line.category.name if line.category else None,
                 })
 
-            campaigns = []
-            for c in (
+            scoped_campaigns = (
                 Campaign.objects.filter(
-                    **target_scope_filter,
+                    budget__scope_node__org_id=opt.entity.org_id,
                     status__in=[
                         CampaignStatus.INTERNALLY_APPROVED,
                         CampaignStatus.FINANCE_PENDING,
                         CampaignStatus.FINANCE_APPROVED,
                     ],
                 )
-                .select_related("category", "subcategory", "budget")
+                .select_related("category", "subcategory", "budget", "budget__scope_node")
                 .order_by("name")
-            ):
+            )
+            campaigns = []
+            for c in [c for c in scoped_campaigns if c.budget and _scope_matches_entity_or_ancestor(opt.entity, c.budget.scope_node)]:
                 if c.category_id:
                     category_ids.add(c.category_id)
                 campaigns.append({
@@ -314,6 +347,8 @@ def get_runtime_split_options(instance_step: WorkflowInstanceStep, user) -> dict
                         "available_amount": str(line.budget.available_amount),
                         "currency": line.budget.currency,
                     })
+
+            _enrich_with_live_balances(budgets, budget_lines)
 
             # Resolve eligible approvers for this entity
             eligible_approvers = []

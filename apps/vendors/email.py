@@ -7,6 +7,10 @@ avoid circular dependencies.  Tests mock `apps.vendors.email.*`.
 from django.conf import settings
 from django.core.mail import EmailMessage
 
+# Shared brand constants
+_BRAND_NAME = "VIMS"
+_BRAND_FULL = "Vendor Invoice Management System"
+
 
 def send_vendor_invitation_email(
     vendor_email: str,
@@ -14,7 +18,7 @@ def send_vendor_invitation_email(
     onboarding_url: str,
     invited_by_name: str,
 ) -> None:
-    subject = "You've been invited to Fund Flow — Vendor Onboarding"
+    subject = f"You've been invited to {_BRAND_NAME} — Vendor Onboarding"
 
     if vendor_name_hint:
         greeting = f"Hello {vendor_name_hint},"
@@ -23,14 +27,14 @@ def send_vendor_invitation_email(
 
     body = (
         f"{greeting}\n\n"
-        f"You have been invited to complete your vendor onboarding via Fund Flow.\n\n"
+        f"You have been invited to complete your vendor onboarding via {_BRAND_NAME} ({_BRAND_FULL}).\n\n"
         f"To get started, click the link below:\n\n"
         f"  {onboarding_url}\n\n"
         f"This onboarding link is personal and should not be shared.\n"
         f"Please complete your registration at your earliest convenience.\n\n"
         f"If you have questions, please contact your {invited_by_name} representative.\n\n"
         f"Regards,\n"
-        f"The Fund Flow Team"
+        f"The {_BRAND_NAME} Team"
     )
 
     email = EmailMessage(
@@ -56,7 +60,7 @@ def send_vendor_activation_email(
         activation_url:   Full URL: /vendor/activate/{uid}/{token}
     """
     expiry_days = getattr(settings, "VENDOR_ACTIVATION_TOKEN_EXPIRY_DAYS", 7)
-    subject = f"Fund Flow — Activate Your Vendor Portal Account"
+    subject = f"{_BRAND_NAME} — Activate Your Vendor Portal Account"
 
     html_body = f"""<!DOCTYPE html>
 <html lang="en">
@@ -72,11 +76,12 @@ def send_vendor_activation_email(
 
         <!-- Header -->
         <tr>
-          <td style="background:linear-gradient(135deg,#1e3a8a 0%,#2563eb 100%);padding:32px 40px;">
-            <p style="margin:0;font-size:10px;font-weight:600;letter-spacing:2px;color:#bfdbfe;text-transform:uppercase;">
-              Fund Flow
+          <td style="background:linear-gradient(135deg,#fff7ed 0%,#fffbeb 50%,#fff7ed 100%);
+                     border-bottom:2px solid #fed7aa;padding:28px 40px;">
+            <p style="margin:0;font-size:10px;font-weight:700;letter-spacing:2px;color:#c2410c;text-transform:uppercase;">
+              {_BRAND_NAME} &mdash; {_BRAND_FULL}
             </p>
-            <h1 style="margin:8px 0 0;font-size:22px;font-weight:700;color:#ffffff;line-height:1.3;">
+            <h1 style="margin:8px 0 0;font-size:22px;font-weight:700;color:#7c2d12;line-height:1.3;">
               Activate Your Vendor Portal
             </h1>
           </td>
@@ -89,16 +94,16 @@ def send_vendor_activation_email(
             <p style="margin:0 0 24px;font-size:14px;color:#374151;line-height:1.7;">
               Dear {vendor_name or 'Vendor'},<br><br>
               Your vendor account has been approved and is now ready for activation.
-              Please set your password to access the vendor self-service portal.
+              Please set your password to access the {_BRAND_NAME} vendor self-service portal.
             </p>
 
             <!-- Vendor badge -->
             <table cellpadding="0" cellspacing="0" width="100%"
-                   style="background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;margin-bottom:28px;">
+                   style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;margin-bottom:28px;">
               <tr>
                 <td style="padding:14px 18px;">
-                  <p style="margin:0;font-size:12px;color:#0369a1;font-weight:600;">Vendor Account</p>
-                  <p style="margin:4px 0 0;font-size:15px;font-weight:700;color:#0c4a6e;">{vendor_name or 'Fund Flow Vendor'}</p>
+                  <p style="margin:0;font-size:12px;color:#c2410c;font-weight:600;">Vendor Account</p>
+                  <p style="margin:4px 0 0;font-size:15px;font-weight:700;color:#7c2d12;">{vendor_name or 'VIMS Vendor'}</p>
                 </td>
               </tr>
             </table>
@@ -111,7 +116,7 @@ def send_vendor_activation_email(
                      style="display:inline-block;padding:15px 40px;background:#16a34a;color:#ffffff;
                             font-size:16px;font-weight:700;text-align:center;text-decoration:none;
                             border-radius:10px;letter-spacing:0.3px;box-shadow:0 2px 8px rgba(22,163,74,.35);">
-                    🔐&nbsp;&nbsp;Set Password & Activate
+                    Set Password &amp; Activate
                   </a>
                 </td>
               </tr>
@@ -129,7 +134,7 @@ def send_vendor_activation_email(
         <tr>
           <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 40px;">
             <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
-              Fund Flow · Vendor Self-Service Portal · Do not reply to this email
+              {_BRAND_NAME} &middot; Vendor Self-Service Portal &middot; Do not reply to this email
             </p>
           </td>
         </tr>
@@ -166,7 +171,7 @@ def send_finance_email(
 ) -> None:
     """
     Send the VRF package to finance recipients as an HTML email with
-    inline-CSS Approve / Reject action buttons.
+    inline-CSS Review / Reject action buttons.
 
     Args:
         submission_id:       ID of VendorOnboardingSubmission (for subject line)
@@ -186,7 +191,7 @@ def send_finance_email(
         recipients = [recipients]
 
     expiry_hours = getattr(settings, "VENDOR_FINANCE_TOKEN_EXPIRY_HOURS", 72)
-    subject = f"[Fund Flow] Vendor Onboarding Review Required: {vendor_name} (Submission #{submission_id})"
+    subject = f"[{_BRAND_NAME}] Vendor Onboarding Review Required: {vendor_name} (Submission #{submission_id})"
 
     # ── Context rows ──────────────────────────────────────────────────────────
     context_rows = ""
@@ -207,7 +212,7 @@ def send_finance_email(
     att_section = ""
     if attachment_urls:
         items = "".join(
-            f'<li style="margin:4px 0;"><a href="{url}" style="color:#2563eb;">{url}</a></li>'
+            f'<li style="margin:4px 0;"><a href="{url}" style="color:#ea580c;">{url}</a></li>'
             for url in attachment_urls
         )
         att_section = f"""
@@ -232,11 +237,12 @@ def send_finance_email(
 
         <!-- Header bar -->
         <tr>
-          <td style="background:linear-gradient(135deg,#1e40af 0%,#3b82f6 100%);padding:28px 36px;">
-            <p style="margin:0;font-size:11px;font-weight:600;letter-spacing:1.5px;color:#bfdbfe;text-transform:uppercase;">
-              Fund Flow
+          <td style="background:linear-gradient(135deg,#fff7ed 0%,#fffbeb 50%,#fff7ed 100%);
+                     border-bottom:2px solid #fed7aa;padding:28px 36px;">
+            <p style="margin:0;font-size:11px;font-weight:700;letter-spacing:1.5px;color:#c2410c;text-transform:uppercase;">
+              {_BRAND_NAME} &mdash; {_BRAND_FULL}
             </p>
-            <h1 style="margin:6px 0 0;font-size:20px;font-weight:700;color:#ffffff;line-height:1.3;">
+            <h1 style="margin:6px 0 0;font-size:20px;font-weight:700;color:#7c2d12;line-height:1.3;">
               Vendor Onboarding Review
             </h1>
           </td>
@@ -274,13 +280,34 @@ def send_finance_email(
 
             {att_section}
 
+            <!-- Review checklist -->
+            <table cellpadding="0" cellspacing="0" width="100%"
+                   style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;margin-bottom:24px;">
+              <tr>
+                <td style="padding:16px 20px;">
+                  <p style="margin:0 0 10px;font-size:13px;font-weight:700;color:#c2410c;text-transform:uppercase;letter-spacing:0.5px;">
+                    Finance Review Checklist
+                  </p>
+                  <table cellpadding="0" cellspacing="0">
+                    <tr><td style="padding:3px 0;font-size:13px;color:#374151;">&#9744;&nbsp; Verify vendor name matches official registration documents</td></tr>
+                    <tr><td style="padding:3px 0;font-size:13px;color:#374151;">&#9744;&nbsp; Confirm bank account details are complete and accurate</td></tr>
+                    <tr><td style="padding:3px 0;font-size:13px;color:#374151;">&#9744;&nbsp; Validate GST / PAN registration numbers</td></tr>
+                    <tr><td style="padding:3px 0;font-size:13px;color:#374151;">&#9744;&nbsp; Review all attached supporting documents</td></tr>
+                    <tr><td style="padding:3px 0;font-size:13px;color:#374151;">&#9744;&nbsp; Confirm vendor type aligns with the intended engagement</td></tr>
+                    <tr><td style="padding:3px 0;font-size:13px;color:#374151;">&#9744;&nbsp; Check MSME declaration if applicable</td></tr>
+                  </table>
+                </td>
+              </tr>
+            </table>
+
             <!-- Divider -->
-            <hr style="border:none;border-top:1px solid #e5e7eb;margin:28px 0;">
+            <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;">
 
             <p style="margin:0 0 20px;font-size:14px;color:#374151;line-height:1.6;">
-              Review the attached VRF workbook and supporting documents, then use the
-              buttons below to record your decision. Each button opens a secure,
-              one-time review page — <strong>no login required</strong>.
+              Click <strong>Review Vendor</strong> to open the secure finance review page where
+              you can approve or decline the submission. You may also enter the SAP Vendor ID
+              on approval. Each button opens a one-time secure page &mdash;
+              <strong>no login required</strong>.
             </p>
 
             <!-- Action buttons -->
@@ -288,10 +315,10 @@ def send_finance_email(
               <tr>
                 <td align="center" style="padding:0 8px 0 0;" width="50%">
                   <a href="{approve_url}"
-                     style="display:block;padding:14px 0;background:#16a34a;color:#ffffff;
+                     style="display:block;padding:14px 0;background:#ea580c;color:#ffffff;
                             font-size:15px;font-weight:700;text-align:center;text-decoration:none;
                             border-radius:8px;letter-spacing:0.3px;">
-                    &#10003;&nbsp;&nbsp;Approve Vendor
+                    Review Vendor
                   </a>
                 </td>
                 <td align="center" style="padding:0 0 0 8px;" width="50%">
@@ -299,7 +326,7 @@ def send_finance_email(
                      style="display:block;padding:14px 0;background:#dc2626;color:#ffffff;
                             font-size:15px;font-weight:700;text-align:center;text-decoration:none;
                             border-radius:8px;letter-spacing:0.3px;">
-                    &#10007;&nbsp;&nbsp;Reject Submission
+                    &#10007;&nbsp;&nbsp;Decline Submission
                   </a>
                 </td>
               </tr>
@@ -316,7 +343,7 @@ def send_finance_email(
         <tr>
           <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 36px;">
             <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
-              This email was sent by Fund Flow · Do not reply to this email
+              {_BRAND_NAME} &middot; {_BRAND_FULL} &middot; Do not reply to this email
             </p>
           </td>
         </tr>

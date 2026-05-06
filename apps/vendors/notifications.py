@@ -14,6 +14,7 @@ All functions are mockable in tests via the standard patch path:
   apps.vendors.notifications.send_finance_handoff_notification
   apps.vendors.notifications.notify_vendor_approved
   apps.vendors.notifications.notify_vendor_rejected
+  apps.vendors.notifications.notify_vendor_reopened
   apps.vendors.notifications.notify_marketing_action_required
 """
 
@@ -193,7 +194,7 @@ def send_vendor_invitation_notification(invitation: "VendorInvitation") -> None:
         if invited_by:
             invited_by_name = invited_by.get_full_name().strip() or invited_by.email
         else:
-            invited_by_name = "Fund Flow"
+            invited_by_name = "VIMS"
 
         send_vendor_invitation_email(
             vendor_email=invitation.vendor_email,
@@ -381,15 +382,15 @@ def notify_vendor_approved(submission: "VendorOnboardingSubmission", vendor: "Ve
         inviter = getattr(invitation, "invited_by", None)
 
         # ── Vendor email ──────────────────────────────────────────────────
-        subject = "Fund Flow — Vendor Onboarding Approved"
+        subject = "VIMS — Vendor Onboarding Approved"
         body = (
             f"Dear Vendor,\n\n"
-            f"Your vendor registration on Fund Flow has been reviewed and approved by our finance team.\n\n"
+            f"Your vendor registration on VIMS has been reviewed and approved by our finance team.\n\n"
             f"Vendor Name : {vendor_name}\n"
             f"SAP Vendor ID: {vendor.sap_vendor_id or 'Pending assignment'}\n\n"
             f"The next step is marketing review. You will be notified once that is complete.\n\n"
             f"If you have questions, please contact your representative.\n\n"
-            f"Regards,\nThe Fund Flow Team"
+            f"Regards,\nThe VIMS Team"
         )
         email = EmailMessage(
             subject=subject,
@@ -403,7 +404,7 @@ def notify_vendor_approved(submission: "VendorOnboardingSubmission", vendor: "Ve
         # ── Internal inviter notification ─────────────────────────────────
         if inviter and inviter.email:
             try:
-                inviter_subject = f"[Fund Flow] Vendor Registration Approved — {vendor_name}"
+                inviter_subject = f"[VIMS] Vendor Registration Approved — {vendor_name}"
                 inviter_body = (
                     f"A vendor registration has been approved by finance.\n\n"
                     f"Vendor  : {vendor_name}\n"
@@ -462,20 +463,20 @@ def notify_vendor_rejected(submission: "VendorOnboardingSubmission", note: str =
         inviter = getattr(invitation, "invited_by", None)
 
         # ── Vendor email ──────────────────────────────────────────────────
-        subject = "Fund Flow — Vendor Onboarding Requires Attention"
+        subject = "VIMS — Vendor Onboarding Requires Attention"
         note_line = f"\nNote from finance team: {note}" if note else ""
         body = (
             f"Dear Vendor,\n\n"
-            f"Your vendor registration submission on Fund Flow requires attention.\n\n"
+            f"Your vendor registration submission on VIMS requires attention.\n\n"
             f"Vendor Name: {vendor_name}\n"
             f"Submission : #{submission.pk}\n"
             f"{note_line}\n\n"
             f"Your registration has not been approved at this time. "
             f"Please review the feedback above and resubmit if appropriate.\n\n"
-            f"To resubmit, log in to Fund Flow using your original onboarding link "
+            f"To resubmit, log in to VIMS using your original onboarding link "
             f"and update your registration details.\n\n"
             f"If you believe this is in error, please contact your representative.\n\n"
-            f"Regards,\nThe Fund Flow Team"
+            f"Regards,\nThe VIMS Team"
         )
         email = EmailMessage(
             subject=subject,
@@ -489,7 +490,7 @@ def notify_vendor_rejected(submission: "VendorOnboardingSubmission", note: str =
         # ── Internal inviter notification ─────────────────────────────────
         if inviter and inviter.email:
             try:
-                inviter_subject = f"[Fund Flow] Vendor Submission Rejected — {vendor_name}"
+                inviter_subject = f"[VIMS] Vendor Submission Rejected — {vendor_name}"
                 inviter_body = (
                     f"A vendor submission has been rejected by finance.\n\n"
                     f"Vendor    : {vendor_name}\n"
@@ -518,6 +519,85 @@ def notify_vendor_rejected(submission: "VendorOnboardingSubmission", note: str =
     except Exception as exc:
         _logger.error(
             "Failed to send rejection notifications for submission_id=%s: %s",
+            submission.pk, exc,
+        )
+
+
+# ---------------------------------------------------------------------------
+# 5b. Vendor + internal notification on reopen
+# ---------------------------------------------------------------------------
+
+def notify_vendor_reopened(submission: "VendorOnboardingSubmission", note: str = "") -> None:
+    """
+    Notify vendor that a finance-rejected submission has been reopened for edits.
+
+    The vendor resumes through the same original onboarding link. Existing data
+    remains on the submission and the onboarding UI rehydrates it for editing.
+    """
+    try:
+        from django.conf import settings
+        from django.core.mail import EmailMessage
+
+        invitation = submission.invitation
+        vendor_email = submission.normalized_email or invitation.vendor_email
+        vendor_name = submission.normalized_vendor_name or invitation.vendor_name_hint or "your registration"
+        inviter = getattr(invitation, "invited_by", None)
+        portal_base = getattr(settings, "VENDOR_PORTAL_BASE_URL", "http://localhost:3000")
+        onboarding_url = f"{portal_base}/vendor/onboarding/{invitation.token}"
+
+        subject = "VIMS — Vendor Onboarding Reopened for Correction"
+        note_line = f"\nFinance note: {note}" if note else ""
+        body = (
+            f"Dear Vendor,\n\n"
+            f"Your vendor onboarding submission has been reopened for correction.\n\n"
+            f"Vendor Name: {vendor_name}\n"
+            f"Submission : #{submission.pk}\n"
+            f"{note_line}\n\n"
+            f"Please open the link below to review the previously submitted details, "
+            f"make the required corrections, and submit again:\n\n"
+            f"{onboarding_url}\n\n"
+            f"Your earlier data will remain available in the form for editing.\n\n"
+            f"Regards,\nThe VIMS Team"
+        )
+        email = EmailMessage(
+            subject=subject,
+            body=body,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            to=[vendor_email],
+        )
+        email.send(fail_silently=False)
+        _logger.info(
+            "Vendor reopen email sent for submission_id=%s to %s",
+            submission.pk, vendor_email,
+        )
+
+        if inviter and inviter.email:
+            try:
+                inviter_subject = f"[VIMS] Vendor Submission Reopened — {vendor_name}"
+                inviter_body = (
+                    f"A vendor submission has been reopened for correction.\n\n"
+                    f"Vendor    : {vendor_name}\n"
+                    f"Email     : {vendor_email}\n"
+                    f"Submission: #{submission.pk}\n"
+                    f"Note      : {note or '(none)'}\n\n"
+                    f"The vendor has been sent the original onboarding link to correct and resubmit.\n"
+                )
+                inviter_email = EmailMessage(
+                    subject=inviter_subject,
+                    body=inviter_body,
+                    from_email=settings.DEFAULT_FROM_EMAIL,
+                    to=[inviter.email],
+                )
+                inviter_email.send(fail_silently=False)
+            except Exception as exc:
+                _logger.warning(
+                    "Failed to send internal reopen notification for submission_id=%s to %s: %s",
+                    submission.pk, inviter.email, exc,
+                )
+
+    except Exception as exc:
+        _logger.error(
+            "Failed to send reopen notifications for submission_id=%s: %s",
             submission.pk, exc,
         )
 

@@ -211,13 +211,11 @@ class ManualExpenseAttachmentViewSet(
                 {"detail": "expense_entry is required."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        visible_scope_ids = get_user_visible_scope_ids(
-            request.user, "manual_expenses", "write"
-        )
+        actionable_scope_ids = get_user_actionable_scope_ids(request.user)
         try:
             expense = ManualExpenseEntry.objects.get(
                 pk=expense_id,
-                scope_node_id__in=visible_scope_ids,
+                scope_node_id__in=actionable_scope_ids,
             )
         except ManualExpenseEntry.DoesNotExist:
             return Response(

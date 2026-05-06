@@ -59,7 +59,7 @@ def _build_approval_email(
     vendor_email: Optional[str],
     internal_url: str,
 ) -> tuple[str, str]:
-    subject = f"[Fund Flow] Invoice Approved by Finance — {invoice_title}"
+    subject = f"[VIMS] Invoice Approved by Finance — {invoice_title}"
     body = (
         f"Invoice Finance Review — Approved\n"
         f"================================\n\n"
@@ -68,7 +68,7 @@ def _build_approval_email(
         f"Ref. ID  : {reference_id}\n"
         f"Decision : Finance Approved\n\n"
         f"View invoice: {internal_url}\n\n"
-        f"This is an automated notification from Fund Flow.\n"
+        f"This is an automated notification from VIMS.\n"
     )
     return subject, body
 
@@ -81,7 +81,7 @@ def _build_rejection_email(
     vendor_email: Optional[str],
     internal_url: str,
 ) -> tuple[str, str]:
-    subject = f"[Fund Flow] Invoice Rejected by Finance — {invoice_title}"
+    subject = f"[VIMS] Invoice Rejected by Finance — {invoice_title}"
     body = (
         f"Invoice Finance Review — Rejected\n"
         f"=================================\n\n"
@@ -90,7 +90,7 @@ def _build_rejection_email(
         f"Decision : Rejected\n"
         f"Reason   : {rejection_reason}\n\n"
         f"View invoice: {internal_url}\n\n"
-        f"This is an automated notification from Fund Flow.\n"
+        f"This is an automated notification from VIMS.\n"
     )
     return subject, body
 

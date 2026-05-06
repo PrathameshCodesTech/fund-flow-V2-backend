@@ -3,6 +3,7 @@ from rest_framework import serializers
 from apps.vendors.models import (
     ALLOWED_ATTACHMENT_DOCUMENT_TYPES,
     FinanceActionType,
+    InvitationStatus,
     Vendor,
     VendorAttachment,
     VendorFinanceActionToken,
@@ -30,6 +31,31 @@ class VendorInvitationSerializer(serializers.ModelSerializer):
 
 
 class VendorInvitationCreateSerializer(serializers.ModelSerializer):
+    def validate_vendor_email(self, value):
+        email = (value or "").strip().lower()
+        if not email:
+            return value
+
+        if Vendor.objects.filter(email__iexact=email).exists():
+            raise serializers.ValidationError(
+                "A vendor with this email is already registered."
+            )
+
+        active_invite_statuses = (
+            InvitationStatus.PENDING,
+            InvitationStatus.OPENED,
+            InvitationStatus.SUBMITTED,
+        )
+        if VendorInvitation.objects.filter(
+            vendor_email__iexact=email,
+            status__in=active_invite_statuses,
+        ).exists():
+            raise serializers.ValidationError(
+                "An active invitation already exists for this email."
+            )
+
+        return email
+
     class Meta:
         model = VendorInvitation
         fields = ["org", "scope_node", "vendor_email", "vendor_name_hint", "expires_at"]
@@ -42,6 +68,7 @@ class VendorInvitationCreateSerializer(serializers.ModelSerializer):
 class VendorSubmissionSerializer(serializers.ModelSerializer):
     has_source_excel = serializers.SerializerMethodField()
     has_exported_excel = serializers.SerializerMethodField()
+    attachments = serializers.SerializerMethodField()
 
     class Meta:
         model = VendorOnboardingSubmission
@@ -77,6 +104,8 @@ class VendorSubmissionSerializer(serializers.ModelSerializer):
             "has_source_excel", "has_exported_excel",
             "finance_sent_at", "finance_vendor_code",
             "submitted_at", "created_at", "updated_at",
+            # Supporting documents (for draft re-entry restoration)
+            "attachments",
         ]
         read_only_fields = ["id", "created_at", "updated_at"]
 
@@ -87,6 +116,17 @@ class VendorSubmissionSerializer(serializers.ModelSerializer):
     def get_has_exported_excel(self, obj):
         import os
         return bool(obj.exported_excel_file and os.path.isfile(obj.exported_excel_file))
+
+    def get_attachments(self, obj):
+        return [
+            {
+                "id": str(att.id),
+                "title": att.title,
+                "file_name": att.file_name,
+                "document_type": att.document_type,
+            }
+            for att in obj.attachments.all()
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -452,20 +492,46 @@ class PublicFinanceTokenSerializer(serializers.ModelSerializer):
     submission_id = serializers.IntegerField(source="submission.id", read_only=True)
     submission_status = serializers.CharField(source="submission.status", read_only=True)
     vendor_name = serializers.CharField(source="submission.normalized_vendor_name", read_only=True)
+    title = serializers.CharField(source="submission.normalized_title", read_only=True)
     vendor_email = serializers.CharField(source="submission.normalized_email", read_only=True)
     vendor_phone = serializers.CharField(source="submission.normalized_phone", read_only=True)
+    fax = serializers.CharField(source="submission.normalized_fax", read_only=True)
     vendor_type = serializers.CharField(source="submission.normalized_vendor_type", read_only=True)
+    gst_registered = serializers.BooleanField(source="submission.normalized_gst_registered", read_only=True)
     gstin = serializers.CharField(source="submission.normalized_gstin", read_only=True)
     pan = serializers.CharField(source="submission.normalized_pan", read_only=True)
+    region = serializers.CharField(source="submission.normalized_region", read_only=True)
+    head_office_no = serializers.CharField(source="submission.normalized_head_office_no", read_only=True)
     address_line1 = serializers.CharField(source="submission.normalized_address_line1", read_only=True)
     address_line2 = serializers.CharField(source="submission.normalized_address_line2", read_only=True)
+    address_line3 = serializers.CharField(source="submission.normalized_address_line3", read_only=True)
     city = serializers.CharField(source="submission.normalized_city", read_only=True)
     state = serializers.CharField(source="submission.normalized_state", read_only=True)
     country = serializers.CharField(source="submission.normalized_country", read_only=True)
     pincode = serializers.CharField(source="submission.normalized_pincode", read_only=True)
+    preferred_payment_mode = serializers.CharField(source="submission.normalized_preferred_payment_mode", read_only=True)
+    beneficiary_name = serializers.CharField(source="submission.normalized_beneficiary_name", read_only=True)
     bank_name = serializers.CharField(source="submission.normalized_bank_name", read_only=True)
     account_number = serializers.CharField(source="submission.normalized_account_number", read_only=True)
+    bank_account_type = serializers.CharField(source="submission.normalized_bank_account_type", read_only=True)
     ifsc = serializers.CharField(source="submission.normalized_ifsc", read_only=True)
+    micr_code = serializers.CharField(source="submission.normalized_micr_code", read_only=True)
+    neft_code = serializers.CharField(source="submission.normalized_neft_code", read_only=True)
+    bank_branch_address_line1 = serializers.CharField(source="submission.normalized_bank_branch_address_line1", read_only=True)
+    bank_branch_address_line2 = serializers.CharField(source="submission.normalized_bank_branch_address_line2", read_only=True)
+    bank_branch_city = serializers.CharField(source="submission.normalized_bank_branch_city", read_only=True)
+    bank_branch_state = serializers.CharField(source="submission.normalized_bank_branch_state", read_only=True)
+    bank_branch_country = serializers.CharField(source="submission.normalized_bank_branch_country", read_only=True)
+    bank_branch_pincode = serializers.CharField(source="submission.normalized_bank_branch_pincode", read_only=True)
+    bank_phone = serializers.CharField(source="submission.normalized_bank_phone", read_only=True)
+    bank_fax = serializers.CharField(source="submission.normalized_bank_fax", read_only=True)
+    msme_registered = serializers.BooleanField(source="submission.normalized_msme_registered", read_only=True)
+    msme_registration_number = serializers.CharField(source="submission.normalized_msme_registration_number", read_only=True)
+    msme_enterprise_type = serializers.CharField(source="submission.normalized_msme_enterprise_type", read_only=True)
+    authorized_signatory_name = serializers.CharField(source="submission.normalized_authorized_signatory_name", read_only=True)
+    contact_persons_json = serializers.JSONField(source="submission.contact_persons_json", read_only=True)
+    head_office_address_json = serializers.JSONField(source="submission.head_office_address_json", read_only=True)
+    tax_registration_details_json = serializers.JSONField(source="submission.tax_registration_details_json", read_only=True)
 
     # Safe file availability flags + download URLs (no raw filesystem paths exposed)
     has_exported_excel = serializers.SerializerMethodField()
@@ -484,10 +550,17 @@ class PublicFinanceTokenSerializer(serializers.ModelSerializer):
         fields = [
             "action_type", "expires_at", "is_expired", "is_used",
             "submission_id", "submission_status",
-            "vendor_name", "vendor_email", "vendor_phone", "vendor_type",
-            "gstin", "pan",
-            "address_line1", "address_line2", "city", "state", "country", "pincode",
-            "bank_name", "account_number", "ifsc",
+            "title", "vendor_name", "vendor_email", "vendor_phone", "fax", "vendor_type",
+            "gst_registered", "gstin", "pan", "region", "head_office_no",
+            "address_line1", "address_line2", "address_line3", "city", "state", "country", "pincode",
+            "preferred_payment_mode", "beneficiary_name", "bank_name", "account_number",
+            "bank_account_type", "ifsc", "micr_code", "neft_code",
+            "bank_branch_address_line1", "bank_branch_address_line2", "bank_branch_city",
+            "bank_branch_state", "bank_branch_country", "bank_branch_pincode",
+            "bank_phone", "bank_fax",
+            "msme_registered", "msme_registration_number", "msme_enterprise_type",
+            "authorized_signatory_name",
+            "contact_persons_json", "head_office_address_json", "tax_registration_details_json",
             "has_exported_excel", "exported_excel_download_url",
             "has_source_excel", "source_excel_download_url",
             "attachments", "reject_token",

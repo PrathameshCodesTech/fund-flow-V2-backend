@@ -85,6 +85,8 @@ _VRF_LABEL_MAP = {
     "fax": "fax",
     "region": "region",
     "head office no": "head_office_no",
+    "head office / site no.": "head_office_no",
+    "head office / site no": "head_office_no",
     # Address
     "address line 1": "address_line1",
     "address line1": "address_line1",
@@ -117,16 +119,27 @@ _VRF_LABEL_MAP = {
     # Bank — branch contact
     "bank branch address line 1": "bank_branch_address_line1",
     "bank branch address line1": "bank_branch_address_line1",
+    "branch address line 1": "bank_branch_address_line1",
+    "branch address line1": "bank_branch_address_line1",
     "bank branch address line 2": "bank_branch_address_line2",
     "bank branch address line2": "bank_branch_address_line2",
+    "branch address line 2": "bank_branch_address_line2",
+    "branch address line2": "bank_branch_address_line2",
     "bank branch city": "bank_branch_city",
+    "branch city": "bank_branch_city",
     "bank branch state": "bank_branch_state",
+    "branch state": "bank_branch_state",
     "bank branch country": "bank_branch_country",
+    "branch country": "bank_branch_country",
     "bank branch pincode": "bank_branch_pincode",
+    "branch pincode": "bank_branch_pincode",
     "bank phone": "bank_phone",
+    "branch phone": "bank_phone",
     "bank fax": "bank_fax",
+    "branch fax": "bank_fax",
     # MSME / compliance
     "msme registered": "msme_registered",
+    "msme registration number": "msme_registration_number",
     "msme_registration_number": "msme_registration_number",
     "udyam registration no": "msme_registration_number",
     "udyam_reg_no": "msme_registration_number",
@@ -137,6 +150,49 @@ _VRF_LABEL_MAP = {
     "authorized_signatory_name": "authorized_signatory_name",
     "declaration accepted": "declaration_accepted",
     "declaration_accepted": "declaration_accepted",
+}
+
+_HEAD_OFFICE_LABEL_MAP = {
+    "head office address line 1": "address_line1",
+    "head office address line1": "address_line1",
+    "head office address line 2": "address_line2",
+    "head office address line2": "address_line2",
+    "head office city": "city",
+    "head office state": "state",
+    "head office country": "country",
+    "head office pincode": "pincode",
+    "head office phone": "phone",
+    "head office fax": "fax",
+}
+
+_TAX_REGISTRATION_LABEL_MAP = {
+    "tax registration nos.": "tax_registration_nos",
+    "tax registration nos": "tax_registration_nos",
+    "tin no.": "tin_no",
+    "tin no": "tin_no",
+    "cst no.": "cst_no",
+    "cst no": "cst_no",
+    "lst no.": "lst_no",
+    "lst no": "lst_no",
+    "esic reg. no.": "esic_reg_no",
+    "esic reg. no": "esic_reg_no",
+    "esic reg no": "esic_reg_no",
+    "pan ref. no.": "pan_ref_no",
+    "pan ref. no": "pan_ref_no",
+    "pan ref no": "pan_ref_no",
+    "ppf no.": "ppf_no",
+    "ppf no": "ppf_no",
+}
+
+_CONTACT_PERSON_LABEL_MAP = {
+    "contact 1 name": (0, "name"),
+    "contact 1 designation": (0, "designation"),
+    "contact 1 email": (0, "email"),
+    "contact 1 telephone": (0, "telephone"),
+    "contact 2 name": (1, "name"),
+    "contact 2 designation": (1, "designation"),
+    "contact 2 email": (1, "email"),
+    "contact 2 telephone": (1, "telephone"),
 }
 
 _KNOWN_KEYS = set(_VRF_LABEL_MAP.values())
@@ -539,7 +595,7 @@ def _send_invitation_email(invitation: VendorInvitation, invited_by) -> None:
     if invited_by:
         invited_by_name = invited_by.get_full_name().strip() or invited_by.email
     else:
-        invited_by_name = "Fund Flow"
+        invited_by_name = "VIMS"
 
     try:
         send_vendor_invitation_email(
@@ -701,6 +757,14 @@ def create_or_update_submission_from_excel(
     ws = wb.active
 
     extracted: dict = {}
+    contact_persons = [
+        {"type": "general_queries", "name": "", "designation": "", "email": "", "telephone": ""},
+        {"type": "secondary", "name": "", "designation": "", "email": "", "telephone": ""},
+    ]
+    contact_has_values = [False, False]
+    head_office_address: dict = {}
+    tax_registration_details: dict = {}
+
     for row in ws.iter_rows(min_col=1, max_col=2, values_only=True):
         label, value = row[0], row[1]
         if label is None:
@@ -709,10 +773,39 @@ def create_or_update_submission_from_excel(
         if not label_str or value is None:
             continue
         lower = label_str.lower()
+
+        if lower in _CONTACT_PERSON_LABEL_MAP:
+            idx, field_name = _CONTACT_PERSON_LABEL_MAP[lower]
+            contact_persons[idx][field_name] = str(value).strip()
+            contact_has_values[idx] = True
+            continue
+
+        if lower in _HEAD_OFFICE_LABEL_MAP:
+            head_office_address[_HEAD_OFFICE_LABEL_MAP[lower]] = str(value).strip()
+            continue
+
+        if lower in _TAX_REGISTRATION_LABEL_MAP:
+            tax_registration_details[_TAX_REGISTRATION_LABEL_MAP[lower]] = str(value).strip()
+            continue
+
         key = _VRF_LABEL_MAP.get(lower, label_str)
         extracted[key] = value
 
-    normalized, _, _, _, _ = _extract_normalized_from_payload(extracted)
+    if any(contact_has_values):
+        extracted["contact_persons"] = [
+            cp
+            for cp in contact_persons
+            if any(
+                str(cp.get(field, "")).strip()
+                for field in ("name", "designation", "email", "telephone")
+            )
+        ]
+    if head_office_address:
+        extracted["head_office_address"] = head_office_address
+    if tax_registration_details:
+        extracted["tax_registration_details"] = tax_registration_details
+
+    normalized, _, contact_persons_json, head_office_json, tax_registration_json = _extract_normalized_from_payload(extracted)
 
     existing_qs = invitation.submissions.filter(
         status__in=[SubmissionStatus.DRAFT, SubmissionStatus.REOPENED]
@@ -734,6 +827,13 @@ def create_or_update_submission_from_excel(
     submission.submission_mode = SubmissionMode.EXCEL_UPLOAD
 
     _apply_normalized_fields(submission, normalized)
+
+    if contact_persons_json is not None:
+        submission.contact_persons_json = contact_persons_json
+    if head_office_json is not None:
+        submission.head_office_address_json = head_office_json
+    if tax_registration_json is not None:
+        submission.tax_registration_details_json = tax_registration_json
 
     # Persist payload state before finance transition.
     submission.save()
@@ -845,7 +945,7 @@ def generate_vendor_export_excel(submission: VendorOnboardingSubmission) -> str:
         return row_num + 1
 
     # Title
-    title_cell = ws.cell(row=1, column=1, value="Fund Flow - Vendor Registration Form (Export)")
+    title_cell = ws.cell(row=1, column=1, value="VIMS - Vendor Registration Form (Export)")
     title_cell.font = header_font
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=2)
 
@@ -1256,6 +1356,9 @@ def reopen_submission(
 
     submission.status = SubmissionStatus.REOPENED
     submission.save(update_fields=["status", "updated_at"])
+    VendorInvitation.objects.filter(pk=submission.invitation_id).update(
+        status=InvitationStatus.OPENED,
+    )
 
     _build_audit_log(
         user=reopened_by,
@@ -1264,6 +1367,12 @@ def reopen_submission(
         resource_id=submission.pk,
         metadata={"note": note},
     )
+
+    from apps.vendors.notifications import notify_vendor_reopened
+    try:
+        notify_vendor_reopened(submission, note=note)
+    except Exception:
+        pass  # Notification failure does not roll back the state transition
 
     return submission
 
@@ -1716,6 +1825,34 @@ def compute_changed_fields(proposed: dict, source: dict) -> list:
     )
 
 
+def merge_profile_snapshot_with_source(proposed: dict, source: dict) -> dict:
+    """
+    Build a complete proposed snapshot using the source snapshot as baseline.
+
+    The portal edit form submits only editable flat fields. Without merging,
+    untouched nested/source fields appear as removed and inflate changed_fields_json.
+    """
+    merged = (source or {}).copy()
+    merged.update(proposed or {})
+    return merged
+
+
+def rebase_profile_revision_source(proposed: dict, source: dict, live: dict) -> dict:
+    """
+    Refresh a stale revision source snapshot using the current live profile only
+    for fields where the proposed draft already matches the live value.
+
+    This keeps actual draft edits intact while collapsing false positives caused
+    by old/empty source snapshots created before the vendor profile was fully set.
+    """
+    rebased = (source or {}).copy()
+    all_keys = set(rebased) | set(proposed or {}) | set(live or {})
+    for key in all_keys:
+      if (proposed or {}).get(key) == (live or {}).get(key):
+          rebased[key] = (live or {}).get(key)
+    return rebased
+
+
 @transaction.atomic
 def get_or_create_editable_profile_revision(vendor: Vendor, actor=None) -> VendorProfileRevision:
     """
@@ -1727,6 +1864,30 @@ def get_or_create_editable_profile_revision(vendor: Vendor, actor=None) -> Vendo
         status__in=[VendorProfileRevisionStatus.DRAFT, VendorProfileRevisionStatus.REOPENED]
     ).order_by("-created_at").first()
     if existing:
+        current_live_snapshot = build_vendor_live_snapshot(vendor)
+        rebased_source_snapshot = rebase_profile_revision_source(
+            existing.proposed_snapshot_json or {},
+            existing.source_revision_snapshot_json or {},
+            current_live_snapshot,
+        )
+        normalized_snapshot = merge_profile_snapshot_with_source(
+            existing.proposed_snapshot_json or {},
+            rebased_source_snapshot,
+        )
+        normalized_changed_fields = compute_changed_fields(
+            normalized_snapshot,
+            rebased_source_snapshot,
+        )
+        if (
+            rebased_source_snapshot != (existing.source_revision_snapshot_json or {})
+            or
+            normalized_snapshot != (existing.proposed_snapshot_json or {})
+            or normalized_changed_fields != (existing.changed_fields_json or [])
+        ):
+            existing.source_revision_snapshot_json = rebased_source_snapshot
+            existing.proposed_snapshot_json = normalized_snapshot
+            existing.changed_fields_json = normalized_changed_fields
+            existing.save(update_fields=["source_revision_snapshot_json", "proposed_snapshot_json", "changed_fields_json", "updated_at"])
         return existing
 
     last = vendor.profile_revisions.order_by("-revision_number").first()
@@ -1759,9 +1920,13 @@ def save_draft_profile_revision(
         raise SubmissionStateError(
             f"Revision {revision.pk} is in '{revision.status}' — cannot edit."
         )
-    revision.proposed_snapshot_json = proposed_snapshot
+    normalized_snapshot = merge_profile_snapshot_with_source(
+        proposed_snapshot,
+        revision.source_revision_snapshot_json or {},
+    )
+    revision.proposed_snapshot_json = normalized_snapshot
     revision.changed_fields_json = compute_changed_fields(
-        proposed_snapshot, revision.source_revision_snapshot_json
+        normalized_snapshot, revision.source_revision_snapshot_json or {}
     )
     revision.updated_by = actor
     revision.save(update_fields=["proposed_snapshot_json", "changed_fields_json", "updated_by", "updated_at"])
