@@ -6,7 +6,10 @@ import io
 import json
 import logging
 import re
+import time
 from typing import Any
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 from django.conf import settings
 from django.db import transaction
@@ -507,6 +510,296 @@ def _json_safe_dict(d: dict) -> dict:
     return result
 
 
+def _azure_docintel_configured() -> bool:
+    return bool(
+        getattr(settings, "AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT", "").strip()
+        and getattr(settings, "AZURE_DOCUMENT_INTELLIGENCE_KEY", "").strip()
+    )
+
+
+def _azure_extract_field_value(field: dict[str, Any]) -> Any:
+    if not isinstance(field, dict):
+        return None
+
+    # Prefer semantic value types first.
+    for key in ("valueString", "valueDate", "valueTime", "valuePhoneNumber", "valueInteger"):
+        value = field.get(key)
+        if value not in (None, ""):
+            return value
+
+    value_number = field.get("valueNumber")
+    if value_number not in (None, ""):
+        return Decimal(str(value_number))
+
+    value_currency = field.get("valueCurrency")
+    if isinstance(value_currency, dict):
+        amount = value_currency.get("amount")
+        code = value_currency.get("currencyCode")
+        if amount not in (None, ""):
+            return Decimal(str(amount))
+        if code:
+            return code
+
+    value_array = field.get("valueArray")
+    if isinstance(value_array, list):
+        return value_array
+
+    value_object = field.get("valueObject")
+    if isinstance(value_object, dict):
+        return value_object
+
+    content = field.get("content")
+    if content not in (None, ""):
+        return content
+    return None
+
+
+def _azure_extract_description(fields: dict[str, Any]) -> str | None:
+    items = fields.get("Items")
+    item_values = _azure_extract_field_value(items)
+    if not isinstance(item_values, list):
+        return None
+
+    descriptions: list[str] = []
+    for item in item_values:
+        value_object = item.get("valueObject") if isinstance(item, dict) else None
+        if not isinstance(value_object, dict):
+            continue
+        desc_field = value_object.get("Description")
+        desc = _azure_extract_field_value(desc_field) if isinstance(desc_field, dict) else None
+        if desc:
+            descriptions.append(str(desc).strip())
+    if descriptions:
+        return "; ".join(descriptions[:5])
+    return None
+
+
+def _clean_party_name(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    text = " ".join(str(value).split()).strip()
+    if not text:
+        return None
+
+    text = re.sub(r"^[\d\W_]+", "", text).strip()
+    text = re.sub(
+        r"^(?:vendor\s*name|customer\s*name|bill\s*to|billed\s*to|buyer|consignee|recipient)\s*[:\-]?\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    text = re.sub(r"\s{2,}", " ", text)
+    return text or None
+
+
+def _normalize_extracted_invoice_fields(
+    normalized: dict[str, Any],
+    submission: VendorInvoiceSubmission | None = None,
+) -> dict[str, Any]:
+    cleaned = dict(normalized)
+
+    for key in ("vendor_name", "bill_to_name"):
+        if key in cleaned:
+            cleaned_value = _clean_party_name(cleaned.get(key))
+            if cleaned_value:
+                cleaned[key] = cleaned_value
+            else:
+                cleaned.pop(key, None)
+
+    if submission is not None:
+        known_vendor_name = _clean_party_name(getattr(submission.vendor, "vendor_name", None))
+        if known_vendor_name and not _is_meaningful_party_name(cleaned.get("vendor_name")):
+            cleaned["vendor_name"] = known_vendor_name
+
+    return cleaned
+
+
+def _map_azure_invoice_fields(fields: dict[str, Any]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+
+    field_map = {
+        "InvoiceId": "vendor_invoice_number",
+        "InvoiceDate": "invoice_date",
+        "DueDate": "due_date",
+        "PurchaseOrder": "po_number",
+        "SubTotal": "subtotal_amount",
+        "TotalTax": "tax_amount",
+        "InvoiceTotal": "total_amount",
+        "VendorName": "vendor_name",
+        "CustomerName": "bill_to_name",
+        "CustomerAddressRecipient": "bill_to_name",
+    }
+
+    for azure_name, normalized_name in field_map.items():
+        field = fields.get(azure_name)
+        if not isinstance(field, dict):
+            continue
+        value = _azure_extract_field_value(field)
+        if value in (None, ""):
+            continue
+        normalized[normalized_name] = value
+
+    currency_field = fields.get("InvoiceTotal") or fields.get("AmountDue") or fields.get("SubTotal")
+    if isinstance(currency_field, dict):
+        currency_info = currency_field.get("valueCurrency")
+        if isinstance(currency_info, dict) and currency_info.get("currencyCode"):
+            normalized["currency"] = currency_info["currencyCode"]
+
+    description = _azure_extract_description(fields)
+    if description:
+        normalized["description"] = description
+
+    return _normalize_extracted_invoice_fields(normalized)
+
+
+def _extract_pdf_with_azure_document_intelligence(submission: VendorInvoiceSubmission) -> ExtractionResult | None:
+    if not _azure_docintel_configured():
+        return None
+
+    endpoint = settings.AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT.strip().rstrip("/")
+    key = settings.AZURE_DOCUMENT_INTELLIGENCE_KEY.strip()
+    analyze_url = (
+        f"{endpoint}/formrecognizer/v2.1/prebuilt/invoice/analyze"
+        "?includeTextDetails=true"
+    )
+
+    try:
+        with submission.source_file.open("rb") as f:
+            payload = f.read()
+
+        post_req = urllib_request.Request(
+            analyze_url,
+            data=payload,
+            method="POST",
+            headers={
+                "Ocp-Apim-Subscription-Key": key,
+                "Content-Type": "application/pdf",
+            },
+        )
+        with urllib_request.urlopen(post_req, timeout=60) as resp:
+            operation_location = resp.headers.get("operation-location") or resp.headers.get("Operation-Location")
+        if not operation_location:
+            raise RuntimeError("Azure Document Intelligence did not return an operation URL.")
+
+        poll_headers = {"Ocp-Apim-Subscription-Key": key}
+        result_payload = None
+        for _ in range(30):
+            poll_req = urllib_request.Request(operation_location, headers=poll_headers, method="GET")
+            with urllib_request.urlopen(poll_req, timeout=60) as poll_resp:
+                result_payload = json.loads(poll_resp.read().decode("utf-8"))
+            status = str(result_payload.get("status", "")).lower()
+            if status == "succeeded":
+                break
+            if status == "failed":
+                error_detail = result_payload.get("error") or {}
+                raise RuntimeError(f"Azure analysis failed: {error_detail}")
+            time.sleep(1)
+        else:
+            raise RuntimeError("Azure analysis timed out while polling for invoice results.")
+
+        analyze_result = result_payload.get("analyzeResult") or {}
+        document_results = analyze_result.get("documentResults") or []
+        if not document_results:
+            raise RuntimeError("Azure returned no invoice document results.")
+        first_doc = document_results[0] or {}
+        fields = first_doc.get("fields") or {}
+        normalized = _map_azure_invoice_fields(fields)
+        confidence = _score_confidence(normalized)
+
+        raw_cells = {
+            "extraction_method": "azure_document_intelligence",
+            "azure_status": result_payload.get("status"),
+            "azure_model": "prebuilt-invoice",
+            "azure_fields": fields,
+        }
+        warnings: list[str] = []
+        errors: list[str] = []
+        if not normalized:
+            warnings.append("Azure extraction did not return usable invoice fields.")
+            errors.append("Azure extraction returned no usable invoice fields.")
+        elif confidence < 0.5:
+            warnings.append("Azure extraction returned only partial invoice data. Please review carefully.")
+
+        return ExtractionResult(
+            raw_cells=raw_cells,
+            normalized={k: v for k, v in normalized.items() if v not in (None, "")},
+            confidence=confidence,
+            warnings=warnings,
+            errors=errors,
+        )
+    except urllib_error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = str(exc)
+        raise RuntimeError(f"Azure Document Intelligence HTTP {exc.code}: {detail}") from exc
+    except urllib_error.URLError as exc:
+        raise RuntimeError(f"Azure Document Intelligence connection failed: {exc.reason}") from exc
+
+
+def _is_meaningful_party_name(value: Any) -> bool:
+    if value in (None, ""):
+        return False
+    text = " ".join(str(value).split()).strip()
+    if len(text) < 4:
+        return False
+    if len(re.findall(r"[A-Za-z]", text)) < 4:
+        return False
+    lowered = text.lower()
+    bad_markers = (
+        "government",
+        "signature",
+        "authorised signatory",
+        "authorized signature",
+        "ship to",
+        "bill to",
+    )
+    return not any(marker in lowered for marker in bad_markers)
+
+
+def _merge_extraction_results(
+    primary: ExtractionResult,
+    fallback: ExtractionResult,
+    submission: VendorInvoiceSubmission | None = None,
+) -> ExtractionResult:
+    merged = dict(primary.normalized)
+    fallback_normalized = fallback.normalized or {}
+
+    for key, value in fallback_normalized.items():
+        if merged.get(key) in (None, ""):
+            merged[key] = value
+
+    # Prefer cleaner party names from fallback when primary looks weak.
+    for key in ("vendor_name", "bill_to_name"):
+        primary_value = primary.normalized.get(key)
+        fallback_value = fallback_normalized.get(key)
+        if not _is_meaningful_party_name(primary_value) and _is_meaningful_party_name(fallback_value):
+            merged[key] = fallback_value
+
+    merged = _normalize_extracted_invoice_fields(merged, submission=submission)
+
+    confidence = _score_confidence(merged)
+    raw_cells = dict(primary.raw_cells)
+    raw_cells["fallback_extraction_method"] = fallback.raw_cells.get("extraction_method")
+    raw_cells["fallback_used"] = True
+
+    warnings = list(primary.warnings)
+    warnings.extend(w for w in fallback.warnings if w not in warnings)
+    errors = list(primary.errors)
+
+    if confidence < primary.confidence:
+        confidence = primary.confidence
+
+    return ExtractionResult(
+        raw_cells=raw_cells,
+        normalized={k: v for k, v in merged.items() if v not in (None, "")},
+        confidence=confidence,
+        warnings=warnings,
+        errors=errors,
+    )
+
+
 PDF_FIELD_SEQUENCE = [
     "vendor_invoice_number",
     "invoice_date",
@@ -543,9 +836,285 @@ def _is_pdf_placeholder_line(line: str) -> bool:
         or lowered.startswith("attach your invoice file")
         or lowered.startswith("submit ")
         or lowered.startswith("fundflow vendor portal")
+        or lowered.startswith("vims vendor portal")
         or lowered.startswith("recommended:")
         or lowered.startswith("brief description")
     )
+
+
+# ---------------------------------------------------------------------------
+# PDF classification
+# ---------------------------------------------------------------------------
+
+_DIGITAL_TEXT_MIN_CHARS = 100  # fewer chars → treat as scanned
+
+
+def _classify_pdf_text(raw_text: str) -> str:
+    """
+    Returns 'template', 'digital', or 'scanned' based on text density and
+    presence of VIMS template markers.
+    """
+    stripped = raw_text.strip()
+    if len(stripped) < _DIGITAL_TEXT_MIN_CHARS:
+        return "scanned"
+    if "VIMS" in raw_text and "Vendor Invoice Submission Template" in raw_text:
+        return "template"
+    return "digital"
+
+
+# ---------------------------------------------------------------------------
+# OCR fallback — PyMuPDF + Tesseract (graceful degradation)
+# ---------------------------------------------------------------------------
+
+
+def _ocr_pdf_pages(file_obj) -> str:
+    """
+    Rasterize each page with PyMuPDF and run Tesseract OCR.
+    Returns concatenated text, or empty string when either library or the
+    Tesseract binary is absent.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        logger.debug("PyMuPDF (fitz) not installed — OCR skipped")
+        return ""
+
+    try:
+        import pytesseract
+        from PIL import Image
+    except ImportError:
+        logger.debug("pytesseract / Pillow not installed — OCR skipped")
+        return ""
+
+    try:
+        pytesseract.get_tesseract_version()
+    except Exception:
+        logger.warning("Tesseract binary not found or not reachable — OCR skipped")
+        return ""
+
+    try:
+        file_obj.seek(0)
+        raw_bytes = file_obj.read()
+        file_obj.seek(0)
+        doc = fitz.open(stream=raw_bytes, filetype="pdf")
+        pages_text: list[str] = []
+        for page in doc:
+            mat = fitz.Matrix(200 / 72, 200 / 72)  # 200 DPI
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            pages_text.append(pytesseract.image_to_string(img, config="--psm 6"))
+        doc.close()
+        return "\n".join(pages_text)
+    except Exception as exc:
+        logger.warning("OCR extraction failed: %s", exc)
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# Regex battery for arbitrary invoice PDFs
+# ---------------------------------------------------------------------------
+
+_PDF_REGEX_PATTERNS: list[tuple[str, str]] = [
+    ("vendor_invoice_number",
+     r"(?:invoice\s*(?:no\.?|number|#|num)|inv\w*\s*(?:no\.?|#|number|num))"
+     r"[:\s#]*([A-Z0-9][A-Z0-9\-\/\.]{2,})"),
+    ("vendor_invoice_number",
+     r"(?:tax\s*invoice)\s+([A-Z0-9][A-Z0-9\-\/\.]{2,})"),
+    ("invoice_date",
+     r"(?:invoice\s*date|inv\.?\s*date|date\s*of\s*invoice|bill\s*date)"
+     r"[:\s]*(\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}|\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2}"
+     r"|[A-Za-z]{3,9}\s+\d{1,2},?\s+\d{4})"),
+    ("invoice_date",
+     r"(?:dated|date)\s*[:\s]*(\d{1,2}[-/\.][A-Za-z]{3,9}[-/\.]\d{2,4}|\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}|\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2})"),
+    ("due_date",
+     r"(?:due\s*date|payment\s*due(?:\s*date)?|pay\s*by)"
+     r"[:\s]*(\d{1,2}[-/\.]\d{1,2}[-/\.]\d{2,4}|\d{4}[-/\.]\d{1,2}[-/\.]\d{1,2})"),
+    ("currency",
+     r"(?:currency)[:\s]*([A-Z]{3})\b"),
+    ("po_number",
+     r"(?:p\.?o\.?\s*(?:no\.?|number|#)|purchase\s*order\s*(?:no\.?|number|#)?)"
+     r"[:\s-]*([A-Z0-9][A-Z0-9\-\/\.]{2,})"),
+    ("total_amount",
+     r"(?:grand\s*total|invoice\s*total|total\s*amount(?:\s*after\s*tax)?|total\s*due|amount\s*due|balance\s*due|net\s*total|amount\s*chargeable)"
+     r"[^\d\n]*([\d,]+\.?\d*)"),
+    ("subtotal_amount",
+     r"(?:sub\s*total|subtotal|amount\s*before\s*tax|taxable\s*amount|total\s*value\s*of\s*services)"
+     r"[^\d\n]*([\d,]+\.?\d*)"),
+    ("tax_amount",
+     r"(?:total\s*tax\s*amount|tax\s*amount|gst\s*amount|vat\s*amount)"
+     r"[^\d\n]*([\d,]+\.?\d*)"),
+    ("bill_to_name",
+     r"(?:bill\s*to|billed\s*to|invoiced\s*to|client)[:\s]*\n?\s*([A-Z][A-Za-z0-9\s,\.&]{3,60})"),
+    ("vendor_name",
+     r"(?:from|vendor|supplier|sold\s*by|company\s*name)[:\s]*\n?\s*([A-Z][A-Za-z0-9\s,\.&]{3,60})"),
+]
+
+_PDF_DATE_FORMATS = (
+    "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y",
+    "%d.%m.%Y", "%Y/%m/%d", "%d/%m/%y", "%d-%m-%y", "%d.%m.%y",
+    "%d-%b-%Y", "%d-%b-%y", "%d %b %Y", "%d %b %y",
+    "%B %d, %Y", "%b %d, %Y", "%d %B %Y",
+)
+
+def _parse_pdf_date(s: str) -> str | None:
+    s = re.sub(r"(\d)(st|nd|rd|th)\b", r"\1", s.strip(), flags=re.IGNORECASE)
+    for fmt in _PDF_DATE_FORMATS:
+        try:
+            return datetime.strptime(s, fmt).date().isoformat()
+        except ValueError:
+            pass
+    return None
+
+
+def _sum_tax_components(raw_text: str) -> Decimal | None:
+    total = Decimal("0")
+    matched = 0
+    for line in raw_text.splitlines():
+        compact = " ".join(line.split())
+        if not compact:
+            continue
+        if not re.search(r"\b(?:add\s+)?(?:cgst|sgst|igst)\b", compact, re.IGNORECASE):
+            continue
+        amount_match = re.search(r"([\d,]+\.\d{1,2})\s*$", compact)
+        if not amount_match:
+            continue
+        amount = _try_parse_decimal(amount_match.group(1))
+        if amount is None:
+            continue
+        total += amount
+        matched += 1
+    return total if matched >= 1 else None
+
+
+def _largest_amount_in_text(raw_text: str) -> Decimal | None:
+    amounts: list[Decimal] = []
+    for match in re.finditer(r"(?<![A-Z0-9])([\d,]+\.\d{1,2})(?![A-Z0-9])", raw_text):
+        amount = _try_parse_decimal(match.group(1))
+        if amount is not None:
+            amounts.append(amount)
+    return max(amounts) if amounts else None
+
+
+def _extract_from_text_with_regex(raw_text: str) -> dict[str, Any]:
+    """Run the regex battery against raw PDF text; first match per field wins."""
+    normalized: dict[str, Any] = {}
+    for field_name, pattern in _PDF_REGEX_PATTERNS:
+        if field_name in normalized:
+            continue
+        match = re.search(pattern, raw_text, re.IGNORECASE | re.MULTILINE)
+        if not match:
+            continue
+        raw_val = match.group(1).strip()
+        if not raw_val:
+            continue
+        if field_name in ("invoice_date", "due_date"):
+            parsed = _parse_pdf_date(raw_val)
+            if parsed:
+                normalized[field_name] = parsed
+        elif field_name in ("total_amount", "subtotal_amount", "tax_amount"):
+            parsed = _try_parse_decimal(raw_val)
+            if parsed is not None:
+                normalized[field_name] = parsed
+        else:
+            normalized[field_name] = raw_val
+
+    if "currency" not in normalized:
+        m = re.search(
+            r"\b(INR|USD|EUR|GBP|AED|SGD|AUD|CAD|JPY|CNY|CHF|MYR)\b",
+            raw_text, re.IGNORECASE,
+        )
+        if m:
+            normalized["currency"] = m.group(1).upper()
+        elif chr(8377) in raw_text or re.search(r"\bindian\s+rupees?\b", raw_text, re.IGNORECASE):
+            normalized["currency"] = "INR"
+
+    tax_components = _sum_tax_components(raw_text)
+    if tax_components is not None:
+        normalized["tax_amount"] = tax_components
+
+    total_amount = normalized.get("total_amount")
+    subtotal_amount = normalized.get("subtotal_amount")
+    tax_amount = normalized.get("tax_amount")
+
+    if total_amount is None:
+        inferred_total = _largest_amount_in_text(raw_text)
+        if inferred_total is not None:
+            normalized["total_amount"] = inferred_total
+            total_amount = inferred_total
+
+    if subtotal_amount is None and total_amount is not None and tax_amount is not None:
+        normalized["subtotal_amount"] = total_amount - tax_amount
+        subtotal_amount = normalized["subtotal_amount"]
+
+    if tax_amount is None and total_amount is not None and subtotal_amount is not None:
+        normalized["tax_amount"] = total_amount - subtotal_amount
+        tax_amount = normalized["tax_amount"]
+
+    if total_amount is None and subtotal_amount is not None and tax_amount is not None:
+        normalized["total_amount"] = subtotal_amount + tax_amount
+
+    invoice_ref = normalized.get("vendor_invoice_number")
+    if invoice_ref and not re.search(r"\d", str(invoice_ref)):
+        normalized.pop("vendor_invoice_number", None)
+
+    po_ref = normalized.get("po_number")
+    if po_ref and not re.search(r"\d", str(po_ref)):
+        normalized.pop("po_number", None)
+
+    bill_to = normalized.get("bill_to_name")
+    if bill_to:
+        lines = [ln.strip() for ln in str(bill_to).splitlines() if ln.strip()]
+        lines = [ln for ln in lines if ln.lower() not in {"bill to", "ship to", "client"}]
+        if lines:
+            normalized["bill_to_name"] = lines[0]
+
+    return normalized
+
+
+# ---------------------------------------------------------------------------
+# Vendor layout hook registry (extensibility point, no built-in hooks yet)
+# ---------------------------------------------------------------------------
+# Maps a lowercase vendor-name substring → hook(normalized, raw_text) -> dict.
+# Register vendor-specific rules here or in a separate vendor_hooks.py module.
+
+_VENDOR_HOOK_REGISTRY: dict[str, Any] = {}
+
+
+def _apply_vendor_hooks(
+    normalized: dict[str, Any],
+    raw_text: str,
+    vendor_name: str | None,
+) -> dict[str, Any]:
+    if not vendor_name:
+        return normalized
+    vn_lower = vendor_name.lower()
+    for pattern, hook_fn in _VENDOR_HOOK_REGISTRY.items():
+        if pattern in vn_lower:
+            try:
+                result = hook_fn(normalized, raw_text)
+                if result:
+                    normalized = result
+            except Exception:
+                logger.warning("Vendor hook '%s' raised an error", pattern, exc_info=True)
+    return normalized
+
+
+# ---------------------------------------------------------------------------
+# Confidence scoring
+# ---------------------------------------------------------------------------
+
+_CONFIDENCE_REQUIRED = ["vendor_invoice_number", "invoice_date", "total_amount", "currency"]
+_CONFIDENCE_OPTIONAL = ["due_date", "po_number", "subtotal_amount", "tax_amount", "description"]
+
+
+def _score_confidence(normalized: dict[str, Any]) -> float:
+    """
+    Weighted confidence: required fields 75%, optional fields 25%.
+    Returns a float in [0.0, 1.0].
+    """
+    req = sum(1 for f in _CONFIDENCE_REQUIRED if normalized.get(f)) / len(_CONFIDENCE_REQUIRED)
+    opt = sum(1 for f in _CONFIDENCE_OPTIONAL if normalized.get(f)) / len(_CONFIDENCE_OPTIONAL)
+    return round(0.75 * req + 0.25 * opt, 4)
 
 
 def _looks_like_invoice_number(value: str) -> bool:
@@ -837,8 +1406,7 @@ def extract_invoice_submission(submission: VendorInvoiceSubmission) -> Extractio
 
     try:
         if submission.source_file_type == "pdf":
-            # PDF V1: store raw text if PyPDF2 is available, otherwise flag needs_correction
-            result = _extract_pdf_fallback(submission)
+            result = extract_pdf(submission)
         else:
             file_obj = submission.source_file.open("rb")
             result = extract_excel(file_obj)
@@ -872,92 +1440,107 @@ def extract_invoice_submission(submission: VendorInvoiceSubmission) -> Extractio
         )
 
 
-def _extract_pdf_fallback(submission: VendorInvoiceSubmission) -> ExtractionResult:
-    """
-    V1 PDF fallback: attempt basic text extraction if PyPDF2 is available.
-    If extraction yields nothing useful, return low-confidence result that
-    forces the needs_correction flow.
-    """
-    warnings = []
-    errors = []
+def _extract_pdf_locally(submission: VendorInvoiceSubmission) -> ExtractionResult:
+    warnings: list[str] = []
+    errors: list[str] = []
     raw_text = ""
+    ocr_used = False
+
+    # Layer 1: native text extraction
     try:
         import PyPDF2
         file_obj = submission.source_file.open("rb")
         reader = PyPDF2.PdfReader(file_obj)
-        text_parts = []
-        for page in reader.pages:
-            text_parts.append(page.extract_text() or "")
-        raw_text = "\n".join(text_parts)
+        raw_text = "\n".join(page.extract_text() or "" for page in reader.pages)
         file_obj.close()
     except ImportError:
-        warnings.append("PDF text extraction library (PyPDF2) is not installed. Please fill in the details manually.")
+        warnings.append("PDF text extraction library (PyPDF2) is not installed.")
     except Exception as exc:
         warnings.append(f"PDF text extraction failed: {exc}")
 
-    raw_cells = {"raw_text": raw_text}
-    normalized = _extract_pdf_template_values(raw_text)
+    # Layer 2: classification
+    pdf_class = _classify_pdf_text(raw_text)
+
+    # Layer 3: OCR when text is sparse
+    if pdf_class == "scanned":
+        file_obj = submission.source_file.open("rb")
+        ocr_text = _ocr_pdf_pages(file_obj)
+        file_obj.close()
+        if ocr_text.strip():
+            raw_text = ocr_text
+            ocr_used = True
+            pdf_class = _classify_pdf_text(raw_text)
+        else:
+            warnings.append(
+                "This appears to be a scanned PDF. OCR is unavailable or produced no text. "
+                "Please fill in the invoice details manually."
+            )
+
+    # Layer 4: field extraction
+    normalized: dict[str, Any] = {}
+    if pdf_class == "template":
+        normalized = _extract_pdf_template_values(raw_text)
+    if not normalized:
+        normalized = _extract_from_text_with_regex(raw_text)
+
+    # Layer 5: vendor-specific rules
+    vendor_name = getattr(submission.vendor, "vendor_name", None)
+    normalized = _apply_vendor_hooks(normalized, raw_text, vendor_name)
+
+    # Layer 6: confidence
+    confidence = _score_confidence(normalized)
+
+    raw_cells: dict[str, Any] = {"raw_text": raw_text}
+    if ocr_used:
+        raw_cells["extraction_method"] = "ocr"
+        warnings.append("OCR was used to read this PDF. Please review all extracted fields carefully.")
+    elif pdf_class == "template":
+        raw_cells["extraction_method"] = "template"
+    else:
+        raw_cells["extraction_method"] = "regex"
 
     if not normalized:
-        patterns = {
-            "vendor_invoice_number": r"(?:invoice\s*(?:no\.?|number|#)[:\s]*)([A-Z0-9][A-Z0-9/\-]{3,})",
-            "invoice_date": r"(?:invoice\s*date[:\s]*)([\d]{1,4}[-/][\d]{1,2}[-/][\d]{1,4})",
-            "currency": r"(?:currency[:\s]*)([A-Z]{3})",
-            "po_number": r"(?:po\s*(?:no\.?|number|#)[:\s]*)([A-Z0-9][A-Z0-9/\-]{3,})",
-        }
-        for field, pattern in patterns.items():
-            match = re.search(pattern, raw_text, re.IGNORECASE)
-            if match:
-                normalized[field] = match.group(1).strip()
-
-    required_fields = ["vendor_invoice_number", "invoice_date", "total_amount", "currency"]
-    matched = sum(1 for field in required_fields if normalized.get(field))
-    confidence = matched / len(required_fields) if required_fields else 0.0
-
-    if not normalized:
-        warnings.append("No invoice fields could be extracted from the PDF. Please enter details manually.")
+        warnings.append("No invoice fields could be extracted. Please enter details manually.")
         errors.append("No fields could be extracted from the PDF.")
     elif confidence < 0.5:
-        warnings.append("PDF extraction found only partial invoice data. Please review and complete the fields.")
+        warnings.append("Extraction found only partial invoice data. Please review and complete all fields.")
 
     return ExtractionResult(
         raw_cells=raw_cells,
-        normalized=normalized,
+        normalized={k: v for k, v in normalized.items() if v not in (None, "")},
         confidence=confidence,
         warnings=warnings,
         errors=errors,
     )
 
-    # Try to extract fields via simple regex from raw text
-    normalized = {}
-    raw_cells = {"raw_text": raw_text}
 
-    patterns = {
-        "vendor_invoice_number": r"(?:invoice\s*(?:no\.?|number|#)[:\s]*)([A-Z0-9][-A-Z0-9/]*)",
-        "invoice_date": r"(?:invoice\s*date[:\s]*)([\d]{1,4}[-/][\d]{1,2}[-/][\d]{1,4})",
-        "po_number": r"(?:po\s*(?:no\.?|number|#)[:\s]*)([A-Z0-9][-A-Z0-9/]*)",
-    }
+def extract_pdf(submission: VendorInvoiceSubmission) -> ExtractionResult:
+    """
+    Hybrid PDF extraction pipeline:
 
-    for field, pattern in patterns.items():
-        match = re.search(pattern, raw_text, re.IGNORECASE)
-        if match:
-            normalized[field] = match.group(1).strip()
+    Layer 1 — Azure Document Intelligence (primary) when configured.
+    Layer 2 — Local parser fallback / backfill.
+    Layer 3 — Review-before-submit remains mandatory.
+    """
+    local_result: ExtractionResult | None = None
 
-    confidence = 0.0
-    if normalized:
-        confidence = 0.25  # Low confidence — manual review required
+    if _azure_docintel_configured():
+        try:
+            azure_result = _extract_pdf_with_azure_document_intelligence(submission)
+            if azure_result and azure_result.normalized:
+                local_result = _extract_pdf_locally(submission)
+                return _merge_extraction_results(azure_result, local_result, submission=submission)
+        except Exception as exc:
+            logger.warning(
+                "Azure Document Intelligence extraction failed for submission %s; falling back to local parser: %s",
+                submission.pk,
+                exc,
+            )
 
-    if not normalized:
-        warnings.append("No invoice fields could be extracted from the PDF. Please enter details manually.")
-        errors.append("No fields could be extracted from the PDF.")
-
-    return ExtractionResult(
-        raw_cells=raw_cells,
-        normalized=normalized,
-        confidence=confidence,
-        warnings=warnings,
-        errors=errors,
-    )
+    result = _extract_pdf_locally(submission)
+    result.normalized = _normalize_extracted_invoice_fields(result.normalized, submission=submission)
+    result.confidence = _score_confidence(result.normalized)
+    return result
 
 
 def validate_invoice_submission(submission: VendorInvoiceSubmission) -> list[dict]:
@@ -1264,6 +1847,70 @@ def cancel_vendor_invoice_submission(submission: VendorInvoiceSubmission) -> Non
     submission.save(update_fields=["status", "updated_at"])
 
 
+def _delete_file_field_safely(file_field) -> None:
+    """Delete a FileField from storage, swallowing storage-layer failures."""
+    if not file_field:
+        return
+    name = getattr(file_field, "name", "")
+    if not name:
+        return
+    try:
+        file_field.storage.delete(name)
+    except Exception:
+        pass
+
+
+def discard_vendor_invoice_submission(submission: VendorInvoiceSubmission) -> None:
+    """
+    Permanently delete an unfinished vendor invoice submission.
+
+    Allowed only for submission-side records that have not created a final Invoice:
+      - uploaded
+      - needs_correction
+      - ready
+      - cancelled
+
+    Not allowed for:
+      - extracting
+      - submitted
+      - rejected
+      - any submission already linked to a final invoice
+    """
+    if submission.final_invoice_id is not None:
+        raise SubmissionStateError(
+            "Cannot discard this record because a final invoice has already been created from it."
+        )
+
+    if submission.status == VendorInvoiceSubmissionStatus.EXTRACTING:
+        raise SubmissionStateError(
+            "Cannot discard while extraction is in progress. Please wait for it to complete."
+        )
+
+    discardable = {
+        VendorInvoiceSubmissionStatus.UPLOADED,
+        VendorInvoiceSubmissionStatus.NEEDS_CORRECTION,
+        VendorInvoiceSubmissionStatus.READY,
+        VendorInvoiceSubmissionStatus.CANCELLED,
+    }
+    if submission.status == VendorInvoiceSubmissionStatus.SUBMITTED:
+        raise SubmissionStateError("Cannot discard a submission that has already been submitted.")
+    if submission.status == VendorInvoiceSubmissionStatus.REJECTED:
+        raise SubmissionStateError("Cannot discard a submission that is already part of review history.")
+    if submission.status not in discardable:
+        raise SubmissionStateError(
+            f"Cannot discard submission in status '{submission.status}'."
+        )
+
+    source_file = submission.source_file
+    document_files = [doc.file for doc in submission.documents.all()]
+
+    submission.delete()
+
+    _delete_file_field_safely(source_file)
+    for document_file in document_files:
+        _delete_file_field_safely(document_file)
+
+
 # ---------------------------------------------------------------------------
 # Invoice template downloads
 # ---------------------------------------------------------------------------
@@ -1376,7 +2023,7 @@ def generate_pdf_template() -> HttpResponse:
 
     # ── Header banner ──────────────────────────────────────────────────────────
     header_data = [[
-        Paragraph("FundFlow — Vendor Invoice Submission Template", title_s),
+        Paragraph("VIMS — Vendor Invoice Submission Template (Recommended)", title_s),
     ]]
     header_tbl = Table(header_data, colWidths=[174*mm])
     header_tbl.setStyle(TableStyle([
@@ -1393,8 +2040,9 @@ def generate_pdf_template() -> HttpResponse:
     # ── Recommended note ───────────────────────────────────────────────────────
     note_data = [[
         Paragraph(
-            "&#10004; Recommended: Use the <b>Excel template</b> for auto-fill. "
-            "Upload this completed PDF alongside your invoice for seamless processing.",
+            "&#10004; <b>Template Usage:</b> You can upload invoices in any format. "
+            "Using this template improves automatic field extraction accuracy, reducing manual corrections. "
+            "All extracted fields will be reviewed and confirmed before final submission.",
             note_s,
         )
     ]]
@@ -1504,10 +2152,10 @@ def generate_pdf_template() -> HttpResponse:
     els.append(Spacer(1, 2*mm))
 
     steps_data = [
-        [Paragraph("1", label_s), Paragraph("Fill in all fields. Print or save this PDF.", body_s)],
-        [Paragraph("2", label_s), Paragraph("Log in to the Vendor Portal and choose <b>Upload Invoice</b>.", body_s)],
-        [Paragraph("3", label_s), Paragraph("Attach your invoice file (PDF/Excel) and this completed template.", body_s)],
-        [Paragraph("4", label_s), Paragraph("Submit — our system will auto-extract data and notify you of status.", body_s)],
+        [Paragraph("1", label_s), Paragraph("(Optional) Fill in fields to help with extraction accuracy.", body_s)],
+        [Paragraph("2", label_s), Paragraph("Log in to the Vendor Portal and choose <b>Upload Invoice PDF</b>.", body_s)],
+        [Paragraph("3", label_s), Paragraph("Upload your invoice PDF in any format. System will extract fields best-effort.", body_s)],
+        [Paragraph("4", label_s), Paragraph("Review and correct extracted fields, then submit for approval.", body_s)],
     ]
     steps_tbl = Table(steps_data, colWidths=[10*mm, 164*mm])
     steps_tbl.setStyle(TableStyle([
@@ -1530,8 +2178,8 @@ def generate_pdf_template() -> HttpResponse:
     els.append(HRFlowable(width="100%", thickness=0.5, color=BORDER))
     els.append(Spacer(1, 2*mm))
     els.append(Paragraph(
-        "FundFlow Vendor Portal — Template generated automatically. "
-        "For support contact your assigned procurement manager.",
+        "VIMS Vendor Portal — Template provided for optional use. "
+        "Invoices in any format are accepted with review-before-submit workflow.",
         footer_s,
     ))
 

@@ -275,13 +275,18 @@ def send_finance_handoff_notification(submission: "VendorOnboardingSubmission") 
         from apps.vendors.email import send_finance_email
         from apps.vendors.models import FinanceActionType
 
-        # Tokens already created by _start_finance_review — look them up
-        tokens = list(submission.finance_tokens.all())
-        approve_token_record = next(
-            (t for t in tokens if t.action_type == FinanceActionType.APPROVE), None
+        # Use the latest unused token pair for the current finance-review cycle.
+        approve_token_record = (
+            submission.finance_tokens
+            .filter(action_type=FinanceActionType.APPROVE, used_at__isnull=True)
+            .order_by("-created_at", "-id")
+            .first()
         )
-        reject_token_record = next(
-            (t for t in tokens if t.action_type == FinanceActionType.REJECT), None
+        reject_token_record = (
+            submission.finance_tokens
+            .filter(action_type=FinanceActionType.REJECT, used_at__isnull=True)
+            .order_by("-created_at", "-id")
+            .first()
         )
 
         if not approve_token_record:
@@ -383,21 +388,89 @@ def notify_vendor_approved(submission: "VendorOnboardingSubmission", vendor: "Ve
 
         # ── Vendor email ──────────────────────────────────────────────────
         subject = "VIMS — Vendor Onboarding Approved"
-        body = (
-            f"Dear Vendor,\n\n"
-            f"Your vendor registration on VIMS has been reviewed and approved by our finance team.\n\n"
-            f"Vendor Name : {vendor_name}\n"
-            f"SAP Vendor ID: {vendor.sap_vendor_id or 'Pending assignment'}\n\n"
-            f"The next step is marketing review. You will be notified once that is complete.\n\n"
-            f"If you have questions, please contact your representative.\n\n"
-            f"Regards,\nThe VIMS Team"
-        )
+
+        html_body = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:'Segoe UI',Arial,sans-serif;">
+
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:40px 16px;">
+    <tr><td align="center">
+
+      <table width="560" cellpadding="0" cellspacing="0"
+             style="background:#ffffff;border-radius:14px;box-shadow:0 4px 16px rgba(0,0,0,.10);overflow:hidden;">
+
+        <tr>
+          <td style="background:linear-gradient(135deg,#ecfdf5 0%,#d1fae5 50%,#ecfdf5 100%);
+                     border-bottom:2px solid #6ee7b7;padding:28px 40px;">
+            <p style="margin:0;font-size:10px;font-weight:700;letter-spacing:2px;color:#065f46;text-transform:uppercase;">
+              VIMS &mdash; Vendor Invoice Management System
+            </p>
+            <h1 style="margin:8px 0 0;font-size:22px;font-weight:700;color:#064e3b;line-height:1.3;">
+              ✓ Vendor Onboarding Approved
+            </h1>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="padding:32px 40px;">
+            <p style="margin:0 0 24px;font-size:14px;color:#374151;line-height:1.7;">
+              Dear Vendor,<br><br>
+              Congratulations! Your vendor registration on VIMS has been reviewed and approved by our finance team.
+            </p>
+
+            <table cellpadding="0" cellspacing="0" width="100%"
+                   style="background:#ecfdf5;border:1px solid #6ee7b7;border-radius:8px;margin-bottom:28px;">
+              <tr>
+                <td style="padding:16px 20px;">
+                  <table cellpadding="0" cellspacing="0">
+                    <tr>
+                      <td style="padding:4px 12px 4px 0;color:#065f46;font-size:13px;white-space:nowrap;">Vendor Name</td>
+                      <td style="padding:4px 0;font-size:13px;font-weight:600;color:#064e3b;">{vendor_name}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:4px 12px 4px 0;color:#065f46;font-size:13px;white-space:nowrap;">SAP Vendor ID</td>
+                      <td style="padding:4px 0;font-size:13px;color:#064e3b;">{vendor.sap_vendor_id or 'Pending assignment'}</td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+            </table>
+
+            <p style="margin:0 0 20px;font-size:14px;color:#374151;line-height:1.7;">
+              <strong>Next Steps:</strong><br>
+              The next step is marketing review. You will be notified once that process is complete.
+            </p>
+
+            <p style="margin:0;font-size:13px;color:#6b7280;line-height:1.6;">
+              If you have any questions, please contact your representative.
+            </p>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 40px;">
+            <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
+              VIMS &middot; Vendor Invoice Management System &middot; Do not reply to this email
+            </p>
+          </td>
+        </tr>
+
+      </table>
+
+    </td></tr>
+  </table>
+
+</body>
+</html>"""
+
         email = EmailMessage(
             subject=subject,
-            body=body,
+            body=html_body,
             from_email=settings.DEFAULT_FROM_EMAIL,
             to=[vendor_email],
         )
+        email.content_subtype = "html"
         email.send(fail_silently=False)
         _logger.info("Vendor approval email sent for submission_id=%s to %s", submission.pk, vendor_email)
 
@@ -464,26 +537,112 @@ def notify_vendor_rejected(submission: "VendorOnboardingSubmission", note: str =
 
         # ── Vendor email ──────────────────────────────────────────────────
         subject = "VIMS — Vendor Onboarding Requires Attention"
-        note_line = f"\nNote from finance team: {note}" if note else ""
-        body = (
-            f"Dear Vendor,\n\n"
-            f"Your vendor registration submission on VIMS requires attention.\n\n"
-            f"Vendor Name: {vendor_name}\n"
-            f"Submission : #{submission.pk}\n"
-            f"{note_line}\n\n"
-            f"Your registration has not been approved at this time. "
-            f"Please review the feedback above and resubmit if appropriate.\n\n"
-            f"To resubmit, log in to VIMS using your original onboarding link "
-            f"and update your registration details.\n\n"
-            f"If you believe this is in error, please contact your representative.\n\n"
-            f"Regards,\nThe VIMS Team"
-        )
+
+        note_section = ""
+        if note:
+            note_section = f"""
+            <table cellpadding="0" cellspacing="0" width="100%"
+                   style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;margin-bottom:24px;">
+              <tr>
+                <td style="padding:16px 20px;">
+                  <p style="margin:0 0 6px;font-size:12px;font-weight:700;color:#991b1b;text-transform:uppercase;letter-spacing:0.5px;">
+                    Finance Team Feedback
+                  </p>
+                  <p style="margin:0;font-size:13px;color:#7f1d1d;line-height:1.6;">
+                    {note}
+                  </p>
+                </td>
+              </tr>
+            </table>"""
+
+        html_body = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:'Segoe UI',Arial,sans-serif;">
+
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:40px 16px;">
+    <tr><td align="center">
+
+      <table width="560" cellpadding="0" cellspacing="0"
+             style="background:#ffffff;border-radius:14px;box-shadow:0 4px 16px rgba(0,0,0,.10);overflow:hidden;">
+
+        <tr>
+          <td style="background:linear-gradient(135deg,#fef2f2 0%,#fee2e2 50%,#fef2f2 100%);
+                     border-bottom:2px solid #fecaca;padding:28px 40px;">
+            <p style="margin:0;font-size:10px;font-weight:700;letter-spacing:2px;color:#991b1b;text-transform:uppercase;">
+              VIMS &mdash; Vendor Invoice Management System
+            </p>
+            <h1 style="margin:8px 0 0;font-size:22px;font-weight:700;color:#7f1d1d;line-height:1.3;">
+              Vendor Onboarding Requires Attention
+            </h1>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="padding:32px 40px;">
+            <p style="margin:0 0 24px;font-size:14px;color:#374151;line-height:1.7;">
+              Dear Vendor,<br><br>
+              Your vendor registration submission on VIMS requires attention from your side.
+            </p>
+
+            <table cellpadding="0" cellspacing="0" width="100%"
+                   style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;margin-bottom:24px;">
+              <tr>
+                <td style="padding:16px 20px;">
+                  <table cellpadding="0" cellspacing="0">
+                    <tr>
+                      <td style="padding:4px 12px 4px 0;color:#6b7280;font-size:13px;white-space:nowrap;">Vendor Name</td>
+                      <td style="padding:4px 0;font-size:13px;font-weight:600;color:#111827;">{vendor_name}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:4px 12px 4px 0;color:#6b7280;font-size:13px;white-space:nowrap;">Submission</td>
+                      <td style="padding:4px 0;font-size:13px;color:#111827;">#{submission.pk}</td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+            </table>
+
+            {note_section}
+
+            <p style="margin:0 0 20px;font-size:14px;color:#374151;line-height:1.7;">
+              Your registration has not been approved at this time. Please review the feedback above
+              and resubmit if appropriate.
+            </p>
+
+            <p style="margin:0 0 20px;font-size:14px;color:#374151;line-height:1.7;">
+              To resubmit, use your original onboarding link to update your registration details.
+            </p>
+
+            <p style="margin:0;font-size:13px;color:#6b7280;line-height:1.6;">
+              If you believe this is in error, please contact your representative.
+            </p>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 40px;">
+            <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
+              VIMS &middot; Vendor Invoice Management System &middot; Do not reply to this email
+            </p>
+          </td>
+        </tr>
+
+      </table>
+
+    </td></tr>
+  </table>
+
+</body>
+</html>"""
+
         email = EmailMessage(
             subject=subject,
-            body=body,
+            body=html_body,
             from_email=settings.DEFAULT_FROM_EMAIL,
             to=[vendor_email],
         )
+        email.content_subtype = "html"
         email.send(fail_silently=False)
         _logger.info("Vendor rejection email sent for submission_id=%s to %s", submission.pk, vendor_email)
 
@@ -546,25 +705,122 @@ def notify_vendor_reopened(submission: "VendorOnboardingSubmission", note: str =
         onboarding_url = f"{portal_base}/vendor/onboarding/{invitation.token}"
 
         subject = "VIMS — Vendor Onboarding Reopened for Correction"
-        note_line = f"\nFinance note: {note}" if note else ""
-        body = (
-            f"Dear Vendor,\n\n"
-            f"Your vendor onboarding submission has been reopened for correction.\n\n"
-            f"Vendor Name: {vendor_name}\n"
-            f"Submission : #{submission.pk}\n"
-            f"{note_line}\n\n"
-            f"Please open the link below to review the previously submitted details, "
-            f"make the required corrections, and submit again:\n\n"
-            f"{onboarding_url}\n\n"
-            f"Your earlier data will remain available in the form for editing.\n\n"
-            f"Regards,\nThe VIMS Team"
-        )
+
+        note_section = ""
+        if note:
+            note_section = f"""
+            <table cellpadding="0" cellspacing="0" width="100%"
+                   style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;margin-bottom:24px;">
+              <tr>
+                <td style="padding:16px 20px;">
+                  <p style="margin:0 0 6px;font-size:12px;font-weight:700;color:#78350f;text-transform:uppercase;letter-spacing:0.5px;">
+                    Finance Team Note
+                  </p>
+                  <p style="margin:0;font-size:13px;color:#78350f;line-height:1.6;">
+                    {note}
+                  </p>
+                </td>
+              </tr>
+            </table>"""
+
+        html_body = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:'Segoe UI',Arial,sans-serif;">
+
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:40px 16px;">
+    <tr><td align="center">
+
+      <table width="560" cellpadding="0" cellspacing="0"
+             style="background:#ffffff;border-radius:14px;box-shadow:0 4px 16px rgba(0,0,0,.10);overflow:hidden;">
+
+        <tr>
+          <td style="background:linear-gradient(135deg,#fffbeb 0%,#fef3c7 50%,#fffbeb 100%);
+                     border-bottom:2px solid #fde68a;padding:28px 40px;">
+            <p style="margin:0;font-size:10px;font-weight:700;letter-spacing:2px;color:#78350f;text-transform:uppercase;">
+              VIMS &mdash; Vendor Invoice Management System
+            </p>
+            <h1 style="margin:8px 0 0;font-size:22px;font-weight:700;color:#78350f;line-height:1.3;">
+              Onboarding Reopened for Correction
+            </h1>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="padding:32px 40px;">
+            <p style="margin:0 0 24px;font-size:14px;color:#374151;line-height:1.7;">
+              Dear Vendor,<br><br>
+              Your vendor onboarding submission has been reopened for correction. You can now edit
+              and resubmit your registration.
+            </p>
+
+            <table cellpadding="0" cellspacing="0" width="100%"
+                   style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;margin-bottom:24px;">
+              <tr>
+                <td style="padding:16px 20px;">
+                  <table cellpadding="0" cellspacing="0">
+                    <tr>
+                      <td style="padding:4px 12px 4px 0;color:#6b7280;font-size:13px;white-space:nowrap;">Vendor Name</td>
+                      <td style="padding:4px 0;font-size:13px;font-weight:600;color:#111827;">{vendor_name}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:4px 12px 4px 0;color:#6b7280;font-size:13px;white-space:nowrap;">Submission</td>
+                      <td style="padding:4px 0;font-size:13px;color:#111827;">#{submission.pk}</td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+            </table>
+
+            {note_section}
+
+            <p style="margin:0 0 28px;font-size:14px;color:#374151;line-height:1.7;">
+              Click the button below to review your previously submitted details, make the required
+              corrections, and submit again:
+            </p>
+
+            <table cellpadding="0" cellspacing="0" width="100%">
+              <tr>
+                <td align="center">
+                  <a href="{onboarding_url}"
+                     style="display:inline-block;padding:15px 40px;background:#ea580c;color:#ffffff;
+                            font-size:16px;font-weight:700;text-align:center;text-decoration:none;
+                            border-radius:10px;letter-spacing:0.3px;box-shadow:0 2px 8px rgba(234,88,12,.35);">
+                    Resume Onboarding
+                  </a>
+                </td>
+              </tr>
+            </table>
+
+            <p style="margin:24px 0 0;font-size:13px;color:#6b7280;text-align:center;line-height:1.6;">
+              Your earlier data will remain available in the form for editing.
+            </p>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 40px;">
+            <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
+              VIMS &middot; Vendor Invoice Management System &middot; Do not reply to this email
+            </p>
+          </td>
+        </tr>
+
+      </table>
+
+    </td></tr>
+  </table>
+
+</body>
+</html>"""
+
         email = EmailMessage(
             subject=subject,
-            body=body,
+            body=html_body,
             from_email=settings.DEFAULT_FROM_EMAIL,
             to=[vendor_email],
         )
+        email.content_subtype = "html"
         email.send(fail_silently=False)
         _logger.info(
             "Vendor reopen email sent for submission_id=%s to %s",

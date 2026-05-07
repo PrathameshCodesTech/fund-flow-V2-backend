@@ -20,29 +20,98 @@ def send_vendor_invitation_email(
 ) -> None:
     subject = f"You've been invited to {_BRAND_NAME} — Vendor Onboarding"
 
-    if vendor_name_hint:
-        greeting = f"Hello {vendor_name_hint},"
-    else:
-        greeting = "Hello,"
+    greeting = f"Dear {vendor_name_hint}," if vendor_name_hint else "Hello,"
 
-    body = (
-        f"{greeting}\n\n"
-        f"You have been invited to complete your vendor onboarding via {_BRAND_NAME} ({_BRAND_FULL}).\n\n"
-        f"To get started, click the link below:\n\n"
-        f"  {onboarding_url}\n\n"
-        f"This onboarding link is personal and should not be shared.\n"
-        f"Please complete your registration at your earliest convenience.\n\n"
-        f"If you have questions, please contact your {invited_by_name} representative.\n\n"
-        f"Regards,\n"
-        f"The {_BRAND_NAME} Team"
-    )
+    html_body = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:'Segoe UI',Arial,sans-serif;">
+
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:40px 16px;">
+    <tr><td align="center">
+
+      <!-- Card -->
+      <table width="560" cellpadding="0" cellspacing="0"
+             style="background:#ffffff;border-radius:14px;box-shadow:0 4px 16px rgba(0,0,0,.10);overflow:hidden;">
+
+        <!-- Header -->
+        <tr>
+          <td style="background:linear-gradient(135deg,#fff7ed 0%,#fffbeb 50%,#fff7ed 100%);
+                     border-bottom:2px solid #fed7aa;padding:28px 40px;">
+            <p style="margin:0;font-size:10px;font-weight:700;letter-spacing:2px;color:#c2410c;text-transform:uppercase;">
+              {_BRAND_NAME} &mdash; {_BRAND_FULL}
+            </p>
+            <h1 style="margin:8px 0 0;font-size:22px;font-weight:700;color:#7c2d12;line-height:1.3;">
+              You're Invited to Join {_BRAND_NAME}
+            </h1>
+          </td>
+        </tr>
+
+        <!-- Body -->
+        <tr>
+          <td style="padding:32px 40px;">
+
+            <p style="margin:0 0 24px;font-size:14px;color:#374151;line-height:1.7;">
+              {greeting}<br><br>
+              You have been invited to complete your vendor registration on {_BRAND_NAME}
+              ({_BRAND_FULL}). This platform streamlines invoice management and vendor collaboration.
+            </p>
+
+            <p style="margin:0 0 28px;font-size:14px;color:#374151;line-height:1.7;">
+              Click the button below to begin your onboarding process:
+            </p>
+
+            <!-- CTA Button -->
+            <table cellpadding="0" cellspacing="0" width="100%">
+              <tr>
+                <td align="center">
+                  <a href="{onboarding_url}"
+                     style="display:inline-block;padding:15px 40px;background:#ea580c;color:#ffffff;
+                            font-size:16px;font-weight:700;text-align:center;text-decoration:none;
+                            border-radius:10px;letter-spacing:0.3px;box-shadow:0 2px 8px rgba(234,88,12,.35);">
+                    Start Onboarding
+                  </a>
+                </td>
+              </tr>
+            </table>
+
+            <p style="margin:28px 0 0;font-size:13px;color:#6b7280;line-height:1.6;">
+              <strong>Important:</strong> This onboarding link is personal and should not be shared.
+              Please complete your registration at your earliest convenience.
+            </p>
+
+            <p style="margin:20px 0 0;font-size:13px;color:#6b7280;line-height:1.6;">
+              If you have questions, please contact your {invited_by_name} representative.
+            </p>
+
+          </td>
+        </tr>
+
+        <!-- Footer -->
+        <tr>
+          <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 40px;">
+            <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
+              {_BRAND_NAME} &middot; Vendor Self-Service Portal &middot; Do not reply to this email
+            </p>
+          </td>
+        </tr>
+
+      </table>
+      <!-- /Card -->
+
+    </td></tr>
+  </table>
+
+</body>
+</html>"""
 
     email = EmailMessage(
         subject=subject,
-        body=body,
+        body=html_body,
         from_email=settings.DEFAULT_FROM_EMAIL,
         to=[vendor_email],
     )
+    email.content_subtype = "html"
     email.send(fail_silently=False)
 
 

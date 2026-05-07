@@ -32,7 +32,7 @@ def _get_invoice_internal_url(invoice_id: int) -> str:
     return f"{_get_base_url()}/invoices/{invoice_id}"
 
 
-def _send_email_safe(to: list[str], subject: str, body: str) -> bool:
+def _send_email_safe(to: list[str], subject: str, body: str, is_html: bool = True) -> bool:
     """Send email; log failure, never raise."""
     if not to:
         return True
@@ -43,6 +43,8 @@ def _send_email_safe(to: list[str], subject: str, body: str) -> bool:
             from_email=settings.DEFAULT_FROM_EMAIL,
             to=to,
         )
+        if is_html:
+            email.content_subtype = "html"
         email.send(fail_silently=False)
         _logger.info("Invoice finance notification sent to %s: %s", to, subject)
         return True
@@ -60,17 +62,98 @@ def _build_approval_email(
     internal_url: str,
 ) -> tuple[str, str]:
     subject = f"[VIMS] Invoice Approved by Finance — {invoice_title}"
-    body = (
-        f"Invoice Finance Review — Approved\n"
-        f"================================\n\n"
-        f"Invoice  : {invoice_title}\n"
-        f"Amount   : {currency} {invoice_amount}\n"
-        f"Ref. ID  : {reference_id}\n"
-        f"Decision : Finance Approved\n\n"
-        f"View invoice: {internal_url}\n\n"
-        f"This is an automated notification from VIMS.\n"
-    )
-    return subject, body
+
+    html_body = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:'Segoe UI',Arial,sans-serif;">
+
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:40px 16px;">
+    <tr><td align="center">
+
+      <table width="560" cellpadding="0" cellspacing="0"
+             style="background:#ffffff;border-radius:14px;box-shadow:0 4px 16px rgba(0,0,0,.10);overflow:hidden;">
+
+        <tr>
+          <td style="background:linear-gradient(135deg,#ecfdf5 0%,#d1fae5 50%,#ecfdf5 100%);
+                     border-bottom:2px solid #6ee7b7;padding:28px 40px;">
+            <p style="margin:0;font-size:10px;font-weight:700;letter-spacing:2px;color:#065f46;text-transform:uppercase;">
+              VIMS &mdash; Vendor Invoice Management System
+            </p>
+            <h1 style="margin:8px 0 0;font-size:22px;font-weight:700;color:#064e3b;line-height:1.3;">
+              ✓ Invoice Approved by Finance
+            </h1>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="padding:32px 40px;">
+            <p style="margin:0 0 24px;font-size:14px;color:#374151;line-height:1.7;">
+              Your invoice has been reviewed and approved by the finance team.
+            </p>
+
+            <table cellpadding="0" cellspacing="0" width="100%"
+                   style="background:#ecfdf5;border:1px solid #6ee7b7;border-radius:8px;margin-bottom:28px;">
+              <tr>
+                <td style="padding:16px 20px;">
+                  <table cellpadding="0" cellspacing="0">
+                    <tr>
+                      <td style="padding:4px 12px 4px 0;color:#065f46;font-size:13px;white-space:nowrap;">Invoice</td>
+                      <td style="padding:4px 0;font-size:13px;font-weight:600;color:#064e3b;">{invoice_title}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:4px 12px 4px 0;color:#065f46;font-size:13px;white-space:nowrap;">Amount</td>
+                      <td style="padding:4px 0;font-size:13px;color:#064e3b;">{currency} {invoice_amount}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:4px 12px 4px 0;color:#065f46;font-size:13px;white-space:nowrap;">Reference ID</td>
+                      <td style="padding:4px 0;font-size:13px;color:#064e3b;">{reference_id}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:4px 12px 4px 0;color:#065f46;font-size:13px;white-space:nowrap;">Status</td>
+                      <td style="padding:4px 0;font-size:13px;font-weight:700;color:#059669;">Approved</td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+            </table>
+
+            <table cellpadding="0" cellspacing="0" width="100%">
+              <tr>
+                <td align="center">
+                  <a href="{internal_url}"
+                     style="display:inline-block;padding:14px 32px;background:#ea580c;color:#ffffff;
+                            font-size:15px;font-weight:700;text-align:center;text-decoration:none;
+                            border-radius:10px;letter-spacing:0.3px;box-shadow:0 2px 8px rgba(234,88,12,.35);">
+                    View Invoice Details
+                  </a>
+                </td>
+              </tr>
+            </table>
+
+            <p style="margin:24px 0 0;font-size:13px;color:#6b7280;text-align:center;line-height:1.6;">
+              This is an automated notification from VIMS.
+            </p>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 40px;">
+            <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
+              VIMS &middot; Vendor Invoice Management System &middot; Do not reply to this email
+            </p>
+          </td>
+        </tr>
+
+      </table>
+
+    </td></tr>
+  </table>
+
+</body>
+</html>"""
+
+    return subject, html_body
 
 
 def _build_rejection_email(
@@ -82,17 +165,108 @@ def _build_rejection_email(
     internal_url: str,
 ) -> tuple[str, str]:
     subject = f"[VIMS] Invoice Rejected by Finance — {invoice_title}"
-    body = (
-        f"Invoice Finance Review — Rejected\n"
-        f"=================================\n\n"
-        f"Invoice  : {invoice_title}\n"
-        f"Amount   : {currency} {invoice_amount}\n"
-        f"Decision : Rejected\n"
-        f"Reason   : {rejection_reason}\n\n"
-        f"View invoice: {internal_url}\n\n"
-        f"This is an automated notification from VIMS.\n"
-    )
-    return subject, body
+
+    html_body = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:'Segoe UI',Arial,sans-serif;">
+
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:40px 16px;">
+    <tr><td align="center">
+
+      <table width="560" cellpadding="0" cellspacing="0"
+             style="background:#ffffff;border-radius:14px;box-shadow:0 4px 16px rgba(0,0,0,.10);overflow:hidden;">
+
+        <tr>
+          <td style="background:linear-gradient(135deg,#fef2f2 0%,#fee2e2 50%,#fef2f2 100%);
+                     border-bottom:2px solid #fecaca;padding:28px 40px;">
+            <p style="margin:0;font-size:10px;font-weight:700;letter-spacing:2px;color:#991b1b;text-transform:uppercase;">
+              VIMS &mdash; Vendor Invoice Management System
+            </p>
+            <h1 style="margin:8px 0 0;font-size:22px;font-weight:700;color:#7f1d1d;line-height:1.3;">
+              Invoice Rejected by Finance
+            </h1>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="padding:32px 40px;">
+            <p style="margin:0 0 24px;font-size:14px;color:#374151;line-height:1.7;">
+              Your invoice has been reviewed by the finance team and requires attention.
+            </p>
+
+            <table cellpadding="0" cellspacing="0" width="100%"
+                   style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;margin-bottom:24px;">
+              <tr>
+                <td style="padding:16px 20px;">
+                  <table cellpadding="0" cellspacing="0">
+                    <tr>
+                      <td style="padding:4px 12px 4px 0;color:#6b7280;font-size:13px;white-space:nowrap;">Invoice</td>
+                      <td style="padding:4px 0;font-size:13px;font-weight:600;color:#111827;">{invoice_title}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:4px 12px 4px 0;color:#6b7280;font-size:13px;white-space:nowrap;">Amount</td>
+                      <td style="padding:4px 0;font-size:13px;color:#111827;">{currency} {invoice_amount}</td>
+                    </tr>
+                    <tr>
+                      <td style="padding:4px 12px 4px 0;color:#6b7280;font-size:13px;white-space:nowrap;">Status</td>
+                      <td style="padding:4px 0;font-size:13px;font-weight:700;color:#dc2626;">Rejected</td>
+                    </tr>
+                  </table>
+                </td>
+              </tr>
+            </table>
+
+            <table cellpadding="0" cellspacing="0" width="100%"
+                   style="background:#fef2f2;border:1px solid #fecaca;border-radius:8px;margin-bottom:28px;">
+              <tr>
+                <td style="padding:16px 20px;">
+                  <p style="margin:0 0 6px;font-size:12px;font-weight:700;color:#991b1b;text-transform:uppercase;letter-spacing:0.5px;">
+                    Rejection Reason
+                  </p>
+                  <p style="margin:0;font-size:13px;color:#7f1d1d;line-height:1.6;">
+                    {rejection_reason}
+                  </p>
+                </td>
+              </tr>
+            </table>
+
+            <table cellpadding="0" cellspacing="0" width="100%">
+              <tr>
+                <td align="center">
+                  <a href="{internal_url}"
+                     style="display:inline-block;padding:14px 32px;background:#ea580c;color:#ffffff;
+                            font-size:15px;font-weight:700;text-align:center;text-decoration:none;
+                            border-radius:10px;letter-spacing:0.3px;box-shadow:0 2px 8px rgba(234,88,12,.35);">
+                    View Invoice Details
+                  </a>
+                </td>
+              </tr>
+            </table>
+
+            <p style="margin:24px 0 0;font-size:13px;color:#6b7280;text-align:center;line-height:1.6;">
+              This is an automated notification from VIMS.
+            </p>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 40px;">
+            <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
+              VIMS &middot; Vendor Invoice Management System &middot; Do not reply to this email
+            </p>
+          </td>
+        </tr>
+
+      </table>
+
+    </td></tr>
+  </table>
+
+</body>
+</html>"""
+
+    return subject, html_body
 
 
 def notify_invoice_finance_approval(

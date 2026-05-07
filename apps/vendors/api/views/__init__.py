@@ -10,6 +10,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.vendors.models import (
+    SubmissionStatus,
     Vendor,
     VendorAttachment,
     VendorFinanceActionToken,
@@ -539,6 +540,24 @@ class PublicFinanceActionView(APIView):
             ).get(token=token)
         except VendorFinanceActionToken.DoesNotExist:
             return Response({"detail": "Token not found."}, status=status.HTTP_404_NOT_FOUND)
+        if action_token.is_used():
+            return Response(
+                {"detail": "This finance review has already been completed."},
+                status=status.HTTP_410_GONE,
+            )
+        if action_token.is_expired():
+            return Response(
+                {"detail": "This finance review link has expired."},
+                status=status.HTTP_410_GONE,
+            )
+        if action_token.submission.status not in (
+            SubmissionStatus.SENT_TO_FINANCE,
+            SubmissionStatus.REOPENED,
+        ):
+            return Response(
+                {"detail": "This finance review has already been completed."},
+                status=status.HTTP_410_GONE,
+            )
         return Response(PublicFinanceTokenSerializer(action_token).data)
 
 
@@ -602,6 +621,8 @@ def _resolve_finance_token_for_download(token_str: str):
         raise Http404("Finance token not found.")
     if token.is_expired():
         raise Http404("Finance token has expired.")
+    if token.is_used():
+        raise Http404("Finance token has already been used.")
     return token
 
 

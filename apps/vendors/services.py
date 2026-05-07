@@ -63,6 +63,12 @@ class POMandate(ValueError):
     """Vendor requires a PO number but none was supplied."""
 
 
+_EDITABLE_SUBMISSION_STATUSES = {
+    SubmissionStatus.DRAFT,
+    SubmissionStatus.REOPENED,
+}
+
+
 # ---------------------------------------------------------------------------
 # VRF field mappings (label → normalized field name)
 # ---------------------------------------------------------------------------
@@ -537,6 +543,28 @@ def _build_vendor_defaults_from_submission(submission: VendorOnboardingSubmissio
     return defaults
 
 
+def _get_editable_submission_for_invitation(
+    invitation: VendorInvitation,
+) -> VendorOnboardingSubmission | None:
+    """
+    Return the latest editable submission for an invitation.
+
+    If the latest submission is already beyond the editable phase, block any
+    attempt to create a fresh submission until finance explicitly reopens it.
+    """
+    latest = invitation.submissions.order_by("-created_at", "-id").first()
+    if latest is None:
+        return None
+
+    if latest.status in _EDITABLE_SUBMISSION_STATUSES:
+        return latest
+
+    raise SubmissionStateError(
+        "This submission has already been sent for review. "
+        "You can edit it again only after it is reopened."
+    )
+
+
 # ---------------------------------------------------------------------------
 # 1. create_vendor_invitation
 # ---------------------------------------------------------------------------
@@ -670,16 +698,11 @@ def create_or_update_submission_from_manual(
         SubmissionStateError if invitation's active submission is past submitted state.
     """
     # Get existing draft/reopened submission or create new
-    existing_qs = invitation.submissions.filter(
-        status__in=[SubmissionStatus.DRAFT, SubmissionStatus.REOPENED]
-    )
-    submission = existing_qs.first()
-
+    submission = _get_editable_submission_for_invitation(invitation)
     if submission is None:
         submission = VendorOnboardingSubmission(invitation=invitation)
 
-    # Validate state
-    if submission.pk and submission.status not in (
+    if False and submission.pk and submission.status not in (
         SubmissionStatus.DRAFT, SubmissionStatus.REOPENED
     ):
         raise SubmissionStateError(
@@ -807,15 +830,11 @@ def create_or_update_submission_from_excel(
 
     normalized, _, contact_persons_json, head_office_json, tax_registration_json = _extract_normalized_from_payload(extracted)
 
-    existing_qs = invitation.submissions.filter(
-        status__in=[SubmissionStatus.DRAFT, SubmissionStatus.REOPENED]
-    )
-    submission = existing_qs.first()
-
+    submission = _get_editable_submission_for_invitation(invitation)
     if submission is None:
         submission = VendorOnboardingSubmission(invitation=invitation)
 
-    if submission.pk and submission.status not in (
+    if False and submission.pk and submission.status not in (
         SubmissionStatus.DRAFT, SubmissionStatus.REOPENED
     ):
         raise SubmissionStateError(
@@ -1225,9 +1244,7 @@ def finance_approve_submission(
 
     now = timezone.now()
 
-    # Mark token used
-    token.used_at = now
-    token.save(update_fields=["used_at"])
+    _consume_submission_finance_tokens(submission, now)
 
     # Create finance decision
     VendorFinanceDecision.objects.create(
@@ -1298,8 +1315,7 @@ def finance_reject_submission(
         )
 
     now = timezone.now()
-    token.used_at = now
-    token.save(update_fields=["used_at"])
+    _consume_submission_finance_tokens(submission, now)
 
     VendorFinanceDecision.objects.create(
         submission=submission,
@@ -1683,6 +1699,14 @@ def _get_valid_finance_token(
         raise FinanceTokenError("This token has expired.")
 
     return token
+
+
+def _consume_submission_finance_tokens(
+    submission: VendorOnboardingSubmission,
+    used_at,
+) -> None:
+    """Mark all still-open finance action tokens for this submission as used."""
+    submission.finance_tokens.filter(used_at__isnull=True).update(used_at=used_at)
 
 
 # ---------------------------------------------------------------------------

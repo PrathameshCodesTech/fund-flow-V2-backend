@@ -100,6 +100,7 @@ class InvoiceCreateSerializer(serializers.Serializer):
 
 class VendorInvoiceSubmissionSerializer(serializers.ModelSerializer):
     confidence_percent = serializers.SerializerMethodField()
+    extraction_method = serializers.SerializerMethodField()
     final_invoice_id = serializers.CharField(read_only=True)
     vendor_name = serializers.CharField(source="vendor.vendor_name", read_only=True)
     scope_node_name = serializers.CharField(source="scope_node.name", read_only=True)
@@ -120,6 +121,7 @@ class VendorInvoiceSubmissionSerializer(serializers.ModelSerializer):
             "status",
             "source_file_name", "source_file_type",
             "confidence_score", "confidence_percent",
+            "extraction_method",
             "normalized_data", "validation_errors",
             "correction_note", "correction_requested_by", "correction_requested_by_name",
             "correction_requested_at",
@@ -142,6 +144,11 @@ class VendorInvoiceSubmissionSerializer(serializers.ModelSerializer):
         if obj.confidence_score is None:
             return None
         return round(float(obj.confidence_score) * 100, 1)
+
+    def get_extraction_method(self, obj):
+        raw = obj.raw_extracted_data or {}
+        method = raw.get("extraction_method")
+        return method if method else None
 
     def get_documents(self, obj):
         docs = obj.documents.all()

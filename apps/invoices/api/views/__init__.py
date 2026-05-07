@@ -728,6 +728,7 @@ from apps.invoices.services import (
     update_invoice_submission_fields,
     submit_vendor_invoice_submission,
     submit_vendor_invoice_with_route,
+    discard_vendor_invoice_submission,
     SubmissionStateError,
     SubmissionValidationError,
     VendorRouteError,
@@ -1005,6 +1006,29 @@ class VendorInvoiceSubmissionViewSet(ViewSet):
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
         return Response(VendorInvoiceSubmissionSerializer(submission).data)
+
+    @transaction.atomic
+    @action(detail=True, methods=["post"], url_path="discard")
+    def discard_submission(self, request, pk=None):
+        """
+        POST /api/v1/vendor-invoice-submissions/{id}/discard/
+        Permanently remove an unfinished submission owned by the vendor.
+        """
+        submission = get_object_or_404(
+            VendorInvoiceSubmission.objects.select_related("vendor", "scope_node").prefetch_related("documents"),
+            pk=pk,
+        )
+        assignment = self._get_vendor_assignment()
+        if assignment and submission.vendor_id != assignment.vendor_id:
+            from django.http import Http404
+            raise Http404("Submission not found.")
+
+        try:
+            discard_vendor_invoice_submission(submission)
+        except SubmissionStateError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=["post"], url_path="documents")
     def add_document(self, request, pk=None):

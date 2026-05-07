@@ -616,7 +616,11 @@ class PublicFinanceTokenSerializer(serializers.ModelSerializer):
         if obj.action_type == FinanceActionType.APPROVE:
             return (
                 obj.submission.finance_tokens
-                .filter(action_type=FinanceActionType.REJECT)
+                .filter(
+                    action_type=FinanceActionType.REJECT,
+                    used_at__isnull=True,
+                )
+                .order_by("-created_at", "-id")
                 .values_list("token", flat=True)
                 .first()
             )
