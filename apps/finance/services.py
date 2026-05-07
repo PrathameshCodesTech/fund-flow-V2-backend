@@ -692,6 +692,22 @@ def finance_reject_handoff(
     # Sync subject status
     sync_subject_on_finance_change(handoff)
 
+    # Re-open the internal workflow at the originating owner so they can decide
+    # whether to fix internally or return the invoice to the vendor.
+    if handoff.module == "invoice":
+        try:
+            from apps.workflow.services import return_invoice_workflow_for_finance_rework
+            return_invoice_workflow_for_finance_rework(
+                invoice_id=handoff.subject_id,
+                acted_by=None,
+                note=note,
+            )
+        except Exception as exc:
+            _logger.warning(
+                "Failed to reopen invoice workflow for finance rework. handoff=%s invoice=%s error=%s",
+                handoff.pk, handoff.subject_id, exc,
+            )
+
     # Send notifications (non-fatal)
     _notify_finance_decision(handoff, decision)
 

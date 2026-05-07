@@ -611,7 +611,17 @@ def submit_runtime_invoice_split(instance_step: WorkflowInstanceStep, actor, all
 
     # --- Cancel existing active allocations (correction mode) ---
     now = timezone.now()
-    existing_allocs = list(InvoiceAllocation.objects.filter(split_step=instance_step))
+    existing_allocs = list(
+        InvoiceAllocation.objects.filter(
+            split_step=instance_step,
+            status__in=(
+                InvoiceAllocationStatus.SUBMITTED,
+                InvoiceAllocationStatus.BRANCH_PENDING,
+                InvoiceAllocationStatus.APPROVED,
+                InvoiceAllocationStatus.CORRECTION_REQUIRED,
+            ),
+        )
+    )
     for old in existing_allocs:
         # Release reserved budget if any (includes APPROVED — budget stays RESERVED until invoice final approval)
         if old.budget_id and old.status in (
@@ -1051,9 +1061,11 @@ def _release_allocation_budget(allocation, actor):
 def _snapshot_allocation(allocation, actor, reason: str):
     """Save current allocation state as a revision before overwriting."""
     from apps.invoices.models import InvoiceAllocationRevision
+    latest_revision = allocation.revisions.order_by("-revision_number").values_list("revision_number", flat=True).first()
+    next_revision_number = (latest_revision or 0) + 1
     InvoiceAllocationRevision.objects.create(
         allocation=allocation,
-        revision_number=allocation.revision_number,
+        revision_number=next_revision_number,
         snapshot={
             "entity_id": allocation.entity_id,
             "category_id": allocation.category_id,

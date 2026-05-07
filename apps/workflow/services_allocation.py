@@ -646,9 +646,11 @@ def _release_allocation_budget(allocation, actor, instance):
 def _snapshot_allocation(allocation, actor, reason: str):
     """Save current allocation state as a revision before overwriting."""
     from apps.invoices.models import InvoiceAllocationRevision
+    latest_revision = allocation.revisions.order_by("-revision_number").values_list("revision_number", flat=True).first()
+    next_revision_number = (latest_revision or 0) + 1
     InvoiceAllocationRevision.objects.create(
         allocation=allocation,
-        revision_number=allocation.revision_number,
+        revision_number=next_revision_number,
         snapshot={
             "entity_id": allocation.entity_id,
             "category_id": allocation.category_id,

@@ -358,28 +358,63 @@ def notify_invoice_finance_rejection(
 
     recipients: list[str] = []
 
-    # Vendor email
-    if vendor_email:
-        recipients.append(vendor_email)
-
-    # Invoice submitter / created_by
+    # Invoice submitter / created_by (internal only; skip vendor portal users)
     submitter = getattr(invoice, "created_by", None)
     if submitter and getattr(submitter, "email", None):
+        is_vendor_user = False
+        try:
+            is_vendor_user = submitter.vendor_assignments.filter(is_active=True).exists()
+        except Exception:
+            is_vendor_user = False
         email = submitter.email.strip()
-        if email and email not in recipients:
+        if email and not is_vendor_user and email not in recipients:
             recipients.append(email)
 
-    # Workflow instance started_by
+    # Workflow instance started_by / participants (internal only)
     try:
-        from apps.workflow.models import WorkflowInstance
+        from apps.workflow.models import WorkflowInstance, WorkflowEvent
         instance = WorkflowInstance.objects.filter(
             subject_type="invoice",
             subject_id=invoice.id,
         ).first()
-        if instance and instance.started_by and getattr(instance.started_by, "email", None):
-            email = instance.started_by.email.strip()
-            if email and email not in recipients:
-                recipients.append(email)
+        if instance:
+            if instance.started_by and getattr(instance.started_by, "email", None):
+                started_by_is_vendor = False
+                try:
+                    started_by_is_vendor = instance.started_by.vendor_assignments.filter(is_active=True).exists()
+                except Exception:
+                    started_by_is_vendor = False
+                email = instance.started_by.email.strip()
+                if email and not started_by_is_vendor and email not in recipients:
+                    recipients.append(email)
+            for step in (
+                instance.instance_groups.filter(status="in_progress")
+                .prefetch_related("instance_steps__assigned_user")
+            ):
+                for instance_step in step.instance_steps.all():
+                    assignee = instance_step.assigned_user
+                    if not assignee or not getattr(assignee, "email", None):
+                        continue
+                    assignee_is_vendor = False
+                    try:
+                        assignee_is_vendor = assignee.vendor_assignments.filter(is_active=True).exists()
+                    except Exception:
+                        assignee_is_vendor = False
+                    email = assignee.email.strip()
+                    if email and not assignee_is_vendor and email not in recipients:
+                        recipients.append(email)
+            for event in WorkflowEvent.objects.filter(instance=instance).select_related("actor_user"):
+                actor = event.actor_user
+                if not actor or not getattr(actor, "email", None):
+                    continue
+                actor_is_vendor = False
+                try:
+                    actor_is_vendor = actor.vendor_assignments.filter(is_active=True).exists()
+                except Exception:
+                    actor_is_vendor = False
+                email = actor.email.strip()
+                if email and not actor_is_vendor and email not in recipients and len(recipients) < 10:
+                    recipients.append(email)
     except Exception as exc:
         _logger.warning("Failed to resolve workflow started_by for invoice %s: %s", invoice.id, exc)
 

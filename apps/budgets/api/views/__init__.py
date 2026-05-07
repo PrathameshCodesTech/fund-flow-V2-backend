@@ -365,7 +365,10 @@ class BudgetViewSet(ModelViewSet):
                             "subcategory does not belong to selected category."
                         )
                     # Guard line allocated decrease
-                    if "allocated_amount" in line_data:
+                    if (
+                        "allocated_amount" in line_data
+                        and line_data["allocated_amount"] != line.allocated_amount
+                    ):
                         ok, reason = can_decrease_budget_line_allocated(line, line_data["allocated_amount"])
                         if not ok:
                             raise ValidationError(f"Line {line_id}: {reason}")

@@ -26,6 +26,8 @@ from apps.workflow.services import (
     apply_step_assignment_overrides,
     approve_workflow_step,
     reject_workflow_step,
+    return_workflow_step_to_vendor,
+    can_return_invoice_step_to_vendor,
     reassign_workflow_step,
     approve_workflow_branch,
     reject_workflow_branch,
@@ -445,6 +447,19 @@ class WorkflowInstanceStepViewSet(ModelViewSet):
         note = request.data.get("note", "")
         try:
             instance_step = reject_workflow_step(instance_step, acted_by=request.user, note=note)
+        except StepActionError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_403_FORBIDDEN)
+        except ValueError as e:
+            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(WorkflowInstanceStepSerializer(instance_step).data)
+
+    @action(detail=True, methods=["post"], url_path="return-to-vendor")
+    def return_to_vendor(self, request, pk=None):
+        """POST /instance-steps/{id}/return-to-vendor/ — explicit internal action for vendor correction."""
+        instance_step = self.get_object()
+        note = request.data.get("note", "")
+        try:
+            instance_step = return_workflow_step_to_vendor(instance_step, acted_by=request.user, note=note)
         except StepActionError as e:
             return Response({"detail": str(e)}, status=status.HTTP_403_FORBIDDEN)
         except ValueError as e:
@@ -1198,6 +1213,7 @@ class TaskReviewView(APIView):
             "step_kind": ist.workflow_step.step_kind,
             "group_name": ist.instance_group.step_group.name,
             "status": ist.status,
+            "can_return_to_vendor": can_return_invoice_step_to_vendor(ist),
             "assigned_user": self._user_dict(ist.assigned_user),
             "reassigned_from_user": self._user_dict(ist.reassigned_from_user),
             "reassigned_by": self._user_dict(ist.reassigned_by),

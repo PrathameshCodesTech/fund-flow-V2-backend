@@ -676,11 +676,22 @@ def _return_vendor_submission_for_correction(instance, acted_by, note="") -> boo
     except Exception:
         return False
 
-    first_group = (
-        instance.instance_groups.order_by("step_group__display_order").first()
-    )
-    if not first_group or instance.current_group_id != first_group.id:
-        return False
+    finance_rework_cycle = False
+    try:
+        from apps.finance.models import FinanceHandoff, FinanceHandoffStatus
+        finance_rework_cycle = FinanceHandoff.objects.filter(
+            module="invoice",
+            subject_type="invoice",
+            subject_id=instance.subject_id,
+            status=FinanceHandoffStatus.FINANCE_REJECTED,
+        ).exists()
+    except Exception:
+        finance_rework_cycle = False
+
+    first_group = instance.instance_groups.order_by("step_group__display_order").first()
+    if not finance_rework_cycle:
+        if not first_group or instance.current_group_id != first_group.id:
+            return False
 
     message = (note or "").strip() or "Your invoice was returned for correction during internal review."
     submission.status = VendorInvoiceSubmissionStatus.NEEDS_CORRECTION
@@ -700,6 +711,220 @@ def _return_vendor_submission_for_correction(instance, acted_by, note="") -> boo
             "updated_at",
         ]
     )
+    return True
+
+
+def _get_finance_rework_entry_step_id(instance) -> int | None:
+    """
+    Return the workflow step id that was explicitly re-opened after finance reject.
+
+    This is derived from the latest STEP_ASSIGNED event with metadata.finance_rework=True.
+    """
+    if instance.subject_type != "invoice":
+        return None
+
+    try:
+        from apps.finance.models import FinanceHandoff, FinanceHandoffStatus
+
+        has_finance_rejection = FinanceHandoff.objects.filter(
+            module="invoice",
+            subject_type="invoice",
+            subject_id=instance.subject_id,
+            status=FinanceHandoffStatus.FINANCE_REJECTED,
+        ).exists()
+        if not has_finance_rejection:
+            return None
+    except Exception:
+        return None
+
+    for event in instance.events.filter(event_type=WorkflowEventType.STEP_ASSIGNED).order_by("-created_at", "-id"):
+        metadata = event.metadata or {}
+        if metadata.get("finance_rework"):
+            step_id = metadata.get("instance_step_id")
+            try:
+                return int(step_id)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def can_return_invoice_step_to_vendor(instance_step) -> bool:
+    """
+    Only the finance-rework entry step may explicitly return the invoice to the vendor.
+    """
+    instance = instance_step.instance_group.instance
+    rework_step_id = _get_finance_rework_entry_step_id(instance)
+    return bool(rework_step_id and rework_step_id == instance_step.id)
+
+
+@transaction.atomic
+def return_workflow_step_to_vendor(instance_step, acted_by, note=""):
+    """
+    Explicit internal action: return an invoice back to the vendor for correction.
+
+    This is intended for the finance-rework owner step after finance has rejected
+    an invoice. It terminates the current workflow instance, returns the linked
+    vendor submission to NEEDS_CORRECTION, and preserves route context for later
+    vendor resubmission.
+    """
+    _assert_step_actionable(instance_step)
+
+    if instance_step.assigned_user_id != acted_by.pk:
+        raise StepActionError(
+            f"User {acted_by} is not the assigned user for step {instance_step.id}."
+        )
+
+    if not note or not note.strip():
+        raise StepActionError("A return reason is required when sending an invoice back to the vendor.")
+
+    if not can_return_invoice_step_to_vendor(instance_step):
+        raise StepActionError("This workflow step cannot return the invoice to the vendor.")
+
+    instance = instance_step.instance_group.instance
+
+    if not _return_vendor_submission_for_correction(instance, acted_by, note):
+        raise StepActionError("This invoice is not linked to an editable vendor submission.")
+
+    now = timezone.now()
+    instance_step.status = StepStatus.REJECTED
+    instance_step.acted_at = now
+    instance_step.note = note
+    instance_step.save(update_fields=["status", "acted_at", "note"])
+
+    group = instance_step.instance_group
+    group.status = GroupStatus.REJECTED
+    group.save(update_fields=["status"])
+
+    instance.status = InstanceStatus.REJECTED
+    instance.completed_at = now
+    instance.save(update_fields=["status", "completed_at", "updated_at"])
+
+    _release_allocation_budgets(instance, acted_by, note=note)
+
+    _emit_event(
+        instance,
+        WorkflowEventType.STEP_REJECTED,
+        acted_by,
+        target_user=acted_by,
+        metadata={
+            "instance_step_id": instance_step.id,
+            "note": note,
+            "return_to_vendor": True,
+        },
+    )
+    _emit_event(
+        instance,
+        WorkflowEventType.INSTANCE_REJECTED,
+        acted_by,
+        metadata={
+            "reason": "return_to_vendor",
+            "instance_step_id": instance_step.id,
+            "note": note,
+        },
+    )
+    _sync_subject_status_on_workflow_change(instance)
+
+    return instance_step
+
+
+@transaction.atomic
+def return_invoice_workflow_for_finance_rework(invoice_id: int, acted_by=None, note: str = "") -> bool:
+    """
+    Re-open the approved workflow instance for an invoice after finance rejection.
+
+    The return target is:
+      1. latest assigned RUNTIME_SPLIT_ALLOCATION step, if present
+      2. otherwise earliest assigned human step in the instance
+
+    This preserves the original route/template and gives the same internal owner
+    the task again. Later groups are reset so the post-fix flow runs forward again.
+    """
+    from apps.invoices.models import Invoice
+
+    instance = (
+        WorkflowInstance.objects
+        .filter(
+            subject_type="invoice",
+            subject_id=invoice_id,
+            status=InstanceStatus.APPROVED,
+        )
+        .order_by("-completed_at", "-created_at")
+        .first()
+    )
+    if not instance:
+        return False
+
+    target_step = (
+        WorkflowInstanceStep.objects
+        .filter(
+            instance_group__instance=instance,
+            workflow_step__step_kind=StepKind.RUNTIME_SPLIT_ALLOCATION,
+            assigned_user__isnull=False,
+        )
+        .select_related("instance_group__step_group", "assigned_user", "workflow_step")
+        .order_by("-instance_group__step_group__display_order", "-workflow_step__display_order", "-id")
+        .first()
+    )
+    if not target_step:
+        target_step = (
+            WorkflowInstanceStep.objects
+            .filter(
+                instance_group__instance=instance,
+                assigned_user__isnull=False,
+            )
+            .select_related("instance_group__step_group", "assigned_user", "workflow_step")
+            .order_by("instance_group__step_group__display_order", "workflow_step__display_order", "id")
+            .first()
+        )
+    if not target_step:
+        return False
+
+    target_group = target_step.instance_group
+    target_order = target_group.step_group.display_order
+
+    groups_to_reset = list(
+        instance.instance_groups
+        .filter(step_group__display_order__gte=target_order)
+        .select_related("step_group")
+        .order_by("step_group__display_order")
+    )
+    for group in groups_to_reset:
+        group.status = GroupStatus.WAITING
+        group.save(update_fields=["status"])
+        group.instance_steps.all().update(
+            status=StepStatus.WAITING,
+            acted_at=None,
+            note="",
+        )
+
+    target_group.status = GroupStatus.IN_PROGRESS
+    target_group.save(update_fields=["status"])
+
+    instance.status = InstanceStatus.ACTIVE
+    instance.current_group = target_group
+    instance.completed_at = None
+    instance.save(update_fields=["status", "current_group", "completed_at", "updated_at"])
+
+    _emit_event(
+        instance,
+        WorkflowEventType.STEP_ASSIGNED,
+        acted_by,
+        target_user=target_step.assigned_user,
+        metadata={
+            "instance_step_id": target_step.id,
+            "workflow_step_id": target_step.workflow_step_id,
+            "finance_rework": True,
+            "finance_rejection_note": note,
+        },
+    )
+
+    _sync_subject_status_on_workflow_change(instance)
+
+    try:
+        Invoice.objects.filter(pk=invoice_id).update(updated_at=timezone.now())
+    except Exception:
+        pass
+
     return True
 
 

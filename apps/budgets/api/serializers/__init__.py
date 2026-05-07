@@ -232,16 +232,35 @@ class BudgetLineNestedSerializer(serializers.Serializer):
     )
     allocated_amount = serializers.DecimalField(
         max_digits=14, decimal_places=2,
-        min_value=Decimal("0.01"),
+        min_value=Decimal("0"),
     )
 
     def validate(self, data):
         category = data["category"]
         subcategory = data.get("subcategory")
+        line_id = data.get("id")
+        allocated_amount = data["allocated_amount"]
 
         if subcategory and subcategory.category_id != category.id:
             raise serializers.ValidationError({
                 "subcategory": "Subcategory does not belong to the selected category."
+            })
+
+        if line_id is None:
+            if allocated_amount < Decimal("0.01"):
+                raise serializers.ValidationError({
+                    "allocated_amount": "Ensure this value is greater than or equal to 0.01."
+                })
+            return data
+
+        try:
+            line = BudgetLine.objects.get(pk=line_id)
+        except BudgetLine.DoesNotExist:
+            return data
+
+        if allocated_amount != line.allocated_amount and allocated_amount < Decimal("0.01"):
+            raise serializers.ValidationError({
+                "allocated_amount": "Ensure this value is greater than or equal to 0.01."
             })
         return data
 

@@ -758,6 +758,48 @@ def _is_meaningful_party_name(value: Any) -> bool:
     return not any(marker in lowered for marker in bad_markers)
 
 
+def _decimal_or_none(value: Any) -> Decimal | None:
+    if value in (None, ""):
+        return None
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return None
+
+
+def _amount_set_quality(values: dict[str, Any]) -> tuple[int, Decimal]:
+    subtotal = _decimal_or_none(values.get("subtotal_amount"))
+    tax = _decimal_or_none(values.get("tax_amount"))
+    total = _decimal_or_none(values.get("total_amount"))
+    present = sum(v is not None for v in (subtotal, tax, total))
+    residual = Decimal("999999999")
+    if subtotal is not None and tax is not None and total is not None:
+        residual = abs((subtotal + tax) - total)
+    return present, residual
+
+
+def _should_prefer_fallback_amounts(primary_values: dict[str, Any], fallback_values: dict[str, Any]) -> bool:
+    primary_present, primary_residual = _amount_set_quality(primary_values)
+    fallback_present, fallback_residual = _amount_set_quality(fallback_values)
+    primary_total = _decimal_or_none(primary_values.get("total_amount"))
+    fallback_total = _decimal_or_none(fallback_values.get("total_amount"))
+
+    if fallback_present < 2:
+        return False
+    if primary_present < 2:
+        return True
+    if primary_total is not None and fallback_total is not None:
+        delta = abs(primary_total - fallback_total)
+        if delta > Decimal("1000") and delta > (primary_total * Decimal("0.05")):
+            return False
+
+    if fallback_residual <= Decimal("0.05") and primary_residual > Decimal("0.05"):
+        return True
+    if fallback_residual < primary_residual and (primary_residual - fallback_residual) > Decimal("0.50"):
+        return True
+    return False
+
+
 def _merge_extraction_results(
     primary: ExtractionResult,
     fallback: ExtractionResult,
@@ -776,6 +818,16 @@ def _merge_extraction_results(
         fallback_value = fallback_normalized.get(key)
         if not _is_meaningful_party_name(primary_value) and _is_meaningful_party_name(fallback_value):
             merged[key] = fallback_value
+
+    if _should_prefer_fallback_amounts(primary.normalized, fallback_normalized):
+        for key in ("subtotal_amount", "tax_amount", "total_amount"):
+            fallback_value = fallback_normalized.get(key)
+            if fallback_value not in (None, ""):
+                merged[key] = fallback_value
+
+    raw_text = fallback.raw_cells.get("raw_text") if isinstance(fallback.raw_cells, dict) else None
+    if isinstance(raw_text, str) and raw_text.strip():
+        _correct_tax_from_totals_when_split_marked(merged, raw_text)
 
     merged = _normalize_extracted_invoice_fields(merged, submission=submission)
 
@@ -966,19 +1018,66 @@ def _parse_pdf_date(s: str) -> str | None:
     return None
 
 
+_TAX_COMPONENT_LABEL_RE = re.compile(
+    r"\b(?:add\s+)?(?:cgst|sgst|igst|utgst|cess|service\s*tax)\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_amount_candidates(text: str) -> list[Decimal]:
+    candidates: list[Decimal] = []
+    for match in re.finditer(r"(?<![A-Z0-9])([\d,]+(?:\.\d{1,2})?)(?!\s*%)", text):
+        amount = _try_parse_decimal(match.group(1))
+        if amount is not None:
+            candidates.append(amount)
+    return candidates
+
+
+def _pick_tax_component_amount(line: str) -> Decimal | None:
+    candidates = _extract_amount_candidates(line)
+    if not candidates:
+        return None
+
+    # Tax-component lines often include a rate and an amount. Prefer the last
+    # candidate because layouts commonly end the row with the actual tax value.
+    picked = candidates[-1]
+
+    # If the last candidate is implausibly tiny but a larger later candidate
+    # exists in the line, prefer the maximum. This protects OCR-ish layouts.
+    if picked <= Decimal("100") and any(c > picked for c in candidates):
+        picked = max(candidates)
+
+    return picked
+
+
 def _sum_tax_components(raw_text: str) -> Decimal | None:
+    lines = [" ".join(line.split()) for line in raw_text.splitlines()]
     total = Decimal("0")
     matched = 0
-    for line in raw_text.splitlines():
-        compact = " ".join(line.split())
+
+    def _looks_like_tax_noise(text: str) -> bool:
+        lower = text.lower()
+        return "gstin" in lower or "gst number" in lower or lower.startswith("gst:")
+
+    for idx, compact in enumerate(lines):
         if not compact:
             continue
-        if not re.search(r"\b(?:add\s+)?(?:cgst|sgst|igst)\b", compact, re.IGNORECASE):
+        if _looks_like_tax_noise(compact):
             continue
-        amount_match = re.search(r"([\d,]+\.\d{1,2})\s*$", compact)
-        if not amount_match:
+        if not _TAX_COMPONENT_LABEL_RE.search(compact):
             continue
-        amount = _try_parse_decimal(amount_match.group(1))
+        amount = _pick_tax_component_amount(compact)
+        if amount is None:
+            for next_idx in range(idx + 1, min(idx + 3, len(lines))):
+                candidate_line = lines[next_idx]
+                if not candidate_line or _looks_like_tax_noise(candidate_line):
+                    continue
+                if _TAX_COMPONENT_LABEL_RE.search(candidate_line):
+                    break
+                candidate_amount = _pick_tax_component_amount(candidate_line)
+                if candidate_amount is not None:
+                    amount = candidate_amount
+                    break
         if amount is None:
             continue
         total += amount
@@ -986,13 +1085,77 @@ def _sum_tax_components(raw_text: str) -> Decimal | None:
     return total if matched >= 1 else None
 
 
-def _largest_amount_in_text(raw_text: str) -> Decimal | None:
-    amounts: list[Decimal] = []
-    for match in re.finditer(r"(?<![A-Z0-9])([\d,]+\.\d{1,2})(?![A-Z0-9])", raw_text):
+def _count_tax_component_markers(raw_text: str) -> int:
+    seen: set[str] = set()
+    for match in _TAX_COMPONENT_LABEL_RE.finditer(raw_text):
+        token = re.sub(r"\s+", "", match.group(0).lower())
+        token = token.removeprefix("add")
+        seen.add(token)
+    return len(seen)
+
+
+def _correct_tax_from_totals_when_split_marked(normalized: dict[str, Any], raw_text: str) -> None:
+    subtotal = _decimal_or_none(normalized.get("subtotal_amount"))
+    total = _decimal_or_none(normalized.get("total_amount"))
+    tax = _decimal_or_none(normalized.get("tax_amount"))
+    if subtotal is None or total is None:
+        return
+
+    expected_tax = total - subtotal
+    if expected_tax <= 0:
+        return
+
+    marker_count = _count_tax_component_markers(raw_text)
+    if marker_count < 2:
+        return
+
+    if tax is None:
+        normalized["tax_amount"] = expected_tax
+        return
+
+    if abs(expected_tax - tax) <= Decimal("0.05"):
+        return
+
+    if expected_tax > tax and abs(expected_tax - (tax * 2)) <= Decimal("0.10"):
+        normalized["tax_amount"] = expected_tax
+
+
+def _amounts_with_positions(raw_text: str) -> list[tuple[int, Decimal]]:
+    amounts: list[tuple[int, Decimal]] = []
+    for match in re.finditer(r"(?<![A-Z0-9])([\d,]+(?:\.\d{1,2})?)(?![A-Z0-9])", raw_text):
         amount = _try_parse_decimal(match.group(1))
         if amount is not None:
-            amounts.append(amount)
+            if amount > Decimal("999999999.99"):
+                continue
+            amounts.append((match.start(), amount))
+    return amounts
+
+
+def _largest_amount_in_text(raw_text: str) -> Decimal | None:
+    amounts = [amount for _, amount in _amounts_with_positions(raw_text)]
     return max(amounts) if amounts else None
+
+
+def _previous_distinct_amount(raw_text: str, target: Decimal) -> Decimal | None:
+    amounts = [amount for _, amount in _amounts_with_positions(raw_text)]
+    for amount in sorted(set(amounts), reverse=True):
+        if amount < target:
+            return amount
+    return None
+
+
+def _currency_marked_amounts(raw_text: str) -> list[Decimal]:
+    amounts: list[Decimal] = []
+    for pattern in (
+        r"\u20b9\s*([\d,]+(?:\.\d{1,2})?)",
+        r"Rs\.?\s*([\d,]+(?:\.\d{1,2})?)",
+        r"INR\s*([\d,]+(?:\.\d{1,2})?)",
+    ):
+        for match in re.finditer(pattern, raw_text, re.IGNORECASE):
+            amount = _try_parse_decimal(match.group(1))
+            if amount is not None:
+                amounts.append(amount)
+    return amounts
 
 
 def _extract_from_text_with_regex(raw_text: str) -> dict[str, Any]:
@@ -1050,8 +1213,53 @@ def _extract_from_text_with_regex(raw_text: str) -> dict[str, Any]:
         normalized["tax_amount"] = total_amount - subtotal_amount
         tax_amount = normalized["tax_amount"]
 
+    if subtotal_amount is None and total_amount is not None and tax_amount is not None:
+        previous_amount = _previous_distinct_amount(raw_text, total_amount)
+        if previous_amount is not None and previous_amount + tax_amount == total_amount:
+            normalized["subtotal_amount"] = previous_amount
+            subtotal_amount = previous_amount
+
+    if total_amount is not None and subtotal_amount is None and tax_amount is None:
+        previous_amount = _previous_distinct_amount(raw_text, total_amount)
+        if previous_amount is not None and previous_amount < total_amount:
+            inferred_tax = total_amount - previous_amount
+            if inferred_tax > 0:
+                normalized["subtotal_amount"] = previous_amount
+                normalized["tax_amount"] = inferred_tax
+                subtotal_amount = previous_amount
+                tax_amount = inferred_tax
+
     if total_amount is None and subtotal_amount is not None and tax_amount is not None:
         normalized["total_amount"] = subtotal_amount + tax_amount
+
+    currency_amounts = _currency_marked_amounts(raw_text)
+    if currency_amounts:
+        distinct_currency_amounts = sorted(set(currency_amounts), reverse=True)
+        currency_total = distinct_currency_amounts[0]
+
+        if total_amount is None or total_amount not in distinct_currency_amounts:
+            normalized["total_amount"] = currency_total
+            total_amount = currency_total
+
+        subtotal_candidate = next(
+            (amount for amount in distinct_currency_amounts if amount < total_amount),
+            None,
+        )
+        if subtotal_candidate is not None:
+            inferred_tax = total_amount - subtotal_candidate
+            if inferred_tax > 0:
+                if subtotal_amount is None or subtotal_amount not in distinct_currency_amounts or subtotal_amount >= total_amount:
+                    normalized["subtotal_amount"] = subtotal_candidate
+                    subtotal_amount = subtotal_candidate
+                if (
+                    tax_amount is None
+                    or tax_amount > inferred_tax
+                    or inferred_tax == tax_amount * 2
+                ):
+                    normalized["tax_amount"] = inferred_tax
+                    tax_amount = inferred_tax
+
+    _correct_tax_from_totals_when_split_marked(normalized, raw_text)
 
     invoice_ref = normalized.get("vendor_invoice_number")
     if invoice_ref and not re.search(r"\d", str(invoice_ref)):
