@@ -11,13 +11,11 @@ from apps.campaigns.api.serializers import (
     CampaignUpdateSerializer,
     CampaignDocumentSerializer,
     CampaignDocumentCreateSerializer,
-    ReviewBudgetVarianceSerializer,
     CancelCampaignSerializer,
 )
 from apps.campaigns.services import (
     create_campaign,
     submit_campaign_for_budget,
-    review_campaign_budget_variance,
     cancel_campaign,
     CampaignStateError,
 )
@@ -172,30 +170,6 @@ class CampaignViewSet(ModelViewSet):
             "status": result["status"],
             "campaign": CampaignSerializer(campaign, context=self.get_serializer_context()).data,
         })
-
-    @action(detail=True, methods=["post"], url_path="review-budget-variance")
-    def review_budget_variance(self, request, pk=None):
-        """POST /campaigns/{id}/review-budget-variance/"""
-        campaign = self.get_object()
-        if err := user_can_act_on_scope_response(request.user, campaign.scope_node_id, "review budget variance for this campaign"):
-            return err
-        serializer = ReviewBudgetVarianceSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
-
-        try:
-            review_campaign_budget_variance(
-                campaign=campaign,
-                decision=data["decision"],
-                reviewed_by=request.user,
-                review_note=data.get("review_note", ""),
-            )
-        except (CampaignStateError, ValueError) as e:
-            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
-
-        return Response(
-            CampaignSerializer(campaign, context=self.get_serializer_context()).data
-        )
 
     @action(detail=True, methods=["post"], url_path="cancel")
     def cancel(self, request, pk=None):

@@ -2,6 +2,7 @@ from rest_framework import serializers
 
 from apps.campaigns.models import Campaign, CampaignDocument
 from apps.budgets.models import BudgetStatus
+from apps.budgets.models import BudgetLine
 
 
 # ---------------------------------------------------------------------------
@@ -103,14 +104,14 @@ class CampaignCreateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({
                     "budget": "Budget scope node does not match the campaign scope node."
                 })
-            if category and budget.category_id and budget.category_id != category.id:
-                raise serializers.ValidationError({
-                    "budget": "Budget category does not match the campaign category."
-                })
-            if subcategory and budget.subcategory_id and budget.subcategory_id != subcategory.id:
-                raise serializers.ValidationError({
-                    "budget": "Budget subcategory does not match the campaign subcategory."
-                })
+            if category:
+                matching_lines = BudgetLine.objects.filter(budget=budget, category=category)
+                if subcategory:
+                    matching_lines = matching_lines.filter(subcategory=subcategory)
+                if not matching_lines.exists():
+                    raise serializers.ValidationError({
+                        "budget": "Selected budget does not contain a matching budget line for the chosen category/subcategory."
+                    })
         return data
 
 
@@ -152,24 +153,15 @@ class CampaignUpdateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({
                     "budget": "Budget scope node does not match the campaign scope node."
                 })
-            if category and budget.category_id and budget.category_id != category.id:
-                raise serializers.ValidationError({
-                    "budget": "Budget category does not match the campaign category."
-                })
-            if subcategory and budget.subcategory_id and budget.subcategory_id != subcategory.id:
-                raise serializers.ValidationError({
-                    "budget": "Budget subcategory does not match the campaign subcategory."
-                })
+            if category:
+                matching_lines = BudgetLine.objects.filter(budget=budget, category=category)
+                if subcategory:
+                    matching_lines = matching_lines.filter(subcategory=subcategory)
+                if not matching_lines.exists():
+                    raise serializers.ValidationError({
+                        "budget": "Selected budget does not contain a matching budget line for the chosen category/subcategory."
+                    })
         return data
-
-
-# ---------------------------------------------------------------------------
-# Action request serializers
-# ---------------------------------------------------------------------------
-
-class ReviewBudgetVarianceSerializer(serializers.Serializer):
-    decision = serializers.ChoiceField(choices=["approved", "rejected"])
-    review_note = serializers.CharField(required=False, default="", allow_blank=True)
 
 
 class CancelCampaignSerializer(serializers.Serializer):

@@ -5,10 +5,7 @@ from django.db import transaction
 from apps.campaigns.models import Campaign, CampaignStatus
 from apps.budgets.models import SourceType
 from apps.budgets.services import (
-    reserve_budget,
-    release_reserved_budget,
     release_reserved_budget_line,
-    review_variance_request,
     get_source_reserved_balance,
     reserve_budget_line,
     resolve_budget_line_for_allocation,
@@ -71,15 +68,14 @@ def submit_campaign_for_budget(campaign: Campaign, submitted_by) -> dict:
 
     Transitions:
         draft → pending_workflow   (no budget linked, or reservation succeeded)
-        draft → budget_variance_pending  (budget linked, variance required)
 
     Returns dict with:
-        status: "no_budget_linked" | "reserved" | "reserved_with_warning" | "variance_required"
-        + reserve_budget() result keys when budget is linked
+        status: "no_budget_linked" | "reserved"
+        + reserve_budget_line() result keys when budget is linked
 
     Raises:
         CampaignStateError  — if campaign is not DRAFT
-        BudgetLimitExceeded — if reservation would exceed hard block threshold
+        BudgetLimitExceeded — if reservation would exceed available balance
         BudgetNotActiveError — if linked budget is not ACTIVE
     """
     if campaign.status != CampaignStatus.DRAFT:
@@ -116,65 +112,15 @@ def submit_campaign_for_budget(campaign: Campaign, submitted_by) -> dict:
         note=f"Reserve for campaign {campaign.code}",
     )
 
-    if result["status"] in ("reserved", "reserved_with_warning"):
+    if result["status"] == "reserved":
         campaign.status = CampaignStatus.PENDING_WORKFLOW
         campaign.save(update_fields=["status", "updated_at"])
-    elif result["status"] == "variance_required":
-        campaign.budget_variance_request = result["variance_request"]
-        campaign.status = CampaignStatus.BUDGET_VARIANCE_PENDING
-        campaign.save(update_fields=["status", "budget_variance_request", "updated_at"])
+    else:
+        raise ValueError(
+            f"Unexpected budget reservation result for campaign {campaign.id}: {result['status']!r}"
+        )
 
     return result
-
-
-# ---------------------------------------------------------------------------
-# Review campaign budget variance
-# ---------------------------------------------------------------------------
-
-@transaction.atomic
-def review_campaign_budget_variance(
-    campaign: Campaign,
-    decision: str,
-    reviewed_by,
-    review_note: str = "",
-):
-    """
-    Approve or reject the budget variance request attached to the campaign.
-
-    Transitions:
-        budget_variance_pending → pending_workflow  (if approved)
-        budget_variance_pending → rejected          (if rejected)
-
-    Returns the updated BudgetVarianceRequest.
-
-    Raises:
-        CampaignStateError — if campaign is not BUDGET_VARIANCE_PENDING
-        ValueError         — if campaign has no attached variance request,
-                             or decision is invalid
-    """
-    if campaign.status != CampaignStatus.BUDGET_VARIANCE_PENDING:
-        raise CampaignStateError(
-            f"Campaign {campaign.id} is {campaign.status!r}, expected 'budget_variance_pending'."
-        )
-    if not campaign.budget_variance_request_id:
-        raise ValueError(
-            f"Campaign {campaign.id} has no budget_variance_request attached."
-        )
-
-    updated_variance = review_variance_request(
-        variance_request=campaign.budget_variance_request,
-        decision=decision,
-        reviewed_by=reviewed_by,
-        review_note=review_note,
-    )
-
-    if decision == "approved":
-        campaign.status = CampaignStatus.PENDING_WORKFLOW
-    else:
-        campaign.status = CampaignStatus.REJECTED
-
-    campaign.save(update_fields=["status", "updated_at"])
-    return updated_variance
 
 
 # ---------------------------------------------------------------------------

@@ -177,19 +177,10 @@ def reserve_budget_line(
     note: str = "",
 ) -> dict:
     """
-    Attempt to reserve `amount` from a BudgetLine.
+    Attempt to reserve `amount` from a BudgetLine using only real available balance.
 
-    Returns a dict with keys:
-        status: "reserved" | "reserved_with_warning" | "variance_required"
-        consumption: BudgetConsumption | None
-        variance_request: BudgetVarianceRequest | None
-        projected_utilization: Decimal
-        current_utilization: Decimal
-
-    Raises:
-        BudgetNotActiveError — if line.budget.status != ACTIVE
-        BudgetLimitExceeded — if projected > hard_block_threshold
-        ValueError — if amount <= 0
+    No threshold rules or variance workflow are involved. Reservation is allowed
+    only when the line has enough available amount remaining.
     """
     # Refresh both objects for concurrency safety
     line.refresh_from_db()
@@ -205,45 +196,13 @@ def reserve_budget_line(
     if amount <= 0:
         raise ValueError("Reservation amount must be greater than zero.")
 
-    rule = _get_rule(budget)
-    if rule:
-        warning = rule.warning_threshold_percent
-        approval = rule.approval_threshold_percent
-        hard_block = rule.hard_block_threshold_percent
-    else:
-        warning = Decimal("80.00")
-        approval = Decimal("100.00")
-        hard_block = Decimal("110.00")
-
     current_util, projected_util = calculate_projected_utilization_for_line(line, amount)
-
-    if projected_util >= hard_block:
+    available_amount = line.available_amount
+    if amount > available_amount:
         raise BudgetLimitExceeded(
-            f"Reservation of {amount} would bring projected utilization to "
-            f"{projected_util:.2f}%, exceeding hard block threshold of "
-            f"{hard_block:.2f}%. Variance approval required."
+            f"Reservation of {amount} exceeds available amount of {available_amount} "
+            f"for budget line {line.id}."
         )
-
-    if projected_util >= approval:
-        variance_req = BudgetVarianceRequest.objects.create(
-            budget=budget,
-            budget_line=line,
-            source_type=source_type,
-            source_id=str(source_id),
-            requested_amount=amount,
-            current_utilization_percent=current_util,
-            projected_utilization_percent=projected_util,
-            reason=note,
-            status=VarianceStatus.PENDING,
-            requested_by=requested_by,
-        )
-        return {
-            "status": "variance_required",
-            "consumption": None,
-            "variance_request": variance_req,
-            "projected_utilization": projected_util,
-            "current_utilization": current_util,
-        }
 
     consumption = BudgetConsumption.objects.create(
         budget=budget,
@@ -260,15 +219,6 @@ def reserve_budget_line(
     line.save(update_fields=["reserved_amount", "updated_at"])
     budget.reserved_amount += amount
     budget.save(update_fields=["reserved_amount", "updated_at"])
-
-    if projected_util >= warning:
-        return {
-            "status": "reserved_with_warning",
-            "consumption": consumption,
-            "variance_request": None,
-            "projected_utilization": projected_util,
-            "current_utilization": current_util,
-        }
 
     return {
         "status": "reserved",
@@ -495,6 +445,7 @@ def reserve_budget(
     """
     Header-level budget reservation (backward compat for campaign/workflow callers).
     Operates directly on the Budget header without targeting a specific BudgetLine.
+    No threshold rules or variance workflow are involved.
     """
     budget.refresh_from_db()
 
@@ -505,45 +456,13 @@ def reserve_budget(
     if amount <= 0:
         raise ValueError("Reservation amount must be greater than zero.")
 
-    rule = _get_rule(budget)
-    if rule:
-        warning = rule.warning_threshold_percent
-        approval = rule.approval_threshold_percent
-        hard_block = rule.hard_block_threshold_percent
-    else:
-        warning = Decimal("80.00")
-        approval = Decimal("100.00")
-        hard_block = Decimal("110.00")
-
     current_util, projected_util = calculate_projected_utilization(budget, amount)
-
-    if projected_util >= hard_block:
+    available_amount = budget.available_amount
+    if amount > available_amount:
         raise BudgetLimitExceeded(
-            f"Reservation of {amount} would bring projected utilization to "
-            f"{projected_util:.2f}%, exceeding hard block threshold of "
-            f"{hard_block:.2f}%. Variance approval required."
+            f"Reservation of {amount} exceeds available amount of {available_amount} "
+            f"for budget {budget.id}."
         )
-
-    if projected_util >= approval:
-        variance_req = BudgetVarianceRequest.objects.create(
-            budget=budget,
-            budget_line=None,
-            source_type=source_type,
-            source_id=str(source_id),
-            requested_amount=amount,
-            current_utilization_percent=current_util,
-            projected_utilization_percent=projected_util,
-            reason=note,
-            status=VarianceStatus.PENDING,
-            requested_by=requested_by,
-        )
-        return {
-            "status": "variance_required",
-            "consumption": None,
-            "variance_request": variance_req,
-            "projected_utilization": projected_util,
-            "current_utilization": current_util,
-        }
 
     consumption = BudgetConsumption.objects.create(
         budget=budget,
@@ -558,15 +477,6 @@ def reserve_budget(
     )
     budget.reserved_amount += amount
     budget.save(update_fields=["reserved_amount", "updated_at"])
-
-    if projected_util >= warning:
-        return {
-            "status": "reserved_with_warning",
-            "consumption": consumption,
-            "variance_request": None,
-            "projected_utilization": projected_util,
-            "current_utilization": current_util,
-        }
 
     return {
         "status": "reserved",

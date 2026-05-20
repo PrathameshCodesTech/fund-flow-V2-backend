@@ -607,9 +607,107 @@ class MyTasksView(APIView):
     """
     permission_classes = [IsAuthenticated]
 
+    @staticmethod
+    def _role_label(role):
+        if not role:
+            return None
+        return role.name or role.code.replace("_", " ").title()
+
+    def _build_invoice_context_map(self, instances):
+        from apps.invoices.models import Invoice
+
+        invoice_instance_pairs = [
+            (instance.id, instance.subject_id)
+            for instance in instances
+            if instance.subject_type == "invoice"
+        ]
+        if not invoice_instance_pairs:
+            return {}
+
+        invoice_ids = {subject_id for _, subject_id in invoice_instance_pairs}
+        invoices = (
+            Invoice.objects
+            .filter(pk__in=invoice_ids)
+            .select_related("vendor")
+        )
+        invoices_by_id = {invoice.pk: invoice for invoice in invoices}
+
+        context_by_instance = {}
+        for instance_id, invoice_id in invoice_instance_pairs:
+            invoice = invoices_by_id.get(invoice_id)
+            context_by_instance[instance_id] = {
+                "vendor_name": invoice.vendor.vendor_name if invoice and invoice.vendor_id else None,
+                "vendor_invoice_number": invoice.vendor_invoice_number if invoice else None,
+            }
+        return context_by_instance
+
+    def _build_previous_actor_map(self, instances):
+        instance_ids = [instance.id for instance in instances]
+        if not instance_ids:
+            return {}
+
+        acted_steps = (
+            WorkflowInstanceStep.objects
+            .filter(
+                instance_group__instance_id__in=instance_ids,
+                acted_at__isnull=False,
+                status__in=["APPROVED", "REJECTED"],
+            )
+            .select_related("assigned_user", "workflow_step__required_role")
+            .order_by("instance_group__instance_id", "-acted_at", "-id")
+        )
+
+        steps_by_instance = {}
+        for step in acted_steps:
+            steps_by_instance.setdefault(step.instance_group.instance_id, []).append(step)
+        return steps_by_instance
+
+    def _resolve_previous_actor(self, acted_steps, excluded_step_id=None):
+        for step in acted_steps:
+            if excluded_step_id and step.id == excluded_step_id:
+                continue
+            return {
+                "previous_actor_name": (
+                    step.assigned_user.get_full_name().strip()
+                    if step.assigned_user and step.assigned_user.get_full_name().strip()
+                    else (step.assigned_user.email if step.assigned_user else None)
+                ),
+                "previous_actor_role": self._role_label(step.workflow_step.required_role),
+                "previous_actor_action": (
+                    "approved" if step.status == "APPROVED"
+                    else "rejected" if step.status == "REJECTED"
+                    else None
+                ),
+            }
+        return {
+            "previous_actor_name": None,
+            "previous_actor_role": None,
+            "previous_actor_action": None,
+        }
+
     def get(self, request):
         # Step tasks
         step_tasks = get_pending_tasks_for_user(request.user)
+        branch_tasks = (
+            WorkflowInstanceBranch.objects
+            .filter(
+                assigned_user=request.user,
+                status=BranchStatus.PENDING,
+                instance__status=InstanceStatus.ACTIVE,
+            )
+            .select_related(
+                "instance",
+                "parent_instance_step__workflow_step",
+                "parent_instance_step__instance_group__step_group",
+                "target_scope_node",
+            )
+            .order_by("created_at")
+        )
+
+        task_instances = [ist.instance_group.instance for ist in step_tasks] + [b.instance for b in branch_tasks]
+        invoice_context_by_instance = self._build_invoice_context_map(task_instances)
+        previous_steps_by_instance = self._build_previous_actor_map(task_instances)
+
         step_data = [
             {
                 "task_kind": "step",
@@ -630,26 +728,18 @@ class MyTasksView(APIView):
                 "target_scope_node": None,
                 "target_scope_node_name": None,
                 "split_step_name": None,
+                **invoice_context_by_instance.get(ist.instance_group.instance_id, {
+                    "vendor_name": None,
+                    "vendor_invoice_number": None,
+                }),
+                **self._resolve_previous_actor(
+                    previous_steps_by_instance.get(ist.instance_group.instance_id, []),
+                    excluded_step_id=ist.id,
+                ),
             }
             for ist in step_tasks
         ]
 
-        # Branch tasks — user is assigned to a PENDING branch
-        branch_tasks = (
-            WorkflowInstanceBranch.objects
-            .filter(
-                assigned_user=request.user,
-                status=BranchStatus.PENDING,
-                instance__status=InstanceStatus.ACTIVE,
-            )
-            .select_related(
-                "instance",
-                "parent_instance_step__workflow_step",
-                "parent_instance_step__instance_group__step_group",
-                "target_scope_node",
-            )
-            .order_by("created_at")
-        )
         branch_data = [
             {
                 "task_kind": "branch",
@@ -670,6 +760,13 @@ class MyTasksView(APIView):
                 "target_scope_node": b.target_scope_node_id,
                 "target_scope_node_name": b.target_scope_node.name if b.target_scope_node else None,
                 "split_step_name": b.parent_instance_step.workflow_step.name,
+                **invoice_context_by_instance.get(b.instance_id, {
+                    "vendor_name": None,
+                    "vendor_invoice_number": None,
+                }),
+                **self._resolve_previous_actor(
+                    previous_steps_by_instance.get(b.instance_id, []),
+                ),
             }
             for b in branch_tasks
         ]
