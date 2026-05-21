@@ -1828,7 +1828,19 @@ def approve_workflow_branch(branch: WorkflowInstanceBranch, acted_by, note=""):
 
     # Update linked allocation status for RUNTIME_SPLIT_ALLOCATION branches.
     allocation = getattr(branch, "invoice_allocation", None)
-    if allocation:
+    if branch.parent_instance_step.workflow_step.step_kind == StepKind.RUNTIME_SPLIT_ALLOCATION:
+        from apps.invoices.models import InvoiceAllocation, InvoiceAllocationStatus
+
+        InvoiceAllocation.objects.filter(
+            split_step=branch.parent_instance_step,
+            entity=branch.target_scope_node,
+            status=InvoiceAllocationStatus.BRANCH_PENDING,
+        ).update(
+            status=InvoiceAllocationStatus.APPROVED,
+            approved_by=acted_by,
+            approved_at=now,
+        )
+    elif allocation:
         allocation.status = "approved"
         allocation.approved_by = acted_by
         allocation.approved_at = now

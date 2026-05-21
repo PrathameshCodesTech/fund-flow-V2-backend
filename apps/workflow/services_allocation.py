@@ -29,15 +29,18 @@ from apps.workflow.services import (
 )
 
 
-def _scope_matches_entity_or_ancestor(entity, scope_node) -> bool:
+def _scope_matches_entity_or_descendant(entity, scope_node) -> bool:
     """
     Accept budgets scoped:
-      - on the entity itself or within its subtree, OR
-      - on an ancestor of the entity (e.g. Marketing owning North allocations)
+      - on the entity itself, OR
+      - within its subtree.
+
+    Parent-scope budgets are excluded so single-allocation follows the same
+    BU-owned budget model as runtime split.
     """
     if not scope_node:
         return False
-    return scope_node.path.startswith(entity.path) or entity.path.startswith(scope_node.path)
+    return scope_node.path.startswith(entity.path)
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +107,7 @@ def get_single_allocation_options(instance_step: WorkflowInstanceStep, user) -> 
             .select_related("budget", "budget__scope_node", "category", "subcategory")
             .order_by("category__name", "subcategory__name")
         )
-        scoped_lines_qs = [line for line in scoped_lines_qs if _scope_matches_entity_or_ancestor(node, line.budget.scope_node)]
+        scoped_lines_qs = [line for line in scoped_lines_qs if _scope_matches_entity_or_descendant(node, line.budget.scope_node)]
 
         # Collect categories and subcategories from budget lines
         category_ids: set[int] = set()
@@ -132,7 +135,7 @@ def get_single_allocation_options(instance_step: WorkflowInstanceStep, user) -> 
             .select_related("category", "subcategory", "budget")
             .order_by("name")
         )
-        scoped_campaigns_qs = [c for c in scoped_campaigns_qs if c.budget and _scope_matches_entity_or_ancestor(node, c.budget.scope_node)]
+        scoped_campaigns_qs = [c for c in scoped_campaigns_qs if c.budget and _scope_matches_entity_or_descendant(node, c.budget.scope_node)]
         for c in scoped_campaigns_qs:
             if c.category_id:
                 category_ids.add(c.category_id)
@@ -420,7 +423,7 @@ def submit_single_invoice_allocation(
             raise StepActionError(
                 f"Budget {budget.id} is not ACTIVE (status={budget.status})."
             )
-        if budget.scope_node and not _scope_matches_entity_or_ancestor(entity, budget.scope_node):
+        if budget.scope_node and not _scope_matches_entity_or_descendant(entity, budget.scope_node):
             raise StepActionError(
                 f"Budget {budget.id} is not within the scope of entity {entity.id}."
             )

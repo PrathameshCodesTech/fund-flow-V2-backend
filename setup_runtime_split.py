@@ -187,7 +187,7 @@ split_step = WorkflowStep.objects.create(
     require_subcategory=False,
     require_budget=False,
     require_campaign=False,
-    allow_multiple_lines_per_entity=False,
+    allow_multiple_lines_per_entity=True,
 )
 
 # Group 2: Each branch is approved by HO Ops for that entity

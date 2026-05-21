@@ -240,22 +240,7 @@ class BudgetViewSet(ModelViewSet):
 
         scope_node_id = self.request.query_params.get("scope_node")
         if scope_node_id:
-            try:
-                selected_node = ScopeNode.objects.get(pk=scope_node_id)
-            except ScopeNode.DoesNotExist:
-                return qs.none()
-
-            ancestor_paths = selected_node.get_ancestors_from_path() + [selected_node.path]
-            ancestor_ids = list(
-                ScopeNode.objects.filter(
-                    org=selected_node.org,
-                    path__in=ancestor_paths,
-                ).values_list("id", flat=True)
-            )
-            qs = qs.filter(
-                Q(scope_node_id__in=ancestor_ids)
-                | Q(scope_node__path__startswith=selected_node.path)
-            )
+            qs = qs.filter(scope_node_id=scope_node_id)
 
         fy = self.request.query_params.get("financial_year")
         if fy:
@@ -306,7 +291,7 @@ class BudgetViewSet(ModelViewSet):
             return err
 
         partial = kwargs.pop("partial", False)
-        serializer = BudgetUpdateSerializer(data=request.data, partial=partial)
+        serializer = BudgetUpdateSerializer(instance=budget, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 

@@ -306,7 +306,7 @@ WORKFLOW_SPECS = [
                         "approver_selection_mode": "RUNTIME_SELECTED_FROM_POOL",
                         "require_category": True,
                         "require_budget": True,
-                        "allow_multiple_lines_per_entity": False,
+                        "allow_multiple_lines_per_entity": True,
                         "branch_approval_policy": "REQUIRED_FOR_ALL",
                         "split_entities": [
                             ("Corporate", ["Ronnie.Zaiwalla@hiparks.com"]),
@@ -378,7 +378,7 @@ WORKFLOW_SPECS = [
                         "approver_selection_mode": "RUNTIME_SELECTED_FROM_POOL",
                         "require_category": True,
                         "require_budget": True,
-                        "allow_multiple_lines_per_entity": False,
+                        "allow_multiple_lines_per_entity": True,
                         "branch_approval_policy": "REQUIRED_FOR_ALL",
                         "split_entities": [
                             ("Corporate", ["Taruna.Mahajan@hiparks.com"]),
@@ -433,7 +433,7 @@ WORKFLOW_SPECS = [
                         "approver_selection_mode": "RUNTIME_SELECTED_FROM_POOL",
                         "require_category": True,
                         "require_budget": True,
-                        "allow_multiple_lines_per_entity": False,
+                        "allow_multiple_lines_per_entity": True,
                         "branch_approval_policy": "REQUIRED_FOR_ALL",
                         "split_entities": [
                             ("Corporate", ["Taruna.Mahajan@hiparks.com"]),
@@ -488,7 +488,7 @@ WORKFLOW_SPECS = [
                         "approver_selection_mode": "RUNTIME_SELECTED_FROM_POOL",
                         "require_category": True,
                         "require_budget": True,
-                        "allow_multiple_lines_per_entity": False,
+                        "allow_multiple_lines_per_entity": True,
                         "branch_approval_policy": "REQUIRED_FOR_ALL",
                         "split_entities": [
                             ("Corporate", ["Taruna.Mahajan@hiparks.com"]),

@@ -5,6 +5,21 @@ from apps.budgets.models import BudgetStatus
 from apps.budgets.models import BudgetLine
 
 
+def _campaign_scope_code(value: str | None) -> str:
+    return (value or "").strip().upper().replace(" ", "-")
+
+
+def generate_campaign_code(scope_node) -> str:
+    if not scope_node:
+        raise serializers.ValidationError({"scope_node": "Business unit is required to generate campaign code."})
+
+    prefix = f"CMP-{_campaign_scope_code(scope_node.code or scope_node.name)}"
+    sequence = 1
+    while Campaign.objects.filter(code=f"{prefix}-{sequence:04d}").exists():
+        sequence += 1
+    return f"{prefix}-{sequence:04d}"
+
+
 # ---------------------------------------------------------------------------
 # CampaignDocument
 # ---------------------------------------------------------------------------
@@ -75,8 +90,12 @@ class CampaignCreateSerializer(serializers.ModelSerializer):
             "requested_amount", "currency",
             "category", "subcategory", "budget",
         )
+        extra_kwargs = {
+            "code": {"required": False, "allow_blank": True},
+        }
 
     def validate(self, data):
+        data["code"] = generate_campaign_code(data.get("scope_node"))
         subcategory = data.get("subcategory")
         category = data.get("category")
         if subcategory and category and subcategory.category_id != category.id:

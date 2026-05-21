@@ -23,6 +23,51 @@ from apps.budgets.models import (
 )
 
 
+def _normalize_scope_code(value: str | None) -> str:
+    return (value or "").strip().upper().replace(" ", "-")
+
+
+def generate_budget_code(financial_year: str | None, scope_node: ScopeNode | None) -> str:
+    fy = (financial_year or "").strip()
+    if not fy:
+        raise serializers.ValidationError({"financial_year": "Financial year is required to generate budget code."})
+    if not scope_node:
+        raise serializers.ValidationError({"scope_node": "Business unit is required to generate budget code."})
+
+    fy_suffix = fy
+    if "-" in fy:
+        fy_suffix = fy.split("-")[-1].strip()
+    digits = "".join(ch for ch in fy_suffix if ch.isdigit())
+    if not digits:
+        digits = "".join(ch for ch in fy if ch.isdigit())
+    if not digits:
+        raise serializers.ValidationError({"financial_year": "Financial year format is invalid."})
+    fy_code = f"FY{digits[-2:]}"
+    scope_code = _normalize_scope_code(scope_node.code or scope_node.name)
+    return f"{fy_code}-MKT-{scope_code}"
+
+
+def _validate_unique_budget_line_pairs(lines: list[dict]):
+    seen: set[tuple[str, str | None]] = set()
+    for line in lines:
+        category = line.get("category")
+        subcategory = line.get("subcategory")
+        category_id = str(category.id if hasattr(category, "id") else category)
+        subcategory_id = None
+        if subcategory is not None:
+            subcategory_id = str(subcategory.id if hasattr(subcategory, "id") else subcategory)
+        key = (category_id, subcategory_id)
+        if key in seen:
+            if subcategory_id is None:
+                raise serializers.ValidationError({
+                    "lines": "Duplicate category lines are not allowed within the same budget."
+                })
+            raise serializers.ValidationError({
+                "lines": "Duplicate category and subcategory lines are not allowed within the same budget."
+            })
+        seen.add(key)
+
+
 # ---------------------------------------------------------------------------
 # Category
 # ---------------------------------------------------------------------------
@@ -423,7 +468,7 @@ class BudgetCreateSerializer(serializers.Serializer):
         queryset=ScopeNode.objects.all(),
     )
     name = serializers.CharField(max_length=255)
-    code = serializers.CharField(max_length=100)
+    code = serializers.CharField(max_length=100, required=False, allow_blank=True)
     financial_year = serializers.CharField(max_length=20, required=False, allow_blank=True)
     period_type = serializers.ChoiceField(
         choices=PeriodType.choices, default=PeriodType.YEARLY
@@ -438,6 +483,12 @@ class BudgetCreateSerializer(serializers.Serializer):
     lines = BudgetLineNestedSerializer(many=True, required=False)
 
     def validate(self, data):
+        scope_node = data.get("scope_node")
+        if scope_node is not None:
+            data["org"] = scope_node.org
+        financial_year = data.get("financial_year")
+        data["code"] = generate_budget_code(financial_year, scope_node)
+
         period_start = data.get("period_start")
         period_end = data.get("period_end")
         if period_start and period_end and period_start >= period_end:
@@ -447,6 +498,7 @@ class BudgetCreateSerializer(serializers.Serializer):
 
         lines = data.get("lines", [])
         if lines:
+            _validate_unique_budget_line_pairs(lines)
             lines_total = sum(line["allocated_amount"] for line in lines)
             if lines_total != data["allocated_amount"]:
                 raise serializers.ValidationError({
@@ -455,6 +507,14 @@ class BudgetCreateSerializer(serializers.Serializer):
                         f"budget allocated_amount ({data['allocated_amount']})."
                     )
                 })
+        if Budget.objects.filter(
+            scope_node=scope_node,
+            financial_year=financial_year,
+            code=data["code"],
+        ).exists():
+            raise serializers.ValidationError({
+                "financial_year": "A budget for this business unit and financial year already exists."
+            })
         return data
 
 
@@ -484,6 +544,11 @@ class BudgetUpdateSerializer(serializers.Serializer):
     lines = BudgetLineNestedSerializer(many=True, required=False)
 
     def validate(self, data):
+        budget_instance = getattr(self, "instance", None)
+        if budget_instance is not None:
+            financial_year = data.get("financial_year", budget_instance.financial_year)
+            data["code"] = generate_budget_code(financial_year, budget_instance.scope_node)
+
         period_start = data.get("period_start")
         period_end = data.get("period_end")
         if period_start and period_end and period_start >= period_end:
@@ -495,6 +560,7 @@ class BudgetUpdateSerializer(serializers.Serializer):
         lines = data.get("lines", [])
         allocated = data.get("allocated_amount")
         if lines and allocated is not None:
+            _validate_unique_budget_line_pairs(lines)
             lines_total = sum(line["allocated_amount"] for line in lines)
             if lines_total != allocated:
                 raise serializers.ValidationError({
@@ -503,6 +569,8 @@ class BudgetUpdateSerializer(serializers.Serializer):
                         f"budget allocated_amount ({allocated})."
                     )
                 })
+        elif lines:
+            _validate_unique_budget_line_pairs(lines)
         return data
 
 

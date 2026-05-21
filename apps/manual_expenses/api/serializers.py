@@ -193,6 +193,10 @@ class ManualExpenseCreateSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(
                 {"budget": "Selected budget does not belong to this organization."}
             )
+        if scope_node and budget and budget.scope_node_id != scope_node.id:
+            raise serializers.ValidationError(
+                {"budget": "Selected budget does not belong to the chosen business unit."}
+            )
         if category and org and category.org_id != org.id:
             raise serializers.ValidationError(
                 {"category": "Selected category does not belong to this organization."}
