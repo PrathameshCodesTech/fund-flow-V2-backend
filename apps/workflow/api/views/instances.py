@@ -894,6 +894,24 @@ class TaskReviewView(APIView):
         from apps.invoices.models import Invoice, InvoiceDocument
         from apps.vendors.models import Vendor
 
+        def _normalize_compare(value):
+            if value is None:
+                return ""
+            if isinstance(value, str):
+                return value.strip()
+            return str(value).strip()
+
+        def _edited_fields(submission):
+            if not submission:
+                return []
+            baseline = submission.original_normalized_data or {}
+            current = submission.normalized_data or {}
+            keys = set(baseline.keys()) | set(current.keys())
+            return sorted(
+                key for key in keys
+                if _normalize_compare(current.get(key)) != _normalize_compare(baseline.get(key))
+            )
+
         try:
             invoice = (
                 Invoice.objects
@@ -949,6 +967,7 @@ class TaskReviewView(APIView):
         docs = []
         seen_source_keys = set()
         submission = getattr(invoice, "submission", None)
+        edited_fields = _edited_fields(submission)
         if submission and (submission.source_file or submission.source_file_name):
             source_doc_type = "invoice_pdf" if submission.source_file_type == "pdf" else "invoice_excel"
             source_key = (submission.source_file_name, source_doc_type)
@@ -982,6 +1001,10 @@ class TaskReviewView(APIView):
             "invoice": invoice_data,
             "vendor": vendor_data,
             "documents": docs,
+            "edited_after_extraction": {
+                "count": len(edited_fields),
+                "fields": edited_fields,
+            },
             "missing": False,
         }
 

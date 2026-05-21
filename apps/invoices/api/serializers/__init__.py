@@ -13,6 +13,10 @@ from apps.vendors.models import Vendor
 # ---------------------------------------------------------------------------
 
 class InvoiceSerializer(serializers.ModelSerializer):
+    vendor_name = serializers.CharField(
+        source="vendor.vendor_name", read_only=True, default=None
+    )
+    send_to_route_label = serializers.SerializerMethodField()
     selected_workflow_template_name = serializers.CharField(
         source="selected_workflow_template.name", read_only=True, default=None
     )
@@ -30,7 +34,8 @@ class InvoiceSerializer(serializers.ModelSerializer):
         model = Invoice
         fields = [
             "id", "scope_node", "title", "amount", "currency",
-            "status", "po_number", "vendor",
+            "status", "po_number", "vendor", "vendor_name",
+            "send_to_route_label",
             "vendor_invoice_number", "invoice_date", "due_date",
             "subtotal_amount", "tax_amount", "description",
             "selected_workflow_template", "selected_workflow_version",
@@ -72,6 +77,18 @@ class InvoiceSerializer(serializers.ModelSerializer):
         if not request or not request.user or not request.user.is_authenticated:
             return False
         return user_can_record_invoice_payment(request.user, obj)
+
+    def get_send_to_route_label(self, obj):
+        submission = (
+            VendorInvoiceSubmission.objects
+            .select_related("send_to_route")
+            .filter(final_invoice=obj)
+            .order_by("-created_at")
+            .first()
+        )
+        if not submission or not submission.send_to_route_id:
+            return None
+        return submission.send_to_route.label
 
 
 class InvoiceCreateSerializer(serializers.Serializer):

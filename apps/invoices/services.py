@@ -1622,6 +1622,7 @@ def extract_invoice_submission(submission: VendorInvoiceSubmission) -> Extractio
 
         # Persist extraction results — convert Decimals to floats for JSON serialization
         submission.raw_extracted_data = _json_safe_dict(result.raw_cells)
+        submission.original_normalized_data = _json_safe_dict(result.normalized)
         submission.normalized_data = _json_safe_dict(result.normalized)
         submission.confidence_score = Decimal(str(result.confidence)) if result.confidence else None
         if result.errors:
@@ -1632,7 +1633,7 @@ def extract_invoice_submission(submission: VendorInvoiceSubmission) -> Extractio
         else:
             submission.status = VendorInvoiceSubmissionStatus.READY
         submission.save(update_fields=[
-            "raw_extracted_data", "normalized_data", "confidence_score",
+            "raw_extracted_data", "original_normalized_data", "normalized_data", "confidence_score",
             "validation_errors", "status", "updated_at",
         ])
         return result

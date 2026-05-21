@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework.decorators import action
 from rest_framework.viewsets import ModelViewSet
 from django.db import transaction
+from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from apps.core.models import ScopeNode
@@ -45,6 +46,19 @@ class InvoiceViewSet(ModelViewSet):
             return InvoiceCreateSerializer
         return InvoiceSerializer
 
+    def _apply_search_filter(self, qs, search_term: str | None):
+        if not search_term:
+            return qs
+        search_term = search_term.strip()
+        if not search_term:
+            return qs
+        return qs.filter(
+            Q(title__icontains=search_term)
+            | Q(vendor_invoice_number__icontains=search_term)
+            | Q(po_number__icontains=search_term)
+            | Q(vendor__vendor_name__icontains=search_term)
+        )
+
     def get_queryset(self):
         """
         Return only invoices the current user can read:
@@ -52,13 +66,15 @@ class InvoiceViewSet(ModelViewSet):
         - invoices at scope nodes where they have READ permission
           at the node or any ancestor.
         """
-        qs = Invoice.objects.select_related("scope_node", "created_by").order_by("-created_at")
+        qs = Invoice.objects.select_related("scope_node", "created_by", "vendor").order_by("-created_at")
 
         node_id = self.request.query_params.get("scope_node")
         invoice_status = self.request.query_params.get("status")
+        search_term = self.request.query_params.get("search")
         qs = self._apply_scope_filter(qs, node_id)
         if invoice_status:
             qs = qs.filter(status=invoice_status)
+        qs = self._apply_search_filter(qs, search_term)
 
         return filter_invoices_readable_for_user(self.request.user, qs)
 
@@ -68,12 +84,14 @@ class InvoiceViewSet(ModelViewSet):
         consistent with REST semantics (do not reveal resource existence to
         unauthorized users).
         """
-        queryset = Invoice.objects.select_related("scope_node", "created_by")
+        queryset = Invoice.objects.select_related("scope_node", "created_by", "vendor")
         node_id = self.request.query_params.get("scope_node")
         invoice_status = self.request.query_params.get("status")
+        search_term = self.request.query_params.get("search")
         queryset = self._apply_scope_filter(queryset, node_id)
         if invoice_status:
             queryset = queryset.filter(status=invoice_status)
+        queryset = self._apply_search_filter(queryset, search_term)
 
         # Build the list of accessible invoice IDs for this user
         accessible_ids = set(

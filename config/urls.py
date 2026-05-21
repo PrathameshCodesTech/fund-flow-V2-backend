@@ -3,6 +3,11 @@ from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
 
+# Customize Django Admin branding
+admin.site.site_header = "VIMS Administration"
+admin.site.site_title = "VIMS Admin"
+admin.site.index_title = "Horizon Industrial Parks - Vendor Invoice Management"
+
 urlpatterns = [
     path("django-admin/", admin.site.urls),
     path("api/v1/", include("apps.users.api.urls")),

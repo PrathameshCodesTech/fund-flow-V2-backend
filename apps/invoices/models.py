@@ -164,6 +164,7 @@ class VendorInvoiceSubmission(models.Model):
     source_file_hash = models.CharField(max_length=64, blank=True)
     # Extraction
     raw_extracted_data = models.JSONField(default=dict, blank=True)
+    original_normalized_data = models.JSONField(default=dict, blank=True)
     normalized_data = models.JSONField(default=dict, blank=True)
     validation_errors = models.JSONField(default=list, blank=True)
     confidence_score = models.DecimalField(
