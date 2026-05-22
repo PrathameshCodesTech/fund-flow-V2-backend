@@ -894,9 +894,16 @@ class TaskReviewView(APIView):
         from apps.invoices.models import Invoice, InvoiceDocument
         from apps.vendors.models import Vendor
 
-        def _normalize_compare(value):
+        numeric_compare_fields = {"subtotal_amount", "tax_amount", "total_amount"}
+
+        def _normalize_compare(field, value):
             if value is None:
                 return ""
+            if field in numeric_compare_fields:
+                try:
+                    return Decimal(str(value).strip())
+                except Exception:
+                    pass
             if isinstance(value, str):
                 return value.strip()
             return str(value).strip()
@@ -909,7 +916,7 @@ class TaskReviewView(APIView):
             keys = set(baseline.keys()) | set(current.keys())
             return sorted(
                 key for key in keys
-                if _normalize_compare(current.get(key)) != _normalize_compare(baseline.get(key))
+                if _normalize_compare(key, current.get(key)) != _normalize_compare(key, baseline.get(key))
             )
 
         try:
