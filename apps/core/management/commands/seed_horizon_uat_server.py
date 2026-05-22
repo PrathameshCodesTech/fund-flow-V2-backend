@@ -58,8 +58,14 @@ ROLE_SPECS = {
     "hod": {
         "name": "HOD",
         "permissions": [
+            ("create", "budget"),
             ("read", "budget"),
+            ("update", "budget"),
+            ("delete", "budget"),
+            ("create", "campaign"),
             ("read", "campaign"),
+            ("update", "campaign"),
+            ("delete", "campaign"),
             ("approve", "invoice"),
             ("create", "invoice"),
             ("read", "invoice"),

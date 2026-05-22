@@ -21,7 +21,21 @@ from apps.campaigns.services import (
 )
 from apps.budgets.services import BudgetLimitExceeded, BudgetNotActiveError
 from apps.access.selectors import get_user_actionable_scope_ids, get_user_visible_scope_ids
-from apps.access.services import user_can_act_on_scope_response
+from apps.access.services import (
+    user_can_act_on_scope_or_ancestors_response,
+    user_can_act_on_scope_response,
+    user_has_permission_including_ancestors,
+)
+from apps.core.models import ScopeNode
+
+
+def _campaign_permission_response(user, scope_node, action: str, action_label: str):
+    if not user_has_permission_including_ancestors(user, action, "campaign", scope_node):
+        return Response(
+            {"detail": f"You do not have permission to {action_label} at this scope."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -121,10 +135,16 @@ class CampaignViewSet(ModelViewSet):
         serializer.instance = campaign
 
     def create(self, request, *args, **kwargs):
-        # Explicit actionable scope check before calling super().create()
+        # Explicit actionable scope + permission check before calling create()
         scope_node_id = request.data.get("scope_node")
         if scope_node_id:
-            if err := user_can_act_on_scope_response(request.user, scope_node_id, "create a campaign"):
+            if err := user_can_act_on_scope_or_ancestors_response(request.user, scope_node_id, "create a campaign"):
+                return err
+            try:
+                scope_node = ScopeNode.objects.get(pk=scope_node_id)
+            except ScopeNode.DoesNotExist:
+                scope_node = None
+            if scope_node and (err := _campaign_permission_response(request.user, scope_node, "create", "create a campaign")):
                 return err
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -135,19 +155,25 @@ class CampaignViewSet(ModelViewSet):
 
     def update(self, request, *args, **kwargs):
         campaign = self.get_object()
-        if err := user_can_act_on_scope_response(request.user, campaign.scope_node_id, "update this campaign"):
+        if err := user_can_act_on_scope_or_ancestors_response(request.user, campaign.scope_node_id, "update this campaign"):
+            return err
+        if err := _campaign_permission_response(request.user, campaign.scope_node, "update", "update this campaign"):
             return err
         return super().update(request, *args, **kwargs)
 
     def partial_update(self, request, *args, **kwargs):
         campaign = self.get_object()
-        if err := user_can_act_on_scope_response(request.user, campaign.scope_node_id, "update this campaign"):
+        if err := user_can_act_on_scope_or_ancestors_response(request.user, campaign.scope_node_id, "update this campaign"):
+            return err
+        if err := _campaign_permission_response(request.user, campaign.scope_node, "update", "update this campaign"):
             return err
         return super().partial_update(request, *args, **kwargs)
 
     def destroy(self, request, *args, **kwargs):
         campaign = self.get_object()
-        if err := user_can_act_on_scope_response(request.user, campaign.scope_node_id, "delete this campaign"):
+        if err := user_can_act_on_scope_or_ancestors_response(request.user, campaign.scope_node_id, "delete this campaign"):
+            return err
+        if err := _campaign_permission_response(request.user, campaign.scope_node, "delete", "delete this campaign"):
             return err
         return super().destroy(request, *args, **kwargs)
 

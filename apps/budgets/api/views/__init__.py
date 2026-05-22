@@ -76,6 +76,17 @@ from apps.access.services import user_can_act_on_scope_or_ancestors_response
 from apps.core.models import ScopeNode
 
 
+def _budget_permission_response(user, scope_node, action: str, action_label: str):
+    from apps.access.services import user_has_permission_including_ancestors
+
+    if not user_has_permission_including_ancestors(user, action, "budget", scope_node):
+        return Response(
+            {"detail": f"You do not have permission to {action_label} at this scope."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Category
 # ---------------------------------------------------------------------------
@@ -261,6 +272,12 @@ class BudgetViewSet(ModelViewSet):
         if scope_node_id:
             if err := user_can_act_on_scope_or_ancestors_response(request.user, scope_node_id, "create a budget"):
                 return err
+            try:
+                scope_node = ScopeNode.objects.get(pk=scope_node_id)
+            except ScopeNode.DoesNotExist:
+                scope_node = None
+            if scope_node and (err := _budget_permission_response(request.user, scope_node, "create", "create a budget")):
+                return err
 
         serializer = BudgetCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -288,6 +305,8 @@ class BudgetViewSet(ModelViewSet):
     def update(self, request, *args, **kwargs):
         budget = self.get_object()
         if err := user_can_act_on_scope_or_ancestors_response(request.user, budget.scope_node_id, "update this budget"):
+            return err
+        if err := _budget_permission_response(request.user, budget.scope_node, "update", "update this budget"):
             return err
 
         partial = kwargs.pop("partial", False)
@@ -378,6 +397,8 @@ class BudgetViewSet(ModelViewSet):
     def destroy(self, request, *args, **kwargs):
         budget = self.get_object()
         if err := user_can_act_on_scope_or_ancestors_response(request.user, budget.scope_node_id, "delete this budget"):
+            return err
+        if err := _budget_permission_response(request.user, budget.scope_node, "delete", "delete this budget"):
             return err
         ok, reason = can_delete_budget(budget)
         if not ok:

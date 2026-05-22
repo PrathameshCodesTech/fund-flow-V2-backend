@@ -247,6 +247,7 @@ _ROLE_CAPABILITIES: dict[str, FrozenSet[str]] = {
         "campaign.view",
         "campaign.create",
         "campaign.edit",
+        "campaign.manage",
         "vendor.view",
         "workflow.task.view",
         "workflow.step.approve",
