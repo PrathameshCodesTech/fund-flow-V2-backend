@@ -18,7 +18,8 @@ from apps.manual_expenses.api.serializers import (
     CancelExpenseSerializer,
 )
 from apps.manual_expenses import services
-from apps.access.selectors import get_user_visible_scope_ids, get_user_actionable_scope_ids
+from apps.access.selectors import get_user_visible_scope_ids
+from apps.manual_expenses.access import get_user_manual_expense_scope_ids
 
 
 class ManualExpenseViewSet(viewsets.ModelViewSet):
@@ -26,7 +27,7 @@ class ManualExpenseViewSet(viewsets.ModelViewSet):
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
-        context["actionable_scope_ids"] = get_user_actionable_scope_ids(self.request.user)
+        context["manual_expense_scope_ids"] = get_user_manual_expense_scope_ids(self.request.user)
         return context
 
     def get_serializer_class(self):
@@ -76,18 +77,18 @@ class ManualExpenseViewSet(viewsets.ModelViewSet):
         return qs
 
     def perform_create(self, serializer):
-        actionable_ids = get_user_actionable_scope_ids(self.request.user)
-        if not actionable_ids:
+        manual_expense_scope_ids = get_user_manual_expense_scope_ids(self.request.user)
+        if not manual_expense_scope_ids:
             raise PermissionDenied("You do not have permission to create manual expenses.")
 
         scope_node = serializer.validated_data.get("scope_node")
         if scope_node is None:
-            if len(actionable_ids) != 1:
+            if len(manual_expense_scope_ids) != 1:
                 raise ValidationError({"scope_node": "Scope node is required when you have access to multiple scopes."})
             from apps.core.models import ScopeNode
-            scope_node = ScopeNode.objects.only("id", "org_id").get(pk=actionable_ids[0])
+            scope_node = ScopeNode.objects.only("id", "org_id").get(pk=manual_expense_scope_ids[0])
 
-        if scope_node.id not in actionable_ids:
+        if scope_node.id not in manual_expense_scope_ids:
             raise PermissionDenied("You do not have permission to create manual expenses at this scope.")
 
         org = scope_node.org
@@ -152,8 +153,8 @@ class ManualExpenseViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def settle(self, request, pk=None):
         expense = self.get_object()
-        actionable_scope_ids = get_user_actionable_scope_ids(request.user)
-        if expense.scope_node_id not in actionable_scope_ids:
+        manual_expense_scope_ids = get_user_manual_expense_scope_ids(request.user)
+        if expense.scope_node_id not in manual_expense_scope_ids:
             return Response(
                 {"detail": "You do not have permission to settle this expense."},
                 status=status.HTTP_403_FORBIDDEN,
@@ -168,10 +169,10 @@ class ManualExpenseViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
         expense = self.get_object()
-        actionable_scope_ids = get_user_actionable_scope_ids(request.user)
+        manual_expense_scope_ids = get_user_manual_expense_scope_ids(request.user)
         can_cancel = (
             expense.status == ExpenseStatus.DRAFT and expense.created_by_id == request.user.id
-        ) or expense.scope_node_id in actionable_scope_ids
+        ) or expense.scope_node_id in manual_expense_scope_ids
         if not can_cancel:
             return Response(
                 {"detail": "You do not have permission to cancel this expense."},
@@ -211,11 +212,11 @@ class ManualExpenseAttachmentViewSet(
                 {"detail": "expense_entry is required."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        actionable_scope_ids = get_user_actionable_scope_ids(request.user)
+        manual_expense_scope_ids = get_user_manual_expense_scope_ids(request.user)
         try:
             expense = ManualExpenseEntry.objects.get(
                 pk=expense_id,
-                scope_node_id__in=actionable_scope_ids,
+                scope_node_id__in=manual_expense_scope_ids,
             )
         except ManualExpenseEntry.DoesNotExist:
             return Response(
@@ -250,10 +251,10 @@ class ManualExpenseAttachmentViewSet(
     def destroy(self, request, *args, **kwargs):
         attachment = self.get_object()
         expense = attachment.expense_entry
-        actionable_scope_ids = get_user_actionable_scope_ids(request.user)
+        manual_expense_scope_ids = get_user_manual_expense_scope_ids(request.user)
         can_delete = (
             expense.status == ExpenseStatus.DRAFT and expense.created_by_id == request.user.id
-        ) or expense.scope_node_id in actionable_scope_ids
+        ) or expense.scope_node_id in manual_expense_scope_ids
         if not can_delete:
             return Response(
                 {"detail": "You do not have permission to delete this attachment."},

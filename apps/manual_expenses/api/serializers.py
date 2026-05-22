@@ -177,8 +177,8 @@ class ManualExpenseCreateSerializer(serializers.ModelSerializer):
         category = attrs.get("category") or getattr(self.instance, "category", None)
         subcategory = attrs.get("subcategory") or getattr(self.instance, "subcategory", None)
 
-        actionable_scope_ids = self.context.get("actionable_scope_ids", [])
-        if scope_node and actionable_scope_ids and scope_node.id not in actionable_scope_ids:
+        manual_expense_scope_ids = self.context.get("manual_expense_scope_ids", [])
+        if scope_node and manual_expense_scope_ids and scope_node.id not in manual_expense_scope_ids:
             raise serializers.ValidationError(
                 {"scope_node": "You do not have permission to create or edit expenses at this scope."}
             )
