@@ -21,7 +21,7 @@ EMAIL_USE_TLS = True
 EMAIL_USE_SSL = False
 EMAIL_TIMEOUT = 10
 EMAIL_HOST_USER = "solodevbuilds@gmail.com"
-EMAIL_HOST_PASSWORD = "qouh exkt ywep gwxq"
+EMAIL_HOST_PASSWORD = "mcve rnxb rnrz kxuy"
 DEFAULT_FROM_EMAIL = "VIMS <solodevbuilds@gmail.com>"
 
 # Vendor portal

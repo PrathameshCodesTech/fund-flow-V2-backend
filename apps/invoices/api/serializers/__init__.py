@@ -128,6 +128,17 @@ class VendorInvoiceSubmissionSerializer(serializers.ModelSerializer):
     documents = serializers.SerializerMethodField()
     send_to_route_id = serializers.IntegerField(source="send_to_route.id", read_only=True, default=None)
     send_to_route_label = serializers.CharField(source="send_to_route.label", read_only=True, default=None)
+    final_invoice_status = serializers.CharField(source="final_invoice.status", read_only=True, default=None)
+    final_invoice_title = serializers.CharField(source="final_invoice.title", read_only=True, default=None)
+    final_invoice_amount = serializers.DecimalField(
+        source="final_invoice.amount",
+        max_digits=14,
+        decimal_places=2,
+        read_only=True,
+        allow_null=True,
+        default=None,
+    )
+    final_invoice_currency = serializers.CharField(source="final_invoice.currency", read_only=True, default=None)
 
     class Meta:
         model = VendorInvoiceSubmission
@@ -143,6 +154,7 @@ class VendorInvoiceSubmissionSerializer(serializers.ModelSerializer):
             "correction_note", "correction_requested_by", "correction_requested_by_name",
             "correction_requested_at",
             "final_invoice", "final_invoice_id",
+            "final_invoice_status", "final_invoice_title", "final_invoice_amount", "final_invoice_currency",
             "send_to_route_id", "send_to_route_label",
             "documents",
             "created_at", "updated_at", "submitted_at",
