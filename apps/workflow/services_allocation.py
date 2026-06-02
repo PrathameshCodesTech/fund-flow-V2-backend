@@ -37,10 +37,16 @@ def _scope_matches_entity_or_descendant(entity, scope_node) -> bool:
 
     Parent-scope budgets are excluded so single-allocation follows the same
     BU-owned budget model as runtime split.
+
+    The check requires exact match OR descendant (with trailing slash) to prevent
+    "Farukhnagar I" from matching "Farukhnagar II" via prefix collision.
     """
     if not scope_node:
         return False
-    return scope_node.path.startswith(entity.path)
+    return (
+        scope_node.path == entity.path
+        or scope_node.path.startswith(entity.path + "/")
+    )
 
 
 # ---------------------------------------------------------------------------

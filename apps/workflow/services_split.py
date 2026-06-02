@@ -68,10 +68,16 @@ def _scope_matches_entity_or_descendant(entity, scope_node) -> bool:
 
     This enforces BU-owned budget behavior. Parent-scope budgets are no longer
     considered valid funding sources for child BU allocations.
+
+    The check requires exact match OR descendant (with trailing slash) to prevent
+    "Farukhnagar I" from matching "Farukhnagar II" via prefix collision.
     """
     if not scope_node:
         return False
-    return scope_node.path.startswith(entity.path)
+    return (
+        scope_node.path == entity.path
+        or scope_node.path.startswith(entity.path + "/")
+    )
 
 
 def _get_active_branch_children(entity):
