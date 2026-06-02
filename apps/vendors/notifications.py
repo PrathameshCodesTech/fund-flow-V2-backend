@@ -28,8 +28,11 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 def _get_logo_url() -> str:
-    base_url = getattr(settings, "FUND_FLOW_BASE_URL", "http://localhost:3000").rstrip("/")
-    return f"{base_url}/hp.jpg"
+    return getattr(
+        settings,
+        "EMAIL_BRAND_LOGO_URL",
+        f"{getattr(settings, 'FUND_FLOW_BASE_URL', 'http://localhost:3000').rstrip('/')}/hp.jpg",
+    )
 
 
 # ---------------------------------------------------------------------------

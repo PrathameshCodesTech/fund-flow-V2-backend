@@ -87,6 +87,10 @@ DEFAULT_FROM_EMAIL = config("DEFAULT_FROM_EMAIL", default="Horizon Industrial Pa
 
 # Vendor settings
 FUND_FLOW_BASE_URL = config("FUND_FLOW_BASE_URL", default="http://localhost:5173")
+EMAIL_BRAND_LOGO_URL = config(
+    "EMAIL_BRAND_LOGO_URL",
+    default=f"{FUND_FLOW_BASE_URL.rstrip('/')}/hp.jpg",
+)
 VENDOR_FINANCE_RECIPIENTS = config(
     "VENDOR_FINANCE_RECIPIENTS", default="finance@example.com"
 ).split(",")

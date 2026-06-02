@@ -12,9 +12,11 @@ _BRAND_NAME = "HORIZON"
 _BRAND_FULL = "Horizon Industrial Parks"
 
 def _get_logo_url() -> str:
-    from django.conf import settings
-    base_url = getattr(settings, "FUND_FLOW_BASE_URL", "http://localhost:3000").rstrip("/")
-    return f"{base_url}/hp.jpg"
+    return getattr(
+        settings,
+        "EMAIL_BRAND_LOGO_URL",
+        f"{getattr(settings, 'FUND_FLOW_BASE_URL', 'http://localhost:3000').rstrip('/')}/hp.jpg",
+    )
 
 def _get_logo_html(height: str = "32") -> str:
     return f'<img src="{_get_logo_url()}" alt="Horizon Industrial Parks" style="height:{height}px;width:auto;">'
