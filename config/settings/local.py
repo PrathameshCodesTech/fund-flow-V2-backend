@@ -22,7 +22,7 @@ EMAIL_USE_SSL = False
 EMAIL_TIMEOUT = 10
 EMAIL_HOST_USER = "solodevbuilds@gmail.com"
 EMAIL_HOST_PASSWORD = "mcve rnxb rnrz kxuy"
-DEFAULT_FROM_EMAIL = "VIMS <solodevbuilds@gmail.com>"
+DEFAULT_FROM_EMAIL = "Horizon Industrial Parks <solodevbuilds@gmail.com>"
 
 # Vendor portal
 VENDOR_PORTAL_BASE_URL = "http://localhost:8080"

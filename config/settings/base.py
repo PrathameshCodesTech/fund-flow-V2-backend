@@ -83,7 +83,7 @@ EMAIL_USE_SSL = config("EMAIL_USE_SSL", default=False, cast=bool)
 EMAIL_TIMEOUT = config("EMAIL_TIMEOUT", default=30, cast=int)
 EMAIL_HOST_USER = config("EMAIL_HOST_USER", default="")
 EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD", default="")
-DEFAULT_FROM_EMAIL = config("DEFAULT_FROM_EMAIL", default="VIMS <no-reply@vims.local>")
+DEFAULT_FROM_EMAIL = config("DEFAULT_FROM_EMAIL", default="Horizon Industrial Parks <no-reply@horizon.local>")
 
 # Vendor settings
 FUND_FLOW_BASE_URL = config("FUND_FLOW_BASE_URL", default="http://localhost:5173")
