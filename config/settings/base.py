@@ -86,12 +86,15 @@ EMAIL_HOST_PASSWORD = config("EMAIL_HOST_PASSWORD", default="")
 DEFAULT_FROM_EMAIL = config("DEFAULT_FROM_EMAIL", default="VIMS <no-reply@vims.local>")
 
 # Vendor settings
+FUND_FLOW_BASE_URL = config("FUND_FLOW_BASE_URL", default="http://localhost:5173")
 VENDOR_FINANCE_RECIPIENTS = config(
     "VENDOR_FINANCE_RECIPIENTS", default="finance@example.com"
 ).split(",")
 VENDOR_FINANCE_BASE_URL = config("VENDOR_FINANCE_BASE_URL", default="http://localhost:8000")
 VENDOR_PORTAL_BASE_URL = config("VENDOR_PORTAL_BASE_URL", default="http://localhost:5173")
+FINANCE_REVIEW_BASE_URL = config("FINANCE_REVIEW_BASE_URL", default=VENDOR_PORTAL_BASE_URL)
 VENDOR_FINANCE_TOKEN_EXPIRY_HOURS = config("VENDOR_FINANCE_TOKEN_EXPIRY_HOURS", default=72, cast=int)
+VENDOR_MSME_TESSERACT_CMD = config("VENDOR_MSME_TESSERACT_CMD", default="")
 
 # Azure Document Intelligence
 AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT = config("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT", default="")

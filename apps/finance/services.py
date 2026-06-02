@@ -105,13 +105,15 @@ def _resolve_invoice_finance_recipients(handoff: FinanceHandoff) -> list[str]:
             f"Cannot resolve recipients: Invoice scope node has no organisation."
         )
 
-    # Walk up scope chain: entity -> company -> org root
-    scope_ids = [scope_node.id]
-    if hasattr(scope_node, "path") and scope_node.path:
-        from apps.core.services import get_ancestors
-        for ancestor in get_ancestors(scope_node):
-            if ancestor.id not in scope_ids:
-                scope_ids.append(ancestor.id)
+    # Walk up scope chain: branch/region -> department/company/org root.
+    # Some seeded scope trees do not populate `path`, so walk parent pointers
+    # directly instead of using the path-based ancestor helper.
+    scope_ids = []
+    current = scope_node
+    while current:
+        if current.id not in scope_ids:
+            scope_ids.append(current.id)
+        current = getattr(current, "parent", None)
 
     # Get finance role codes
     role_codes = _get_finance_role_codes()
@@ -496,7 +498,9 @@ def send_finance_handoff(
         getattr(settings, "VENDOR_PORTAL_BASE_URL", "http://localhost:3000"),
     ).rstrip("/")
     approve_url = f"{review_base_url}/finance/review/{approve_token.token}"
-    reject_url = f"{review_base_url}/finance/review/{reject_token.token}"
+    # Finance emails expose one review entry point. The opened review page
+    # receives the paired reject token from the API payload.
+    reject_url = approve_url
 
     subject_name = _get_subject_name(handoff)
 
@@ -579,11 +583,31 @@ def finance_approve_handoff(
         HandoffStateError — handoff is not in a sendable state
         ValueError       — reference_id is empty
     """
+    token = _get_valid_finance_token(token_str, expected_action=FinanceActionType.APPROVE)
+    return approve_finance_handoff(
+        handoff=token.handoff,
+        reference_id=reference_id,
+        note=note,
+        token=token,
+        actor=None,
+    )
+
+
+@transaction.atomic
+def approve_finance_handoff(
+    handoff: FinanceHandoff,
+    reference_id: str,
+    note: str = "",
+    token: FinanceActionToken | None = None,
+    actor=None,
+) -> tuple[FinanceHandoff, FinanceDecision]:
+    """
+    Record a finance approval for a handoff.
+
+    Shared by public email-token links and authenticated finance portal actions.
+    """
     if not reference_id or not reference_id.strip():
         raise ValueError("reference_id is required for finance approval.")
-
-    token = _get_valid_finance_token(token_str, expected_action=FinanceActionType.APPROVE)
-    handoff = token.handoff
 
     if handoff.status not in (FinanceHandoffStatus.PENDING, FinanceHandoffStatus.SENT):
         raise HandoffStateError(
@@ -594,9 +618,12 @@ def finance_approve_handoff(
 
     now = timezone.now()
 
-    # Mark token used
-    token.used_at = now
-    token.save(update_fields=["used_at"])
+    # Authenticated portal decisions invalidate outstanding email links.
+    if token is not None:
+        token.used_at = now
+        token.save(update_fields=["used_at"])
+    else:
+        handoff.action_tokens.filter(used_at__isnull=True).update(used_at=now)
 
     # Record decision
     decision = FinanceDecision.objects.create(
@@ -622,7 +649,7 @@ def finance_approve_handoff(
     _notify_finance_decision(handoff, decision)
 
     _build_audit_log(
-        user=None,
+        user=actor,
         action="finance_handoff_approved",
         resource_type="FinanceHandoff",
         resource_id=handoff.pk,
@@ -659,7 +686,26 @@ def finance_reject_handoff(
         HandoffStateError — handoff is not in a sendable state
     """
     token = _get_valid_finance_token(token_str, expected_action=FinanceActionType.REJECT)
-    handoff = token.handoff
+    return reject_finance_handoff(
+        handoff=token.handoff,
+        note=note,
+        token=token,
+        actor=None,
+    )
+
+
+@transaction.atomic
+def reject_finance_handoff(
+    handoff: FinanceHandoff,
+    note: str = "",
+    token: FinanceActionToken | None = None,
+    actor=None,
+) -> tuple[FinanceHandoff, FinanceDecision]:
+    """
+    Record a finance rejection for a handoff.
+
+    Shared by public email-token links and authenticated finance portal actions.
+    """
 
     if handoff.status not in (FinanceHandoffStatus.PENDING, FinanceHandoffStatus.SENT):
         raise HandoffStateError(
@@ -670,9 +716,12 @@ def finance_reject_handoff(
 
     now = timezone.now()
 
-    # Mark token used
-    token.used_at = now
-    token.save(update_fields=["used_at"])
+    # Authenticated portal decisions invalidate outstanding email links.
+    if token is not None:
+        token.used_at = now
+        token.save(update_fields=["used_at"])
+    else:
+        handoff.action_tokens.filter(used_at__isnull=True).update(used_at=now)
 
     # Record decision
     decision = FinanceDecision.objects.create(
@@ -699,7 +748,7 @@ def finance_reject_handoff(
             from apps.workflow.services import return_invoice_workflow_for_finance_rework
             return_invoice_workflow_for_finance_rework(
                 invoice_id=handoff.subject_id,
-                acted_by=None,
+                acted_by=actor,
                 note=note,
             )
         except Exception as exc:
@@ -712,7 +761,7 @@ def finance_reject_handoff(
     _notify_finance_decision(handoff, decision)
 
     _build_audit_log(
-        user=None,
+        user=actor,
         action="finance_handoff_rejected",
         resource_type="FinanceHandoff",
         resource_id=handoff.pk,

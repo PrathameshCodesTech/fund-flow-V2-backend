@@ -889,6 +889,207 @@ class TaskReviewView(APIView):
             })
         return result
 
+    @staticmethod
+    def _display_name(user):
+        if not user:
+            return None
+        full_name = (user.get_full_name() or "").strip()
+        if full_name:
+            return full_name.split()[0]
+        if user.email:
+            return user.email.split("@")[0]
+        return None
+
+    def _business_event(self, key, label, created_at, actor=None, metadata=None):
+        if not created_at:
+            return None
+        return {
+            "id": key,
+            "label": label,
+            "actor": self._user_dict(actor),
+            "created_at": created_at,
+            "metadata": metadata or {},
+        }
+
+    def _build_invoice_business_timeline(self, instance):
+        """
+        Client-facing invoice milestones.
+
+        Raw workflow_events remain the audit source. This list intentionally hides
+        technical workflow mechanics such as assignments, budget reservations, and
+        split/join events.
+        """
+        if instance.subject_type != "invoice":
+            return []
+
+        from apps.finance.models import FinanceDecision, FinanceDecisionChoice, FinanceHandoff
+        from apps.invoices.models import Invoice
+
+        try:
+            invoice = (
+                Invoice.objects
+                .select_related("created_by", "submission", "submission__submitted_by")
+                .get(pk=instance.subject_id)
+            )
+        except Invoice.DoesNotExist:
+            return []
+
+        events = []
+        submission = getattr(invoice, "submission", None)
+        vendor_upload_at = (
+            submission.created_at
+            if submission is not None
+            else invoice.created_at
+        )
+        vendor_upload_actor = (
+            submission.submitted_by
+            if submission is not None
+            else invoice.created_by
+        )
+        upload_event = self._business_event(
+            "vendor-upload-invoice",
+            "Vendor Upload Invoice",
+            vendor_upload_at,
+            vendor_upload_actor,
+        )
+        if upload_event:
+            events.append(upload_event)
+
+        approved_steps = (
+            instance.instance_groups
+            .select_related("step_group")
+            .prefetch_related(
+                "instance_steps__workflow_step",
+                "instance_steps__assigned_user",
+                "instance_steps__branches__assigned_user",
+            )
+            .order_by("display_order")
+        )
+
+        seen_approval_keys = set()
+        for group in approved_steps:
+            for step in group.instance_steps.all():
+                if step.status == "APPROVED" and step.acted_at and step.assigned_user_id:
+                    if step.workflow_step.step_kind in (
+                        StepKind.RUNTIME_SPLIT_ALLOCATION,
+                        StepKind.SINGLE_ALLOCATION,
+                    ):
+                        continue
+                    actor_name = self._display_name(step.assigned_user) or "Approver"
+                    key = f"step-approved-{step.id}"
+                    seen_approval_keys.add(("step", step.id))
+                    events.append(self._business_event(
+                        key,
+                        f"{actor_name} Approved Date",
+                        step.acted_at,
+                        step.assigned_user,
+                        {
+                            "source": "workflow_step",
+                            "step_name": step.workflow_step.name,
+                            "group_name": group.step_group.name,
+                        },
+                    ))
+
+                branch_groups = {}
+                for branch in step.branches.all():
+                    if branch.status != "APPROVED" or not branch.acted_at or not branch.assigned_user_id:
+                        continue
+                    actor_id = branch.assigned_user_id
+                    existing = branch_groups.get(actor_id)
+                    if existing is None or branch.acted_at > existing.acted_at:
+                        branch_groups[actor_id] = branch
+
+                for branch in branch_groups.values():
+                    actor_name = self._display_name(branch.assigned_user) or "Approver"
+                    key = f"branch-approved-{step.id}-{branch.assigned_user_id}"
+                    if ("branch", step.id, branch.assigned_user_id) in seen_approval_keys:
+                        continue
+                    seen_approval_keys.add(("branch", step.id, branch.assigned_user_id))
+                    events.append(self._business_event(
+                        key,
+                        f"{actor_name} Approved Date",
+                        branch.acted_at,
+                        branch.assigned_user,
+                        {
+                            "source": "workflow_branch",
+                            "step_name": step.workflow_step.name,
+                            "group_name": group.step_group.name,
+                        },
+                    ))
+
+        finance_decision = (
+            FinanceDecision.objects
+            .filter(
+                handoff__module="invoice",
+                handoff__subject_type="invoice",
+                handoff__subject_id=invoice.id,
+                decision=FinanceDecisionChoice.APPROVED,
+            )
+            .select_related("handoff")
+            .order_by("-acted_at", "-id")
+            .first()
+        )
+        if finance_decision:
+            events.append(self._business_event(
+                f"finance-approved-{finance_decision.id}",
+                "Finance Approved Date",
+                finance_decision.acted_at,
+                None,
+                {
+                    "source": "finance_decision",
+                    "handoff_id": finance_decision.handoff_id,
+                    "reference_id": finance_decision.reference_id,
+                },
+            ))
+        else:
+            approved_handoff = (
+                FinanceHandoff.objects
+                .filter(
+                    module="invoice",
+                    subject_type="invoice",
+                    subject_id=invoice.id,
+                    status="finance_approved",
+                )
+                .order_by("-updated_at", "-id")
+                .first()
+            )
+            if approved_handoff:
+                events.append(self._business_event(
+                    f"finance-approved-handoff-{approved_handoff.id}",
+                    "Finance Approved Date",
+                    approved_handoff.updated_at,
+                    None,
+                    {
+                        "source": "finance_handoff",
+                        "handoff_id": approved_handoff.id,
+                        "reference_id": approved_handoff.finance_reference_id,
+                    },
+                ))
+
+        try:
+            payment = invoice.payment_record
+        except Exception:
+            payment = None
+        if payment:
+            payment_event_at = payment.updated_at or payment.recorded_at or payment.created_at
+            events.append(self._business_event(
+                f"finance-payment-update-{payment.id}",
+                "Finance Payment Update",
+                payment_event_at,
+                payment.updated_by or payment.recorded_by,
+                {
+                    "source": "invoice_payment",
+                    "payment_status": payment.payment_status,
+                    "payment_reference_number": payment.payment_reference_number,
+                    "utr_number": payment.utr_number,
+                },
+            ))
+
+        return sorted(
+            [event for event in events if event],
+            key=lambda event: event["created_at"],
+        )
+
     def _build_invoice_subject(self, request, instance):
         """Fetch and shape invoice + vendor + documents for the review payload."""
         from apps.invoices.models import Invoice, InvoiceDocument
@@ -1359,6 +1560,7 @@ class TaskReviewView(APIView):
             "subject": self._build_subject(request, instance),
             "workflow": self._build_workflow_context(instance, current_step_id=ist.id),
             "timeline": self._build_timeline(instance),
+            "business_timeline": self._build_invoice_business_timeline(instance),
             "allocation_context": allocation_context,
             "allocation_audit": allocation_audit,
         })
@@ -1428,6 +1630,7 @@ class TaskReviewView(APIView):
                 current_branch_id=branch.id,
             ),
             "timeline": self._build_timeline(instance),
+            "business_timeline": self._build_invoice_business_timeline(instance),
             "branch_allocation": branch_allocation,
             "allocation_audit": allocation_audit,
         })

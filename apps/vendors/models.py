@@ -72,13 +72,36 @@ class VendorProfileRevisionStatus(models.TextChoices):
 # Attachment document type constants
 # ---------------------------------------------------------------------------
 
-#: Allowed document_type values for VendorAttachment on the vendor portal.
-ALLOWED_ATTACHMENT_DOCUMENT_TYPES: set[str] = {
+ACTIVE_VENDOR_ATTACHMENT_DOCUMENT_TYPES: set[str] = {
     "msme_declaration_form",
     "msme_registration_certificate",
     "cancelled_cheque",
     "pan_copy",
     "gst_certificate",
+}
+
+REQUIRED_VENDOR_ATTACHMENT_DOCUMENT_TYPES: tuple[str, ...] = (
+    "gst_certificate",
+    "pan_copy",
+    "cancelled_cheque",
+)
+
+REQUIRED_MSME_ATTACHMENT_DOCUMENT_TYPES: tuple[str, ...] = (
+    "msme_declaration_form",
+    "msme_registration_certificate",
+)
+
+VENDOR_ATTACHMENT_DOCUMENT_TYPE_LABELS: dict[str, str] = {
+    "gst_certificate": "GST Certificate",
+    "pan_copy": "PAN Copy",
+    "cancelled_cheque": "Cancelled Cheque",
+    "msme_declaration_form": "MSME Declaration Form",
+    "msme_registration_certificate": "MSME Registration Certificate (UDYAM)",
+}
+
+#: Allowed document_type values for existing/read-only VendorAttachment records.
+ALLOWED_ATTACHMENT_DOCUMENT_TYPES: set[str] = {
+    *ACTIVE_VENDOR_ATTACHMENT_DOCUMENT_TYPES,
     "bank_proof",
     "supporting_document",
     # Legacy/generic types already stored in production
@@ -189,8 +212,12 @@ class VendorOnboardingSubmission(models.Model):
     # Bank — core
     normalized_preferred_payment_mode = models.CharField(max_length=100, blank=True)
     normalized_beneficiary_name = models.CharField(max_length=255, blank=True)
+    normalized_beneficiary_account_number = models.CharField(max_length=50, blank=True)
     normalized_bank_name = models.CharField(max_length=255, blank=True)
+    normalized_bank_address = models.CharField(max_length=255, blank=True)
+    normalized_bank_email = models.EmailField(blank=True)
     normalized_account_number = models.CharField(max_length=50, blank=True)
+    normalized_bank_account_number = models.CharField(max_length=50, blank=True)
     normalized_bank_account_type = models.CharField(max_length=100, blank=True)
     normalized_ifsc = models.CharField(max_length=20, blank=True)
     normalized_micr_code = models.CharField(max_length=20, blank=True)
@@ -382,8 +409,12 @@ class Vendor(models.Model):
     # Bank core
     preferred_payment_mode = models.CharField(max_length=100, blank=True)
     beneficiary_name = models.CharField(max_length=255, blank=True)
+    beneficiary_account_number = models.CharField(max_length=50, blank=True)
     bank_name = models.CharField(max_length=255, blank=True)
+    bank_address = models.CharField(max_length=255, blank=True)
+    bank_email = models.EmailField(blank=True)
     account_number = models.CharField(max_length=50, blank=True)
+    bank_account_number = models.CharField(max_length=50, blank=True)
     bank_account_type = models.CharField(max_length=100, blank=True)
     ifsc = models.CharField(max_length=20, blank=True)
     micr_code = models.CharField(max_length=20, blank=True)

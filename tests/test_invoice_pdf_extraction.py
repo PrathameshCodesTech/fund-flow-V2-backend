@@ -30,9 +30,8 @@ Tax portion (e.g. 1800). Total = Subtotal + Tax.
 Total Amount
 Grand total = Subtotal + Tax. Auto-calculated if using Excel.
 PO Number
-Required if your vendor account has PO mandate enabled.
-Note: The PO Number field above is only mandatory if your vendor account has PO mandate enabled. Check your vendor profile or contact
-support to confirm.
+Optional purchase order reference, if available.
+Note: The PO Number field is optional. Add it only if your invoice has one.
 How to Submit
 1
 Fill in all fields. Print or save this PDF.

@@ -34,7 +34,6 @@ from apps.vendors.services import (
     FinanceTokenError,
     InvitationExpiredError,
     InvitationNotFoundError,
-    POMandate,
     SubmissionStateError,
     VendorStateError,
     approve_vendor_marketing,
@@ -575,10 +574,12 @@ class TestMarketingApprove:
 
     def test_marketing_approve_activates(self, invitation, manual_payload, actor):
         vendor = self._get_vendor_in_waiting(invitation, manual_payload)
-        updated = approve_vendor_marketing(vendor, approved_by=actor, po_mandate_enabled=True)
+        vendor.po_mandate_enabled = True
+        vendor.save(update_fields=["po_mandate_enabled"])
+        updated = approve_vendor_marketing(vendor, approved_by=actor)
         assert updated.operational_status == OperationalStatus.ACTIVE
         assert updated.marketing_status == MarketingStatus.APPROVED
-        assert updated.po_mandate_enabled is True
+        assert updated.po_mandate_enabled is False
 
     def test_marketing_approve_sets_submission_activated(self, invitation, manual_payload, actor):
         vendor = self._get_vendor_in_waiting(invitation, manual_payload)
@@ -667,11 +668,11 @@ class TestAssertVendorCanSubmitInvoice:
 
 
 # ---------------------------------------------------------------------------
-# 15. assert_vendor_can_submit_invoice enforces PO mandate
+# 15. PO number remains optional for active vendors
 # ---------------------------------------------------------------------------
 
 class TestPOMandate:
-    def test_po_mandate_enforced_when_enabled(self, entity, org):
+    def test_po_mandate_flag_does_not_block_without_po(self, entity, org):
         vendor = Vendor.objects.create(
             scope_node=entity, org=org,
             vendor_name="PO Vendor", sap_vendor_id="SAP-PO",
@@ -679,8 +680,7 @@ class TestPOMandate:
             marketing_status=MarketingStatus.APPROVED,
             po_mandate_enabled=True,
         )
-        with pytest.raises(POMandate):
-            assert_vendor_can_submit_invoice(vendor, po_number=None)
+        assert_vendor_can_submit_invoice(vendor, po_number=None)
 
     def test_po_mandate_passes_when_po_provided(self, entity, org):
         vendor = Vendor.objects.create(
@@ -777,7 +777,7 @@ class TestFinanceReviewExcelGeneration:
 
 
 # ---------------------------------------------------------------------------
-# 18. Finance email passes approve_url + reject_url as separate buttons
+# 18. Finance email passes one review URL for both actions
 # ---------------------------------------------------------------------------
 
 class TestFinanceEmailActionUrls:
@@ -800,7 +800,7 @@ class TestFinanceEmailActionUrls:
     @patch("apps.vendors.services._send_invitation_email")
     @patch("apps.vendors.notifications.send_finance_handoff_notification")
     def test_send_to_finance_passes_reject_url(self, mock_notif, mock_inv_email, invitation, manual_payload, tmp_path, settings):
-        """send_finance_email must be called with reject_url pointing to the reject token."""
+        """send_finance_email keeps reject_url for compatibility, pointing to the review URL."""
         settings.MEDIA_ROOT = str(tmp_path)
         submission = create_or_update_submission_from_manual(invitation, manual_payload)
         submission.status = "submitted"
@@ -815,8 +815,8 @@ class TestFinanceEmailActionUrls:
 
     @patch("apps.vendors.services._send_invitation_email")
     @patch("apps.vendors.notifications.send_finance_handoff_notification")
-    def test_approve_and_reject_urls_are_different(self, mock_notif, mock_inv_email, invitation, manual_payload, tmp_path, settings):
-        """approve_url and reject_url must point to different tokens."""
+    def test_approve_and_reject_urls_are_same_review_entrypoint(self, mock_notif, mock_inv_email, invitation, manual_payload, tmp_path, settings):
+        """Finance email exposes one review entry point; the page chooses approve/reject."""
         settings.MEDIA_ROOT = str(tmp_path)
         submission = create_or_update_submission_from_manual(invitation, manual_payload)
         submission.status = "submitted"
@@ -824,7 +824,7 @@ class TestFinanceEmailActionUrls:
         with patch("apps.vendors.email.send_finance_email") as mock_email:
             send_submission_to_finance(submission)
             kwargs = mock_email.call_args[1] if mock_email.call_args[1] else {}
-            assert kwargs.get("approve_url") != kwargs.get("reject_url")
+            assert kwargs.get("approve_url") == kwargs.get("reject_url")
 
 
 # ---------------------------------------------------------------------------

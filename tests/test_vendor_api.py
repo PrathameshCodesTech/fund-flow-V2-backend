@@ -433,12 +433,12 @@ class TestMarketingApproveEndpoint:
 
         response = client_auth.post(
             f"/api/v1/vendors/{vendor.id}/marketing-approve/",
-            {"po_mandate_enabled": True},
+            {},
             format="json",
         )
         assert response.status_code == http_status.HTTP_200_OK
         assert response.data["operational_status"] == OperationalStatus.ACTIVE
-        assert response.data["po_mandate_enabled"] is True
+        assert response.data["po_mandate_enabled"] is False
 
     def test_marketing_approve_wrong_state_returns_400(self, client_auth, entity, org):
         vendor = Vendor.objects.create(

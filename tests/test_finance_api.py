@@ -143,7 +143,7 @@ def _build_sent_handoff(invoice_or_campaign, entity, user, mock_email):
 # ---------------------------------------------------------------------------
 
 def test_public_token_metadata_approve(client_anon, invoice, entity, user, mock_email):
-    h, approve_tok, _ = _build_sent_handoff(invoice, entity, user, mock_email)
+    h, approve_tok, reject_tok = _build_sent_handoff(invoice, entity, user, mock_email)
 
     resp = client_anon.get(f"/api/v1/finance/public/{approve_tok.token}/")
     assert resp.status_code == http_status.HTTP_200_OK
@@ -154,6 +154,7 @@ def test_public_token_metadata_approve(client_anon, invoice, entity, user, mock_
     assert data["module"] == "invoice"
     assert data["subject_name"] == "API Test Invoice"
     assert data["handoff_status"] == "sent"
+    assert data["reject_token"] == reject_tok.token
 
 
 def test_public_token_metadata_reject(client_anon, invoice, entity, user, mock_email):
@@ -163,6 +164,7 @@ def test_public_token_metadata_reject(client_anon, invoice, entity, user, mock_e
     assert resp.status_code == http_status.HTTP_200_OK
     data = resp.json()
     assert data["action_type"] == "reject"
+    assert data["reject_token"] is None
 
 
 def test_public_token_metadata_unknown(db, client_anon):

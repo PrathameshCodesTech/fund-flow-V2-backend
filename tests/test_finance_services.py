@@ -194,8 +194,8 @@ def test_send_handoff_calls_email(db, invoice, entity, user, mock_email):
     call_kwargs = mock_email.call_args.kwargs
     assert call_kwargs["module"] == "invoice"
     assert call_kwargs["subject_name"] == "Test Invoice"
-    assert "/approve/" in call_kwargs["approve_url"]
-    assert "/reject/" in call_kwargs["reject_url"]
+    assert "/finance/review/" in call_kwargs["approve_url"]
+    assert call_kwargs["reject_url"] == call_kwargs["approve_url"]
 
 
 def test_send_handoff_not_pending_raises(db, invoice, entity, user, mock_email):

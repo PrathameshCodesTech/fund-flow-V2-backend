@@ -10,6 +10,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.vendors.models import (
+    FinanceActionType,
     SubmissionStatus,
     Vendor,
     VendorAttachment,
@@ -24,6 +25,7 @@ from apps.vendors.services import (
     POMandate,
     SubmissionStateError,
     VendorStateError,
+    approve_vendor_submission_finance,
     approve_vendor_marketing,
     attach_document,
     create_or_update_submission_from_excel,
@@ -34,6 +36,8 @@ from apps.vendors.services import (
     finalize_submission,
     get_invitation_by_token,
     reject_vendor_marketing,
+    reject_vendor_submission_finance,
+    remove_submission_attachment,
     reopen_submission,
     send_submission_to_finance,
 )
@@ -156,6 +160,8 @@ class VendorSubmissionViewSet(viewsets.ReadOnlyModelViewSet):
             qs = qs.filter(invitation__scope_node_id=scope_node_id)
         if status_val := params.get("status"):
             qs = qs.filter(status=status_val)
+        if (params.get("finance_reviewed") or "").strip().lower() in {"1", "true", "yes"}:
+            qs = qs.filter(finance_decisions__isnull=False).distinct()
         if inv_id := params.get("invitation"):
             qs = qs.filter(invitation_id=inv_id)
         if name := params.get("normalized_vendor_name"):
@@ -163,6 +169,66 @@ class VendorSubmissionViewSet(viewsets.ReadOnlyModelViewSet):
         if email := params.get("normalized_email"):
             qs = qs.filter(normalized_email__icontains=email)
         return qs
+
+    def _static_finance_recipient_emails(self) -> set[str]:
+        from django.conf import settings
+
+        recipients = getattr(
+            settings,
+            "VENDOR_FINANCE_RECIPIENTS",
+            getattr(settings, "VENDOR_FINANCE_EMAIL_RECIPIENTS", []),
+        )
+        if isinstance(recipients, str):
+            recipients = [recipients]
+        return {r.strip().lower() for r in recipients if r}
+
+    def _user_has_finance_role_for_submission(self, request, submission) -> bool:
+        from apps.access.models import UserRoleAssignment
+        from apps.core.services import get_ancestors
+        from django.conf import settings
+
+        scope_node = submission.invitation.scope_node
+        if not scope_node:
+            return False
+
+        scope_ids = [scope_node.id]
+        for ancestor in get_ancestors(scope_node):
+            if ancestor.id not in scope_ids:
+                scope_ids.append(ancestor.id)
+
+        role_codes = set(getattr(settings, "FINANCE_ROLE_CODES", {"finance_team"}))
+        return UserRoleAssignment.objects.filter(
+            user=request.user,
+            role__code__in=role_codes,
+            role__is_active=True,
+            scope_node_id__in=scope_ids,
+        ).exists()
+
+    def _can_current_user_act_as_finance(self, request, submission) -> bool:
+        if request.user.is_superuser:
+            return True
+        email = (getattr(request.user, "email", "") or "").strip().lower()
+        if email and email in self._static_finance_recipient_emails():
+            return True
+        return self._user_has_finance_role_for_submission(request, submission)
+
+    def _finance_permission_denied(self):
+        return Response(
+            {"detail": "You are not a finance recipient for this vendor submission."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    def _get_review_token_for_submission(self, submission):
+        return (
+            submission.finance_tokens
+            .filter(action_type=FinanceActionType.APPROVE, used_at__isnull=True)
+            .order_by("-created_at", "-id")
+            .first()
+            or submission.finance_tokens
+            .filter(action_type=FinanceActionType.APPROVE)
+            .order_by("-created_at", "-id")
+            .first()
+        )
 
     @action(detail=True, methods=["post"], url_path="send-to-finance")
     def send_to_finance(self, request, pk=None):
@@ -175,6 +241,68 @@ class VendorSubmissionViewSet(viewsets.ReadOnlyModelViewSet):
         except SubmissionStateError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(VendorSubmissionSerializer(updated).data)
+
+    @action(detail=True, methods=["get"], url_path="finance-review")
+    def finance_review(self, request, pk=None):
+        """GET /api/v1/vendors/submissions/{id}/finance-review/"""
+        submission = self.get_object()
+        if not self._can_current_user_act_as_finance(request, submission):
+            return self._finance_permission_denied()
+
+        token = self._get_review_token_for_submission(submission)
+        if not token:
+            return Response(
+                {"detail": "No finance review token exists for this submission."},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
+        return Response(PublicFinanceTokenSerializer(token, context={"request": request}).data)
+
+    @action(detail=True, methods=["post"], url_path="finance-approve")
+    def finance_approve(self, request, pk=None):
+        """POST /api/v1/vendors/submissions/{id}/finance-approve/"""
+        submission = self.get_object()
+        if not self._can_current_user_act_as_finance(request, submission):
+            return self._finance_permission_denied()
+
+        serializer = FinanceApproveSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            submission, vendor = approve_vendor_submission_finance(
+                submission=submission,
+                sap_vendor_id=serializer.validated_data["sap_vendor_id"],
+                note=serializer.validated_data.get("note", ""),
+                actor=request.user,
+            )
+        except SubmissionStateError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({
+            "submission": VendorSubmissionSerializer(submission).data,
+            "vendor": VendorSerializer(vendor).data,
+        })
+
+    @action(detail=True, methods=["post"], url_path="finance-reject")
+    def finance_reject(self, request, pk=None):
+        """POST /api/v1/vendors/submissions/{id}/finance-reject/"""
+        submission = self.get_object()
+        if not self._can_current_user_act_as_finance(request, submission):
+            return self._finance_permission_denied()
+
+        serializer = FinanceRejectSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            submission = reject_vendor_submission_finance(
+                submission=submission,
+                note=serializer.validated_data.get("note", ""),
+                actor=request.user,
+            )
+        except SubmissionStateError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(VendorSubmissionSerializer(submission).data)
 
     @action(detail=True, methods=["post"], url_path="reopen")
     def reopen(self, request, pk=None):
@@ -262,7 +390,6 @@ class VendorViewSet(viewsets.ModelViewSet):
             updated = approve_vendor_marketing(
                 vendor,
                 approved_by=request.user,
-                po_mandate_enabled=serializer.validated_data.get("po_mandate_enabled", False),
             )
         except VendorStateError as exc:
             return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
@@ -448,11 +575,11 @@ class PublicInvitationAttachView(APIView):
             return Response({"detail": str(exc)}, status=status.HTTP_410_GONE)
 
         submission = invitation.submissions.filter(
-            status__in=["draft", "reopened", "submitted"]
+            status__in=["draft", "reopened"]
         ).first()
         if not submission:
             return Response(
-                {"detail": "No active submission found for this invitation."},
+                {"detail": "No editable submission found for this invitation."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -477,6 +604,8 @@ class PublicInvitationAttachView(APIView):
             ".pdf", ".jpg", ".jpeg", ".png", ".xlsx", ".xls",
             ".doc", ".docx", ".txt", ".csv",
         }
+        if document_type == "msme_declaration_form":
+            allowed_extensions = {".pdf", ".jpg", ".jpeg", ".png", ".docx"}
         from pathlib import Path
         ext = Path(file_obj.name).suffix.lower()
         if ext not in allowed_extensions:
@@ -485,13 +614,48 @@ class PublicInvitationAttachView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        attachment = attach_document(
-            submission=submission,
-            title=title,
-            file_obj=file_obj,
-            document_type=document_type,
-        )
+        try:
+            attachment = attach_document(
+                submission=submission,
+                title=title,
+                file_obj=file_obj,
+                document_type=document_type,
+            )
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
         return Response(VendorAttachmentSerializer(attachment).data, status=status.HTTP_201_CREATED)
+
+
+class PublicInvitationAttachmentDetailView(APIView):
+    """DELETE /api/v1/vendors/public/invitations/{token}/attachments/{attachment_id}/"""
+    permission_classes = [AllowAny]
+
+    def delete(self, request, token, attachment_id, *args, **kwargs):
+        try:
+            invitation = get_invitation_by_token(token)
+        except InvitationNotFoundError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+        except InvitationExpiredError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_410_GONE)
+
+        submission = invitation.submissions.filter(
+            status__in=["draft", "reopened"]
+        ).first()
+        if not submission:
+            return Response(
+                {"detail": "No editable submission found for this invitation."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            remove_submission_attachment(submission, attachment_id)
+        except SubmissionStateError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_404_NOT_FOUND)
+
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class PublicInvitationFinalizeView(APIView):
@@ -507,11 +671,11 @@ class PublicInvitationFinalizeView(APIView):
             return Response({"detail": str(exc)}, status=status.HTTP_410_GONE)
 
         submission = invitation.submissions.filter(
-            status__in=["draft", "reopened"]
+            status__in=["draft", "reopened", "finance_rejected"]
         ).first()
         if not submission:
             return Response(
-                {"detail": "No draft or reopened submission to finalize."},
+                {"detail": "No editable submission to finalize."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -921,12 +1085,20 @@ class VendorPortalProfileView(APIView):
             return Response({"detail": "No vendor account linked."}, status=status.HTTP_404_NOT_FOUND)
         vendor = assignment.vendor
         snapshot = build_vendor_live_snapshot(vendor)
+        documents = []
+        if vendor.onboarding_submission_id:
+            documents = VendorAttachmentSerializer(
+                vendor.onboarding_submission.attachments.all(),
+                many=True,
+                context={"request": request},
+            ).data
         return Response({
             "vendor_id": vendor.pk,
             "vendor_name": vendor.vendor_name,
             "profile_change_pending": vendor.profile_change_pending,
             "profile_hold_reason": vendor.profile_hold_reason,
             "snapshot": snapshot,
+            "documents": documents,
         })
 
 

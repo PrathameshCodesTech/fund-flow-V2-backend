@@ -27,6 +27,10 @@ if TYPE_CHECKING:
 
 _logger = logging.getLogger(__name__)
 
+def _get_logo_url() -> str:
+    base_url = getattr(settings, "FUND_FLOW_BASE_URL", "http://localhost:3000").rstrip("/")
+    return f"{base_url}/hp.jpg"
+
 
 # ---------------------------------------------------------------------------
 # Finance role configuration
@@ -194,7 +198,7 @@ def send_vendor_invitation_notification(invitation: "VendorInvitation") -> None:
         if invited_by:
             invited_by_name = invited_by.get_full_name().strip() or invited_by.email
         else:
-            invited_by_name = "VIMS"
+            invited_by_name = "Horizon Industrial Parks"
 
         send_vendor_invitation_email(
             vendor_email=invitation.vendor_email,
@@ -308,9 +312,10 @@ def send_finance_handoff_notification(submission: "VendorOnboardingSubmission") 
             "VENDOR_FINANCE_PORTAL_BASE_URL",
             getattr(settings, "VENDOR_PORTAL_BASE_URL", "http://localhost:3000"),
         )
-        # Both buttons open the approve-token page; ?action= pre-selects the form.
-        approve_url = f"{base_url}/vendor/finance/{approve_token_record.token}?action=approve"
-        reject_url = f"{base_url}/vendor/finance/{approve_token_record.token}?action=reject"
+        # One email CTA opens the approve-token review page; approve/reject
+        # happens inside the page using the paired reject token.
+        approve_url = f"{base_url}/vendor/finance/{approve_token_record.token}"
+        reject_url = approve_url
 
         # Attachment URLs
         attachment_urls = list(
@@ -387,7 +392,7 @@ def notify_vendor_approved(submission: "VendorOnboardingSubmission", vendor: "Ve
         inviter = getattr(invitation, "invited_by", None)
 
         # ── Vendor email ──────────────────────────────────────────────────
-        subject = "VIMS — Vendor Onboarding Approved"
+        subject = "Horizon — Vendor Onboarding Approved"
 
         html_body = f"""<!DOCTYPE html>
 <html lang="en">
@@ -403,9 +408,7 @@ def notify_vendor_approved(submission: "VendorOnboardingSubmission", vendor: "Ve
         <tr>
           <td style="background:linear-gradient(135deg,#ecfdf5 0%,#d1fae5 50%,#ecfdf5 100%);
                      border-bottom:2px solid #6ee7b7;padding:28px 40px;">
-            <p style="margin:0;font-size:10px;font-weight:700;letter-spacing:2px;color:#065f46;text-transform:uppercase;">
-              VIMS &mdash; Vendor Invoice Management System
-            </p>
+            <img src="{_get_logo_url()}" alt="Horizon Industrial Parks" style="height:36px;width:auto;margin-bottom:8px;">
             <h1 style="margin:8px 0 0;font-size:22px;font-weight:700;color:#064e3b;line-height:1.3;">
               ✓ Vendor Onboarding Approved
             </h1>
@@ -416,7 +419,7 @@ def notify_vendor_approved(submission: "VendorOnboardingSubmission", vendor: "Ve
           <td style="padding:32px 40px;">
             <p style="margin:0 0 24px;font-size:14px;color:#374151;line-height:1.7;">
               Dear Vendor,<br><br>
-              Congratulations! Your vendor registration on VIMS has been reviewed and approved by our finance team.
+              Congratulations! Your vendor registration has been reviewed and approved by our finance team.
             </p>
 
             <table cellpadding="0" cellspacing="0" width="100%"
@@ -451,7 +454,7 @@ def notify_vendor_approved(submission: "VendorOnboardingSubmission", vendor: "Ve
         <tr>
           <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 40px;">
             <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
-              VIMS &middot; Vendor Invoice Management System &middot; Do not reply to this email
+              Horizon Industrial Parks &middot; Vendor Invoice Management &middot; Do not reply to this email
             </p>
           </td>
         </tr>
@@ -477,7 +480,7 @@ def notify_vendor_approved(submission: "VendorOnboardingSubmission", vendor: "Ve
         # ── Internal inviter notification ─────────────────────────────────
         if inviter and inviter.email:
             try:
-                inviter_subject = f"[VIMS] Vendor Registration Approved — {vendor_name}"
+                inviter_subject = f"[Horizon] Vendor Registration Approved — {vendor_name}"
                 inviter_body = (
                     f"A vendor registration has been approved by finance.\n\n"
                     f"Vendor  : {vendor_name}\n"
@@ -536,7 +539,7 @@ def notify_vendor_rejected(submission: "VendorOnboardingSubmission", note: str =
         inviter = getattr(invitation, "invited_by", None)
 
         # ── Vendor email ──────────────────────────────────────────────────
-        subject = "VIMS — Vendor Onboarding Requires Attention"
+        subject = "Horizon — Vendor Onboarding Requires Attention"
 
         note_section = ""
         if note:
@@ -569,9 +572,7 @@ def notify_vendor_rejected(submission: "VendorOnboardingSubmission", note: str =
         <tr>
           <td style="background:linear-gradient(135deg,#fef2f2 0%,#fee2e2 50%,#fef2f2 100%);
                      border-bottom:2px solid #fecaca;padding:28px 40px;">
-            <p style="margin:0;font-size:10px;font-weight:700;letter-spacing:2px;color:#991b1b;text-transform:uppercase;">
-              VIMS &mdash; Vendor Invoice Management System
-            </p>
+            <img src="{_get_logo_url()}" alt="Horizon Industrial Parks" style="height:36px;width:auto;margin-bottom:8px;">
             <h1 style="margin:8px 0 0;font-size:22px;font-weight:700;color:#7f1d1d;line-height:1.3;">
               Vendor Onboarding Requires Attention
             </h1>
@@ -582,7 +583,7 @@ def notify_vendor_rejected(submission: "VendorOnboardingSubmission", note: str =
           <td style="padding:32px 40px;">
             <p style="margin:0 0 24px;font-size:14px;color:#374151;line-height:1.7;">
               Dear Vendor,<br><br>
-              Your vendor registration submission on VIMS requires attention from your side.
+              Your vendor registration submission requires attention from your side.
             </p>
 
             <table cellpadding="0" cellspacing="0" width="100%"
@@ -623,7 +624,7 @@ def notify_vendor_rejected(submission: "VendorOnboardingSubmission", note: str =
         <tr>
           <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 40px;">
             <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
-              VIMS &middot; Vendor Invoice Management System &middot; Do not reply to this email
+              Horizon Industrial Parks &middot; Vendor Invoice Management &middot; Do not reply to this email
             </p>
           </td>
         </tr>
@@ -649,7 +650,7 @@ def notify_vendor_rejected(submission: "VendorOnboardingSubmission", note: str =
         # ── Internal inviter notification ─────────────────────────────────
         if inviter and inviter.email:
             try:
-                inviter_subject = f"[VIMS] Vendor Submission Rejected — {vendor_name}"
+                inviter_subject = f"[Horizon] Vendor Submission Rejected — {vendor_name}"
                 inviter_body = (
                     f"A vendor submission has been rejected by finance.\n\n"
                     f"Vendor    : {vendor_name}\n"
@@ -704,7 +705,7 @@ def notify_vendor_reopened(submission: "VendorOnboardingSubmission", note: str =
         portal_base = getattr(settings, "VENDOR_PORTAL_BASE_URL", "http://localhost:3000")
         onboarding_url = f"{portal_base}/vendor/onboarding/{invitation.token}"
 
-        subject = "VIMS — Vendor Onboarding Reopened for Correction"
+        subject = "Horizon — Vendor Onboarding Reopened for Correction"
 
         note_section = ""
         if note:
@@ -737,9 +738,7 @@ def notify_vendor_reopened(submission: "VendorOnboardingSubmission", note: str =
         <tr>
           <td style="background:linear-gradient(135deg,#fffbeb 0%,#fef3c7 50%,#fffbeb 100%);
                      border-bottom:2px solid #fde68a;padding:28px 40px;">
-            <p style="margin:0;font-size:10px;font-weight:700;letter-spacing:2px;color:#78350f;text-transform:uppercase;">
-              VIMS &mdash; Vendor Invoice Management System
-            </p>
+            <img src="{_get_logo_url()}" alt="Horizon Industrial Parks" style="height:36px;width:auto;margin-bottom:8px;">
             <h1 style="margin:8px 0 0;font-size:22px;font-weight:700;color:#78350f;line-height:1.3;">
               Onboarding Reopened for Correction
             </h1>
@@ -801,7 +800,7 @@ def notify_vendor_reopened(submission: "VendorOnboardingSubmission", note: str =
         <tr>
           <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 40px;">
             <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
-              VIMS &middot; Vendor Invoice Management System &middot; Do not reply to this email
+              Horizon Industrial Parks &middot; Vendor Invoice Management &middot; Do not reply to this email
             </p>
           </td>
         </tr>
@@ -829,7 +828,7 @@ def notify_vendor_reopened(submission: "VendorOnboardingSubmission", note: str =
 
         if inviter and inviter.email:
             try:
-                inviter_subject = f"[VIMS] Vendor Submission Reopened — {vendor_name}"
+                inviter_subject = f"[Horizon] Vendor Submission Reopened — {vendor_name}"
                 inviter_body = (
                     f"A vendor submission has been reopened for correction.\n\n"
                     f"Vendor    : {vendor_name}\n"

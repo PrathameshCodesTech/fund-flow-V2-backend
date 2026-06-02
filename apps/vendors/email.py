@@ -8,8 +8,16 @@ from django.conf import settings
 from django.core.mail import EmailMessage
 
 # Shared brand constants
-_BRAND_NAME = "VIMS"
-_BRAND_FULL = "Vendor Invoice Management System"
+_BRAND_NAME = "HORIZON"
+_BRAND_FULL = "Horizon Industrial Parks"
+
+def _get_logo_url() -> str:
+    from django.conf import settings
+    base_url = getattr(settings, "FUND_FLOW_BASE_URL", "http://localhost:3000").rstrip("/")
+    return f"{base_url}/hp.jpg"
+
+def _get_logo_html(height: str = "32") -> str:
+    return f'<img src="{_get_logo_url()}" alt="Horizon Industrial Parks" style="height:{height}px;width:auto;">'
 
 
 def send_vendor_invitation_email(
@@ -18,7 +26,7 @@ def send_vendor_invitation_email(
     onboarding_url: str,
     invited_by_name: str,
 ) -> None:
-    subject = f"You've been invited to {_BRAND_NAME} — Vendor Onboarding"
+    subject = f"You've been invited to {_BRAND_FULL} — Vendor Onboarding"
 
     greeting = f"Dear {vendor_name_hint}," if vendor_name_hint else "Hello,"
 
@@ -38,11 +46,9 @@ def send_vendor_invitation_email(
         <tr>
           <td style="background:linear-gradient(135deg,#fff7ed 0%,#fffbeb 50%,#fff7ed 100%);
                      border-bottom:2px solid #fed7aa;padding:28px 40px;">
-            <p style="margin:0;font-size:10px;font-weight:700;letter-spacing:2px;color:#c2410c;text-transform:uppercase;">
-              {_BRAND_NAME} &mdash; {_BRAND_FULL}
-            </p>
+            <img src="{_get_logo_url()}" alt="{_BRAND_FULL}" style="height:36px;width:auto;margin-bottom:8px;">
             <h1 style="margin:8px 0 0;font-size:22px;font-weight:700;color:#7c2d12;line-height:1.3;">
-              You're Invited to Join {_BRAND_NAME}
+              You're Invited to Join Horizon
             </h1>
           </td>
         </tr>
@@ -53,8 +59,7 @@ def send_vendor_invitation_email(
 
             <p style="margin:0 0 24px;font-size:14px;color:#374151;line-height:1.7;">
               {greeting}<br><br>
-              You have been invited to complete your vendor registration on {_BRAND_NAME}
-              ({_BRAND_FULL}). This platform streamlines invoice management and vendor collaboration.
+              You have been invited to complete your vendor registration on {_BRAND_FULL}. This platform streamlines invoice management and vendor collaboration.
             </p>
 
             <p style="margin:0 0 28px;font-size:14px;color:#374151;line-height:1.7;">
@@ -91,7 +96,7 @@ def send_vendor_invitation_email(
         <tr>
           <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 40px;">
             <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
-              {_BRAND_NAME} &middot; Vendor Self-Service Portal &middot; Do not reply to this email
+              {_BRAND_FULL} &middot; Vendor Self-Service Portal &middot; Do not reply to this email
             </p>
           </td>
         </tr>
@@ -129,7 +134,7 @@ def send_vendor_activation_email(
         activation_url:   Full URL: /vendor/activate/{uid}/{token}
     """
     expiry_days = getattr(settings, "VENDOR_ACTIVATION_TOKEN_EXPIRY_DAYS", 7)
-    subject = f"{_BRAND_NAME} — Activate Your Vendor Portal Account"
+    subject = f"{_BRAND_FULL} — Activate Your Vendor Portal Account"
 
     html_body = f"""<!DOCTYPE html>
 <html lang="en">
@@ -147,9 +152,7 @@ def send_vendor_activation_email(
         <tr>
           <td style="background:linear-gradient(135deg,#fff7ed 0%,#fffbeb 50%,#fff7ed 100%);
                      border-bottom:2px solid #fed7aa;padding:28px 40px;">
-            <p style="margin:0;font-size:10px;font-weight:700;letter-spacing:2px;color:#c2410c;text-transform:uppercase;">
-              {_BRAND_NAME} &mdash; {_BRAND_FULL}
-            </p>
+            <img src="{_get_logo_url()}" alt="{_BRAND_FULL}" style="height:36px;width:auto;margin-bottom:8px;">
             <h1 style="margin:8px 0 0;font-size:22px;font-weight:700;color:#7c2d12;line-height:1.3;">
               Activate Your Vendor Portal
             </h1>
@@ -163,7 +166,7 @@ def send_vendor_activation_email(
             <p style="margin:0 0 24px;font-size:14px;color:#374151;line-height:1.7;">
               Dear {vendor_name or 'Vendor'},<br><br>
               Your vendor account has been approved and is now ready for activation.
-              Please set your password to access the {_BRAND_NAME} vendor self-service portal.
+              Please set your password to access the Horizon vendor self-service portal.
             </p>
 
             <!-- Vendor badge -->
@@ -172,7 +175,7 @@ def send_vendor_activation_email(
               <tr>
                 <td style="padding:14px 18px;">
                   <p style="margin:0;font-size:12px;color:#c2410c;font-weight:600;">Vendor Account</p>
-                  <p style="margin:4px 0 0;font-size:15px;font-weight:700;color:#7c2d12;">{vendor_name or 'VIMS Vendor'}</p>
+                  <p style="margin:4px 0 0;font-size:15px;font-weight:700;color:#7c2d12;">{vendor_name or 'Horizon Vendor'}</p>
                 </td>
               </tr>
             </table>
@@ -203,7 +206,7 @@ def send_vendor_activation_email(
         <tr>
           <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 40px;">
             <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
-              {_BRAND_NAME} &middot; Vendor Self-Service Portal &middot; Do not reply to this email
+              {_BRAND_FULL} &middot; Vendor Self-Service Portal &middot; Do not reply to this email
             </p>
           </td>
         </tr>
@@ -222,6 +225,97 @@ def send_vendor_activation_email(
         body=html_body,
         from_email=settings.DEFAULT_FROM_EMAIL,
         to=[vendor_email],
+    )
+    email.content_subtype = "html"
+    email.send(fail_silently=False)
+
+
+def send_vendor_contact_activation_notice_email(
+    contact_email: str,
+    contact_name: str,
+    vendor_name: str,
+    primary_vendor_email: str,
+) -> None:
+    """
+    Notify a vendor business contact after final approval.
+
+    This is informational only. The recipient is not given portal credentials,
+    an activation link, or login access.
+    """
+    from html import escape
+
+    safe_contact_name = escape(contact_name or "Vendor Contact")
+    safe_vendor_name = escape(vendor_name or "Vendor")
+    safe_primary_email = escape(primary_vendor_email)
+    subject = f"{_BRAND_FULL} - Vendor Registration Completed: {vendor_name or 'Vendor'}"
+
+    html_body = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:'Segoe UI',Arial,sans-serif;">
+
+  <table width="100%" cellpadding="0" cellspacing="0" style="background:#f3f4f6;padding:40px 16px;">
+    <tr><td align="center">
+
+      <table width="560" cellpadding="0" cellspacing="0"
+             style="background:#ffffff;border-radius:14px;box-shadow:0 4px 16px rgba(0,0,0,.10);overflow:hidden;">
+
+        <tr>
+          <td style="background:linear-gradient(135deg,#fff7ed 0%,#fffbeb 50%,#fff7ed 100%);
+                     border-bottom:2px solid #fed7aa;padding:28px 40px;">
+            <img src="{_get_logo_url()}" alt="{_BRAND_FULL}" style="height:36px;width:auto;margin-bottom:8px;">
+            <h1 style="margin:8px 0 0;font-size:22px;font-weight:700;color:#7c2d12;line-height:1.3;">
+              Vendor Registration Completed
+            </h1>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="padding:32px 40px;">
+            <p style="margin:0 0 20px;font-size:14px;color:#374151;line-height:1.7;">
+              Dear {safe_contact_name},<br><br>
+              The vendor registration for <strong>{safe_vendor_name}</strong> has been approved and activated.
+              You have been listed as a contact person for this vendor account.
+            </p>
+
+            <table cellpadding="0" cellspacing="0" width="100%"
+                   style="background:#fff7ed;border:1px solid #fed7aa;border-radius:8px;margin-bottom:22px;">
+              <tr>
+                <td style="padding:14px 18px;">
+                  <p style="margin:0;font-size:12px;color:#c2410c;font-weight:600;">Registered Vendor Portal User</p>
+                  <p style="margin:4px 0 0;font-size:14px;font-weight:700;color:#7c2d12;">{safe_primary_email}</p>
+                </td>
+              </tr>
+            </table>
+
+            <p style="margin:0;font-size:13px;color:#6b7280;line-height:1.7;">
+              For invoice submissions, account updates, or portal access, please coordinate with the registered
+              vendor portal user shown above. This email is informational only and does not provide portal access.
+            </p>
+          </td>
+        </tr>
+
+        <tr>
+          <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 40px;">
+            <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
+              {_BRAND_FULL} &middot; Vendor Self-Service Portal &middot; Do not reply to this email
+            </p>
+          </td>
+        </tr>
+
+      </table>
+
+    </td></tr>
+  </table>
+
+</body>
+</html>"""
+
+    email = EmailMessage(
+        subject=subject,
+        body=html_body,
+        from_email=settings.DEFAULT_FROM_EMAIL,
+        to=[contact_email],
     )
     email.content_subtype = "html"
     email.send(fail_silently=False)
@@ -260,7 +354,7 @@ def send_finance_email(
         recipients = [recipients]
 
     expiry_hours = getattr(settings, "VENDOR_FINANCE_TOKEN_EXPIRY_HOURS", 72)
-    subject = f"[{_BRAND_NAME}] Vendor Onboarding Review Required: {vendor_name} (Submission #{submission_id})"
+    subject = f"[{_BRAND_FULL}] Vendor Onboarding Review Required: {vendor_name} (Submission #{submission_id})"
 
     # ── Context rows ──────────────────────────────────────────────────────────
     context_rows = ""
@@ -308,9 +402,7 @@ def send_finance_email(
         <tr>
           <td style="background:linear-gradient(135deg,#fff7ed 0%,#fffbeb 50%,#fff7ed 100%);
                      border-bottom:2px solid #fed7aa;padding:28px 36px;">
-            <p style="margin:0;font-size:11px;font-weight:700;letter-spacing:1.5px;color:#c2410c;text-transform:uppercase;">
-              {_BRAND_NAME} &mdash; {_BRAND_FULL}
-            </p>
+            <img src="{_get_logo_url()}" alt="{_BRAND_FULL}" style="height:36px;width:auto;margin-bottom:8px;">
             <h1 style="margin:6px 0 0;font-size:20px;font-weight:700;color:#7c2d12;line-height:1.3;">
               Vendor Onboarding Review
             </h1>
@@ -373,29 +465,20 @@ def send_finance_email(
             <hr style="border:none;border-top:1px solid #e5e7eb;margin:24px 0;">
 
             <p style="margin:0 0 20px;font-size:14px;color:#374151;line-height:1.6;">
-              Click <strong>Review Vendor</strong> to open the secure finance review page where
+              Click <strong>Review Submission</strong> to open the secure finance review page where
               you can approve or decline the submission. You may also enter the SAP Vendor ID
-              on approval. Each button opens a one-time secure page &mdash;
-              <strong>no login required</strong>.
+              on approval. This one-time secure page requires <strong>no login</strong>.
             </p>
 
-            <!-- Action buttons -->
+            <!-- Review button -->
             <table cellpadding="0" cellspacing="0" width="100%">
               <tr>
-                <td align="center" style="padding:0 8px 0 0;" width="50%">
+                <td align="center">
                   <a href="{approve_url}"
-                     style="display:block;padding:14px 0;background:#ea580c;color:#ffffff;
+                     style="display:inline-block;padding:14px 32px;background:#ea580c;color:#ffffff;
                             font-size:15px;font-weight:700;text-align:center;text-decoration:none;
                             border-radius:8px;letter-spacing:0.3px;">
-                    Review Vendor
-                  </a>
-                </td>
-                <td align="center" style="padding:0 0 0 8px;" width="50%">
-                  <a href="{reject_url}"
-                     style="display:block;padding:14px 0;background:#dc2626;color:#ffffff;
-                            font-size:15px;font-weight:700;text-align:center;text-decoration:none;
-                            border-radius:8px;letter-spacing:0.3px;">
-                    &#10007;&nbsp;&nbsp;Decline Submission
+                    Review Submission
                   </a>
                 </td>
               </tr>
@@ -412,7 +495,7 @@ def send_finance_email(
         <tr>
           <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 36px;">
             <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
-              {_BRAND_NAME} &middot; {_BRAND_FULL} &middot; Do not reply to this email
+              {_BRAND_FULL} &middot; Vendor Invoice Management &middot; Do not reply to this email
             </p>
           </td>
         </tr>

@@ -267,7 +267,7 @@ class TestFieldValidation:
         assert not result.is_valid
         assert "due_date" in result.field_errors
 
-    def test_po_mandate_missing_blocks(self, po_vendor, scope_node, send_to_route):
+    def test_po_number_optional_even_when_vendor_flag_true(self, po_vendor, scope_node, send_to_route):
         submission = VendorInvoiceSubmission.objects.create(
             vendor=po_vendor,
             scope_node=scope_node,
@@ -280,8 +280,8 @@ class TestFieldValidation:
             },
         )
         result = validate_vendor_submission_for_submit(submission, send_to_route)
-        assert not result.is_valid
-        assert "po_number" in result.field_errors
+        assert result.is_valid
+        assert "po_number" not in result.field_errors
 
     def test_subtotal_tax_mismatch_blocks(self, vendor, scope_node, send_to_route):
         submission = VendorInvoiceSubmission.objects.create(

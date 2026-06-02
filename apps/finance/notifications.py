@@ -23,6 +23,10 @@ from django.core.mail import EmailMessage
 
 _logger = logging.getLogger(__name__)
 
+def _get_logo_url() -> str:
+    base_url = getattr(settings, "FUND_FLOW_BASE_URL", "http://localhost:3000").rstrip("/")
+    return f"{base_url}/hp.jpg"
+
 
 def _get_base_url() -> str:
     return getattr(settings, "FUND_FLOW_BASE_URL", "http://localhost:3000").rstrip("/")
@@ -61,7 +65,7 @@ def _build_approval_email(
     vendor_email: Optional[str],
     internal_url: str,
 ) -> tuple[str, str]:
-    subject = f"[VIMS] Invoice Approved by Finance — {invoice_title}"
+    subject = f"[Horizon] Invoice Approved by Finance — {invoice_title}"
 
     html_body = f"""<!DOCTYPE html>
 <html lang="en">
@@ -77,9 +81,7 @@ def _build_approval_email(
         <tr>
           <td style="background:linear-gradient(135deg,#ecfdf5 0%,#d1fae5 50%,#ecfdf5 100%);
                      border-bottom:2px solid #6ee7b7;padding:28px 40px;">
-            <p style="margin:0;font-size:10px;font-weight:700;letter-spacing:2px;color:#065f46;text-transform:uppercase;">
-              VIMS &mdash; Vendor Invoice Management System
-            </p>
+            <img src="{_get_logo_url()}" alt="Horizon Industrial Parks" style="height:36px;width:auto;margin-bottom:8px;">
             <h1 style="margin:8px 0 0;font-size:22px;font-weight:700;color:#064e3b;line-height:1.3;">
               ✓ Invoice Approved by Finance
             </h1>
@@ -132,7 +134,7 @@ def _build_approval_email(
             </table>
 
             <p style="margin:24px 0 0;font-size:13px;color:#6b7280;text-align:center;line-height:1.6;">
-              This is an automated notification from VIMS.
+              This is an automated notification from Horizon.
             </p>
           </td>
         </tr>
@@ -140,7 +142,7 @@ def _build_approval_email(
         <tr>
           <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 40px;">
             <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
-              VIMS &middot; Vendor Invoice Management System &middot; Do not reply to this email
+              Horizon Industrial Parks &middot; Vendor Invoice Management &middot; Do not reply to this email
             </p>
           </td>
         </tr>
@@ -164,7 +166,7 @@ def _build_rejection_email(
     vendor_email: Optional[str],
     internal_url: str,
 ) -> tuple[str, str]:
-    subject = f"[VIMS] Invoice Rejected by Finance — {invoice_title}"
+    subject = f"[Horizon] Invoice Rejected by Finance — {invoice_title}"
 
     html_body = f"""<!DOCTYPE html>
 <html lang="en">
@@ -180,9 +182,7 @@ def _build_rejection_email(
         <tr>
           <td style="background:linear-gradient(135deg,#fef2f2 0%,#fee2e2 50%,#fef2f2 100%);
                      border-bottom:2px solid #fecaca;padding:28px 40px;">
-            <p style="margin:0;font-size:10px;font-weight:700;letter-spacing:2px;color:#991b1b;text-transform:uppercase;">
-              VIMS &mdash; Vendor Invoice Management System
-            </p>
+            <img src="{_get_logo_url()}" alt="Horizon Industrial Parks" style="height:36px;width:auto;margin-bottom:8px;">
             <h1 style="margin:8px 0 0;font-size:22px;font-weight:700;color:#7f1d1d;line-height:1.3;">
               Invoice Rejected by Finance
             </h1>
@@ -245,7 +245,7 @@ def _build_rejection_email(
             </table>
 
             <p style="margin:24px 0 0;font-size:13px;color:#6b7280;text-align:center;line-height:1.6;">
-              This is an automated notification from VIMS.
+              This is an automated notification from Horizon.
             </p>
           </td>
         </tr>
@@ -253,7 +253,7 @@ def _build_rejection_email(
         <tr>
           <td style="background:#f8fafc;border-top:1px solid #e5e7eb;padding:16px 40px;">
             <p style="margin:0;font-size:12px;color:#9ca3af;text-align:center;">
-              VIMS &middot; Vendor Invoice Management System &middot; Do not reply to this email
+              Horizon Industrial Parks &middot; Vendor Invoice Management &middot; Do not reply to this email
             </p>
           </td>
         </tr>

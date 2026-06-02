@@ -249,7 +249,7 @@ class TestFinanceHandoffNotification:
         call_kwargs = mock_email.call_args.kwargs
         assert call_kwargs["recipient_list"] == ["finance@company.com"]
         assert "approve-token" in call_kwargs["approve_url"]
-        assert "reject-token" in call_kwargs["reject_url"]
+        assert call_kwargs["reject_url"] == call_kwargs["approve_url"]
 
     @patch("apps.vendors.notifications.send_finance_email")
     @patch("apps.vendors.notifications.resolve_vendor_finance_recipients")

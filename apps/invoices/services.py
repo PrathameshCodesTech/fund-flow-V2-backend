@@ -205,12 +205,6 @@ def validate_vendor_submission_for_submit(submission, send_to_route) -> Submissi
                 "Total amount must be a valid number."
             )
 
-    # PO mandate
-    if vendor and vendor.po_mandate_enabled and not nd.get("po_number"):
-        field_errors.setdefault("po_number", []).append(
-            "PO number is required for this vendor."
-        )
-
     # Subtotal + tax vs total consistency
     sub_str = nd.get("subtotal_amount")
     tax_str = nd.get("tax_amount")
@@ -333,15 +327,8 @@ def create_invoice(
     Create a new invoice if the creator has CREATE permission on INVOICE
     at scope_node or any ancestor.
 
-    If vendor has po_mandate_enabled=True and po_number is not provided,
-    raises InvoicePOMandateError.
+    PO number is optional invoice metadata.
     """
-    if vendor and vendor.po_mandate_enabled and not po_number:
-        raise InvoicePOMandateError(
-            "This vendor requires a PO number on all invoices. "
-            "Please provide 'po_number' and retry."
-        )
-
     if enforce_permission and not user_has_permission_including_ancestors(
         created_by, PermissionAction.CREATE, PermissionResource.INVOICE, scope_node
     ):
@@ -370,7 +357,7 @@ class InvoicePermissionError(PermissionError):
 
 
 class InvoicePOMandateError(ValueError):
-    """Raised when PO number is required but not provided."""
+    """Legacy exception kept for compatibility; PO numbers are optional."""
 
 
 def sync_invoice_status(invoice, new_status):
@@ -904,12 +891,12 @@ _DIGITAL_TEXT_MIN_CHARS = 100  # fewer chars → treat as scanned
 def _classify_pdf_text(raw_text: str) -> str:
     """
     Returns 'template', 'digital', or 'scanned' based on text density and
-    presence of VIMS template markers.
+    presence of Horizon/VIMS template markers.
     """
     stripped = raw_text.strip()
     if len(stripped) < _DIGITAL_TEXT_MIN_CHARS:
         return "scanned"
-    if "VIMS" in raw_text and "Vendor Invoice Submission Template" in raw_text:
+    if ("VIMS" in raw_text or "Horizon" in raw_text) and "Vendor Invoice Submission Template" in raw_text:
         return "template"
     return "digital"
 
@@ -1788,10 +1775,6 @@ def validate_invoice_submission(submission: VendorInvoiceSubmission) -> list[dic
     if not nd.get("currency"):
         errors.append({"field": "currency", "message": "Currency is required."})
 
-    # PO number for PO-mandated vendors
-    if vendor.po_mandate_enabled and not nd.get("po_number"):
-        errors.append({"field": "po_number", "message": "PO number is required for this vendor."})
-
     return errors
 
 
@@ -2232,7 +2215,7 @@ def generate_pdf_template() -> HttpResponse:
 
     # ── Header banner ──────────────────────────────────────────────────────────
     header_data = [[
-        Paragraph("VIMS — Vendor Invoice Submission Template (Recommended)", title_s),
+        Paragraph("Horizon — Vendor Invoice Submission Template (Recommended)", title_s),
     ]]
     header_tbl = Table(header_data, colWidths=[174*mm])
     header_tbl.setStyle(TableStyle([
@@ -2316,7 +2299,7 @@ def generate_pdf_template() -> HttpResponse:
         ("Subtotal Amount", "Numeric value without currency symbol (e.g. 10000)", True),
         ("Tax Amount", "Tax portion (e.g. 1800). Total = Subtotal + Tax.", False),
         ("Total Amount", "Grand total = Subtotal + Tax. Auto-calculated if using Excel.", False),
-        ("PO Number", "Required if your vendor account has PO mandate enabled.", False),
+        ("PO Number", "Optional purchase order reference, if available.", False),
     ]
 
     amount_rows = [row(l, h, r) for l, h, r in AMOUNT_FIELDS]
@@ -2336,11 +2319,10 @@ def generate_pdf_template() -> HttpResponse:
     els.append(amount_tbl)
     els.append(Spacer(1, 5*mm))
 
-    # ── PO Mandate notice ───────────────────────────────────────────────────────
+    # ── PO reference notice ─────────────────────────────────────────────────────
     po_notice_data = [[
         Paragraph(
-            "<b>Note:</b> The <b>PO Number</b> field above is only mandatory if your vendor account "
-            "has PO mandate enabled. Check your vendor profile or contact support to confirm.",
+            "<b>Note:</b> The <b>PO Number</b> field is optional. Add it only if your invoice has one.",
             note_s,
         )
     ]]
@@ -2387,7 +2369,7 @@ def generate_pdf_template() -> HttpResponse:
     els.append(HRFlowable(width="100%", thickness=0.5, color=BORDER))
     els.append(Spacer(1, 2*mm))
     els.append(Paragraph(
-        "VIMS Vendor Portal — Template provided for optional use. "
+        "Horizon Vendor Portal — Template provided for optional use."
         "Invoices in any format are accepted with review-before-submit workflow.",
         footer_s,
     ))
@@ -2416,7 +2398,7 @@ def _pdf_template_fallback() -> HttpResponse:
         "  Tax Amount       : _______________\n"
         "  Total Amount     : _______________\n"
         "  Description       : _______________\n\n"
-        "Note: PO Number is required only if your vendor account has PO mandate enabled.\n"
+        "Note: PO Number is optional. Add it only if your invoice has one.\n"
         "Save this file and re-upload it to the Vendor Portal."
     )
     response = HttpResponse(content, content_type="text/plain")
@@ -2489,13 +2471,13 @@ def can_user_record_invoice_payment(user, invoice) -> bool:
 
     User can record payment if ALL of:
       1. Invoice is in FINANCE_APPROVED status (payment-eligible)
-      2. User is a participant in the invoice's workflow chain
-         OR is the invoice creator
-         OR is a superuser/org_admin/tenant_admin
+      2. User is a resolved finance recipient for the invoice handoff,
+         has a configured finance role, OR is a superuser/org_admin/tenant_admin
 
     Permission model:
-    - Mere scope visibility is NOT sufficient (many users can see an invoice
-      but only workflow actors + creator + admin can record payment)
+    - Internal workflow participation is NOT sufficient.
+    - Finance review and payment recording must use the same finance-recipient
+      authority so a finance user who approved the handoff can record payment.
     """
     if not _get_invoice_eligible_for_payment(invoice):
         return False
@@ -2516,14 +2498,43 @@ def can_user_record_invoice_payment(user, invoice) -> bool:
     if any(r in ("org_admin", "tenant_admin") for r in user_roles):
         return True
 
-    # Invoice creator
-    if invoice.created_by_id == user.pk:
+    try:
+        from apps.finance.services import _get_finance_role_codes
+        finance_role_codes = _get_finance_role_codes()
+    except Exception:
+        finance_role_codes = {"finance_team"}
+
+    if user_roles.intersection(finance_role_codes):
         return True
 
-    # Workflow participants
-    participant_ids = _get_workflow_participants(invoice)
-    if user.pk in participant_ids:
-        return True
+    email = (getattr(user, "email", "") or "").strip().lower()
+    if not email:
+        return False
+
+    try:
+        from apps.finance.models import FinanceHandoff, FinanceHandoffStatus
+        from apps.finance.services import NoFinanceRecipientsError, resolve_finance_recipients_for_handoff
+
+        handoffs = FinanceHandoff.objects.filter(
+            module="invoice",
+            subject_type="invoice",
+            subject_id=invoice.pk,
+            status__in=[
+                FinanceHandoffStatus.FINANCE_APPROVED,
+                FinanceHandoffStatus.SENT,
+                FinanceHandoffStatus.PENDING,
+            ],
+        ).order_by("-updated_at", "-id")
+
+        for handoff in handoffs:
+            try:
+                recipients = resolve_finance_recipients_for_handoff(handoff)
+            except NoFinanceRecipientsError:
+                continue
+            if email in {r.strip().lower() for r in recipients if r}:
+                return True
+    except Exception:
+        pass
 
     return False
 
@@ -2552,8 +2563,7 @@ def record_invoice_payment(
 
     Validation (raises PaymentValidationError):
       - Invoice must be in FINANCE_APPROVED status
-      - When marking PAID: payment_method, payment_date, paid_amount > 0,
-        and at least one of payment_reference_number / utr_number
+      - When marking PAID: payment_date, paid_amount > 0, and utr_number
 
     Permission (raises PaymentPermissionError):
       - Actor must pass can_user_record_invoice_payment()
@@ -2582,18 +2592,15 @@ def record_invoice_payment(
     # Validate PAID status requirements at service layer
     if data.get("payment_status") == InvoicePaymentStatus.PAID:
         errors = {}
-        if not data.get("payment_method"):
-            errors.setdefault("payment_method", []).append("Payment method is required when marking as paid.")
         if not data.get("payment_date"):
             errors.setdefault("payment_date", []).append("Payment date is required when marking as paid.")
         amount = data.get("paid_amount")
         if not amount or amount <= 0:
             errors.setdefault("paid_amount", []).append("Paid amount must be greater than zero when marking as paid.")
-        ref = (data.get("payment_reference_number") or "").strip()
         utr = (data.get("utr_number") or "").strip()
-        if not ref and not utr:
+        if not utr:
             errors.setdefault("utr_number", []).append(
-                "At least one of payment_reference_number or utr_number is required when marking as paid."
+                "UTR number is required when marking as paid."
             )
         if errors:
             raise PaymentValidationError(errors)

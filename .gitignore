@@ -33,6 +33,12 @@ finance_exports/
 vendor_exports/
 vendor_invoice_submissions/
 vendor_source_uploads/
+manual_expense_attachments/
+vendor_attachments/
+vendor_invoice_documents/
+
+# Claude Code settings
+.claude/
 
 # Tooling
 get-pip.py

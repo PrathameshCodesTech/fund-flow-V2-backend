@@ -1,7 +1,7 @@
 from rest_framework import serializers
 
 from apps.vendors.models import (
-    ALLOWED_ATTACHMENT_DOCUMENT_TYPES,
+    ACTIVE_VENDOR_ATTACHMENT_DOCUMENT_TYPES,
     FinanceActionType,
     InvitationStatus,
     Vendor,
@@ -87,7 +87,9 @@ class VendorSubmissionSerializer(serializers.ModelSerializer):
             # Bank core
             "normalized_preferred_payment_mode",
             "normalized_beneficiary_name",
-            "normalized_bank_name", "normalized_account_number", "normalized_bank_account_type",
+            "normalized_bank_name", "normalized_bank_address", "normalized_bank_email",
+            "normalized_beneficiary_account_number", "normalized_account_number",
+            "normalized_bank_account_number", "normalized_bank_account_type",
             "normalized_ifsc", "normalized_micr_code", "normalized_neft_code",
             # Bank branch contact
             "normalized_bank_branch_address_line1", "normalized_bank_branch_address_line2",
@@ -158,10 +160,10 @@ class VendorAttachmentCreateSerializer(serializers.Serializer):
     document_type = serializers.CharField(max_length=100, required=False, allow_blank=True, default="")
 
     def validate_document_type(self, value):
-        if value and value not in ALLOWED_ATTACHMENT_DOCUMENT_TYPES:
+        if value and value not in ACTIVE_VENDOR_ATTACHMENT_DOCUMENT_TYPES:
             raise serializers.ValidationError(
                 f"document_type '{value}' is not allowed. "
-                f"Accepted types: {', '.join(sorted(ALLOWED_ATTACHMENT_DOCUMENT_TYPES))}"
+                f"Accepted types: {', '.join(sorted(ACTIVE_VENDOR_ATTACHMENT_DOCUMENT_TYPES))}"
             )
         return value
 
@@ -229,7 +231,9 @@ class VendorSerializer(serializers.ModelSerializer):
             "city", "state", "country", "pincode",
             # Bank
             "preferred_payment_mode", "beneficiary_name", "bank_name",
-            "account_number", "bank_account_type", "ifsc", "micr_code", "neft_code",
+            "bank_address", "bank_email", "beneficiary_account_number",
+            "account_number", "bank_account_number", "bank_account_type",
+            "ifsc", "micr_code", "neft_code",
             # Bank branch
             "bank_branch_address_line1", "bank_branch_address_line2",
             "bank_branch_city", "bank_branch_state",
@@ -260,7 +264,9 @@ class VendorSerializer(serializers.ModelSerializer):
             "address_line1", "address_line2", "address_line3",
             "city", "state", "country", "pincode",
             "preferred_payment_mode", "beneficiary_name", "bank_name",
-            "account_number", "bank_account_type", "ifsc", "micr_code", "neft_code",
+            "bank_address", "bank_email", "beneficiary_account_number",
+            "account_number", "bank_account_number", "bank_account_type",
+            "ifsc", "micr_code", "neft_code",
             "bank_branch_address_line1", "bank_branch_address_line2",
             "bank_branch_city", "bank_branch_state",
             "bank_branch_country", "bank_branch_pincode",
@@ -293,7 +299,7 @@ class VendorUpdateSerializer(serializers.ModelSerializer):
     """Allows patching only safe fields."""
     class Meta:
         model = Vendor
-        fields = ["po_mandate_enabled", "email", "phone"]
+        fields = ["email", "phone"]
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +324,7 @@ class FinanceRejectSerializer(serializers.Serializer):
 
 
 class MarketingApproveSerializer(serializers.Serializer):
-    po_mandate_enabled = serializers.BooleanField(default=False)
+    pass
 
 
 class MarketingRejectSerializer(serializers.Serializer):
@@ -511,8 +517,12 @@ class PublicFinanceTokenSerializer(serializers.ModelSerializer):
     pincode = serializers.CharField(source="submission.normalized_pincode", read_only=True)
     preferred_payment_mode = serializers.CharField(source="submission.normalized_preferred_payment_mode", read_only=True)
     beneficiary_name = serializers.CharField(source="submission.normalized_beneficiary_name", read_only=True)
+    beneficiary_account_number = serializers.CharField(source="submission.normalized_beneficiary_account_number", read_only=True)
     bank_name = serializers.CharField(source="submission.normalized_bank_name", read_only=True)
+    bank_address = serializers.CharField(source="submission.normalized_bank_address", read_only=True)
+    bank_email = serializers.CharField(source="submission.normalized_bank_email", read_only=True)
     account_number = serializers.CharField(source="submission.normalized_account_number", read_only=True)
+    bank_account_number = serializers.CharField(source="submission.normalized_bank_account_number", read_only=True)
     bank_account_type = serializers.CharField(source="submission.normalized_bank_account_type", read_only=True)
     ifsc = serializers.CharField(source="submission.normalized_ifsc", read_only=True)
     micr_code = serializers.CharField(source="submission.normalized_micr_code", read_only=True)
@@ -544,6 +554,8 @@ class PublicFinanceTokenSerializer(serializers.ModelSerializer):
 
     # Paired reject token (only populated when action_type=approve)
     reject_token = serializers.SerializerMethodField()
+    latest_finance_decision = serializers.SerializerMethodField()
+    finance_decision_history = serializers.SerializerMethodField()
 
     class Meta:
         model = VendorFinanceActionToken
@@ -553,8 +565,9 @@ class PublicFinanceTokenSerializer(serializers.ModelSerializer):
             "title", "vendor_name", "vendor_email", "vendor_phone", "fax", "vendor_type",
             "gst_registered", "gstin", "pan", "region", "head_office_no",
             "address_line1", "address_line2", "address_line3", "city", "state", "country", "pincode",
-            "preferred_payment_mode", "beneficiary_name", "bank_name", "account_number",
-            "bank_account_type", "ifsc", "micr_code", "neft_code",
+            "preferred_payment_mode", "beneficiary_name", "beneficiary_account_number",
+            "bank_name", "bank_address", "bank_email", "account_number",
+            "bank_account_number", "bank_account_type", "ifsc", "micr_code", "neft_code",
             "bank_branch_address_line1", "bank_branch_address_line2", "bank_branch_city",
             "bank_branch_state", "bank_branch_country", "bank_branch_pincode",
             "bank_phone", "bank_fax",
@@ -564,6 +577,7 @@ class PublicFinanceTokenSerializer(serializers.ModelSerializer):
             "has_exported_excel", "exported_excel_download_url",
             "has_source_excel", "source_excel_download_url",
             "attachments", "reject_token",
+            "latest_finance_decision", "finance_decision_history",
         ]
 
     def get_is_expired(self, obj):
@@ -611,6 +625,16 @@ class PublicFinanceTokenSerializer(serializers.ModelSerializer):
                 ),
             })
         return result
+
+    def get_latest_finance_decision(self, obj):
+        decision = obj.submission.finance_decisions.order_by("-acted_at", "-id").first()
+        if not decision:
+            return None
+        return VendorFinanceDecisionSerializer(decision).data
+
+    def get_finance_decision_history(self, obj):
+        decisions = obj.submission.finance_decisions.order_by("-acted_at", "-id")
+        return VendorFinanceDecisionSerializer(decisions, many=True).data
 
     def get_reject_token(self, obj):
         if obj.action_type == FinanceActionType.APPROVE:

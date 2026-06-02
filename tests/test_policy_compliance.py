@@ -390,7 +390,7 @@ class TestVendorHighRiskActions:
         api_client.force_authenticate(user=company_user)
         resp = api_client.post(
             f"/api/v1/vendors/{entity_vendor.id}/marketing-approve/",
-            {"po_mandate_enabled": False},
+            {},
         )
         assert resp.status_code == http_status.HTTP_403_FORBIDDEN
 

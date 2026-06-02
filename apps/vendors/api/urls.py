@@ -10,6 +10,7 @@ from apps.vendors.api.views import (
     PublicFinanceDownloadSourceView,
     PublicFinanceRejectView,
     PublicInvitationAttachView,
+    PublicInvitationAttachmentDetailView,
     PublicInvitationFinalizeView,
     PublicInvitationSubmissionView,
     PublicInvitationSubmitExcelView,
@@ -94,6 +95,11 @@ urlpatterns = [
         "public/invitations/<str:token>/attachments/",
         PublicInvitationAttachView.as_view(),
         name="public-invitation-attachments",
+    ),
+    path(
+        "public/invitations/<str:token>/attachments/<int:attachment_id>/",
+        PublicInvitationAttachmentDetailView.as_view(),
+        name="public-invitation-attachment-detail",
     ),
     path(
         "public/invitations/<str:token>/finalize/",

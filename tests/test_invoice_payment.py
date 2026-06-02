@@ -6,7 +6,9 @@ from decimal import Decimal
 from datetime import date
 
 from django.contrib.auth import get_user_model
+from django.test import override_settings
 
+from apps.access.models import Role, UserRoleAssignment
 from apps.core.models import Organization, ScopeNode, NodeType
 from apps.invoices.models import (
     Invoice, InvoiceStatus, InvoicePayment,
@@ -50,6 +52,14 @@ def admin_user(db):
     return user
 
 
+@pytest.fixture
+def finance_user(db, org, company):
+    user = User.objects.create_user(email="finance@acme.com", password="pass")
+    role = Role.objects.create(org=org, code="finance_team", name="Finance Team")
+    UserRoleAssignment.objects.create(user=user, role=role, scope_node=company)
+    return user
+
+
 def _finance_approved_invoice(company, creator):
     return Invoice.objects.create(
         scope_node=company, title="Invoice F", amount=Decimal("10000.00"),
@@ -87,9 +97,21 @@ class TestCanUserRecordPayment:
         inv = _paid_invoice(company, creator)
         assert can_user_record_invoice_payment(creator, inv) is False
 
-    def test_true_for_finance_approved_creator(self, org, company, creator):
+    def test_false_for_finance_approved_creator(self, org, company, creator):
         inv = _finance_approved_invoice(company, creator)
-        assert can_user_record_invoice_payment(creator, inv) is True
+        assert can_user_record_invoice_payment(creator, inv) is False
+
+    def test_true_for_finance_team(self, org, company, creator, finance_user):
+        inv = _finance_approved_invoice(company, creator)
+        assert can_user_record_invoice_payment(finance_user, inv) is True
+
+    @override_settings(FINANCE_ROLE_CODES={"accounts_payable"})
+    def test_true_for_configured_finance_role(self, org, company, creator):
+        user = User.objects.create_user(email="ap@acme.com", password="pass")
+        role = Role.objects.create(org=org, code="accounts_payable", name="Accounts Payable")
+        UserRoleAssignment.objects.create(user=user, role=role, scope_node=company)
+        inv = _finance_approved_invoice(company, creator)
+        assert can_user_record_invoice_payment(user, inv) is True
 
     def test_true_for_superuser(self, org, company, admin_user):
         inv = _finance_approved_invoice(company, admin_user)
@@ -121,9 +143,14 @@ class TestRecordPaymentBasic:
         assert payment.id is not None
         assert payment.payment_status == InvoicePaymentStatus.PENDING
 
-    def test_creator_can_record_pending(self, org, company, creator):
+    def test_creator_cannot_record_pending(self, org, company, creator):
         inv = _finance_approved_invoice(company, creator)
-        payment = record_invoice_payment(inv, creator, {})
+        with pytest.raises(PaymentPermissionError):
+            record_invoice_payment(inv, creator, {})
+
+    def test_finance_team_can_record_pending(self, org, company, creator, finance_user):
+        inv = _finance_approved_invoice(company, creator)
+        payment = record_invoice_payment(inv, finance_user, {})
         assert payment.id is not None
         assert payment.payment_status == InvoicePaymentStatus.PENDING
 
@@ -133,22 +160,21 @@ class TestRecordPaymentBasic:
 # ---------------------------------------------------------------------------
 
 class TestMarkAsPaidRequiresFields:
-    def test_missing_payment_method_raises(self, org, company, creator):
+    def test_payment_method_is_optional(self, org, company, creator, finance_user):
         inv = _finance_approved_invoice(company, creator)
-        with pytest.raises(PaymentValidationError) as exc_info:
-            record_invoice_payment(inv, creator, {
-                "payment_status": "paid",
-                "payment_date": date(2025, 4, 10),
-                "paid_amount": Decimal("10000.00"),
-                "payment_reference_number": "REF-001",
-            })
-        assert isinstance(exc_info.value.args[0], dict)
-        assert "payment_method" in exc_info.value.args[0]
+        payment = record_invoice_payment(inv, finance_user, {
+            "payment_status": "paid",
+            "payment_date": date(2025, 4, 10),
+            "paid_amount": Decimal("10000.00"),
+            "utr_number": "UTR-001",
+        })
+        assert payment.payment_status == InvoicePaymentStatus.PAID
+        assert payment.payment_method in ("", None)
 
-    def test_missing_payment_date_raises(self, org, company, creator):
+    def test_missing_payment_date_raises(self, org, company, creator, finance_user):
         inv = _finance_approved_invoice(company, creator)
         with pytest.raises(PaymentValidationError) as exc_info:
-            record_invoice_payment(inv, creator, {
+            record_invoice_payment(inv, finance_user, {
                 "payment_status": "paid",
                 "payment_method": "bank_transfer",
                 "paid_amount": Decimal("10000.00"),
@@ -157,34 +183,35 @@ class TestMarkAsPaidRequiresFields:
         assert isinstance(exc_info.value.args[0], dict)
         assert "payment_date" in exc_info.value.args[0]
 
-    def test_zero_amount_raises(self, org, company, creator):
+    def test_zero_amount_raises(self, org, company, creator, finance_user):
         inv = _finance_approved_invoice(company, creator)
         with pytest.raises(PaymentValidationError) as exc_info:
-            record_invoice_payment(inv, creator, {
+            record_invoice_payment(inv, finance_user, {
                 "payment_status": "paid",
                 "payment_method": "rtgs",
                 "payment_date": date(2025, 4, 10),
                 "paid_amount": Decimal("0.00"),
-                "payment_reference_number": "REF-001",
+                "utr_number": "UTR-001",
             })
         assert isinstance(exc_info.value.args[0], dict)
         assert "paid_amount" in exc_info.value.args[0]
 
-    def test_missing_ref_and_utr_raises(self, org, company, creator):
+    def test_missing_utr_raises(self, org, company, creator, finance_user):
         inv = _finance_approved_invoice(company, creator)
         with pytest.raises(PaymentValidationError) as exc_info:
-            record_invoice_payment(inv, creator, {
+            record_invoice_payment(inv, finance_user, {
                 "payment_status": "paid",
                 "payment_method": "neft",
                 "payment_date": date(2025, 4, 10),
                 "paid_amount": Decimal("10000.00"),
+                "payment_reference_number": "REF-001",
             })
         assert isinstance(exc_info.value.args[0], dict)
-        assert any(k in exc_info.value.args[0] for k in ("utr_number", "payment_reference_number"))
+        assert "utr_number" in exc_info.value.args[0]
 
-    def test_valid_paid_succeeds(self, org, company, creator):
+    def test_valid_paid_succeeds(self, org, company, creator, finance_user):
         inv = _finance_approved_invoice(company, creator)
-        payment = record_invoice_payment(inv, creator, {
+        payment = record_invoice_payment(inv, finance_user, {
             "payment_status": "paid",
             "payment_method": "rtgs",
             "payment_date": date(2025, 4, 10),
@@ -194,18 +221,20 @@ class TestMarkAsPaidRequiresFields:
         })
         assert payment.payment_status == InvoicePaymentStatus.PAID
         assert payment.payment_method == PaymentMethod.RTGS
-        assert payment.recorded_by == creator
+        assert payment.recorded_by == finance_user
 
-    def test_ref_number_alone_is_sufficient(self, org, company, creator):
+    def test_ref_number_alone_is_not_sufficient(self, org, company, creator, finance_user):
         inv = _finance_approved_invoice(company, creator)
-        payment = record_invoice_payment(inv, creator, {
-            "payment_status": "paid",
-            "payment_method": "upi",
-            "payment_date": date(2025, 4, 10),
-            "paid_amount": Decimal("5000.00"),
-            "payment_reference_number": "REF-ONLY",
-        })
-        assert payment.payment_status == InvoicePaymentStatus.PAID
+        with pytest.raises(PaymentValidationError) as exc_info:
+            record_invoice_payment(inv, finance_user, {
+                "payment_status": "paid",
+                "payment_method": "upi",
+                "payment_date": date(2025, 4, 10),
+                "paid_amount": Decimal("5000.00"),
+                "payment_reference_number": "REF-ONLY",
+            })
+        assert isinstance(exc_info.value.args[0], dict)
+        assert "utr_number" in exc_info.value.args[0]
 
 
 # ---------------------------------------------------------------------------
@@ -213,9 +242,9 @@ class TestMarkAsPaidRequiresFields:
 # ---------------------------------------------------------------------------
 
 class TestPaymentUpdateAndInvoiceStatus:
-    def test_second_call_updates_existing(self, org, company, creator, admin_user):
+    def test_second_call_updates_existing(self, org, company, creator, admin_user, finance_user):
         inv = _finance_approved_invoice(company, creator)
-        p1 = record_invoice_payment(inv, creator, {"remarks": "Initial"})
+        p1 = record_invoice_payment(inv, finance_user, {"remarks": "Initial"})
         assert p1.payment_status == InvoicePaymentStatus.PENDING
 
         p2 = record_invoice_payment(
@@ -232,18 +261,19 @@ class TestPaymentUpdateAndInvoiceStatus:
         assert p2.pk == p1.pk
         assert p2.payment_status == InvoicePaymentStatus.PAID
         assert p2.updated_by == admin_user
-        assert p2.recorded_by == creator  # preserved from first record
+        assert p2.recorded_by == finance_user  # preserved from first record
 
-    def test_marking_paid_updates_invoice_status(self, org, company, creator):
+    def test_marking_paid_updates_invoice_status(self, org, company, creator, finance_user):
         inv = _finance_approved_invoice(company, creator)
         record_invoice_payment(
-            inv, creator,
+            inv, finance_user,
             {
                 "payment_status": "paid",
                 "payment_method": "bank_transfer",
                 "payment_date": date(2025, 4, 10),
                 "paid_amount": Decimal("10000.00"),
                 "payment_reference_number": "REF-001",
+                "utr_number": "UTR-001",
             },
         )
         inv.refresh_from_db()
@@ -276,10 +306,10 @@ class TestGetOrCreatePayment:
 # ---------------------------------------------------------------------------
 
 class TestPaymentRecordFields:
-    def test_all_reference_fields_stored(self, org, company, creator):
+    def test_all_reference_fields_stored(self, org, company, creator, finance_user):
         inv = _finance_approved_invoice(company, creator)
         payment = record_invoice_payment(
-            inv, creator,
+            inv, finance_user,
             {
                 "payment_status": "paid",
                 "payment_method": "cheque",

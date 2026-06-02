@@ -92,7 +92,7 @@ class InvoiceSerializer(serializers.ModelSerializer):
 
 
 class InvoiceCreateSerializer(serializers.Serializer):
-    """Serializer for invoice creation with PO mandate enforcement."""
+    """Serializer for invoice creation. PO number is optional metadata."""
     scope_node = serializers.PrimaryKeyRelatedField(queryset=ScopeNode.objects.all())
     title = serializers.CharField(max_length=255)
     amount = serializers.DecimalField(max_digits=14, decimal_places=2)
@@ -351,20 +351,16 @@ class InvoicePaymentUpdateSerializer(serializers.Serializer):
     def validate(self, attrs):
         payment_status = attrs.get("payment_status")
         if payment_status == "paid":
-            from apps.invoices.models import PaymentMethod
             errors = {}
-            if not attrs.get("payment_method"):
-                errors.setdefault("payment_method", []).append("Payment method is required when marking as paid.")
             if not attrs.get("payment_date"):
                 errors.setdefault("payment_date", []).append("Payment date is required when marking as paid.")
             amount = attrs.get("paid_amount")
             if not amount or amount <= 0:
                 errors.setdefault("paid_amount", []).append("Paid amount must be greater than zero when marking as paid.")
-            ref = attrs.get("payment_reference_number", "").strip()
             utr = attrs.get("utr_number", "").strip()
-            if not ref and not utr:
+            if not utr:
                 errors.setdefault("utr_number", []).append(
-                    "At least one of payment_reference_number or utr_number is required when marking as paid."
+                    "UTR number is required when marking as paid."
                 )
             if errors:
                 raise serializers.ValidationError(errors)

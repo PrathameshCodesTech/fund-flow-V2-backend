@@ -4,6 +4,7 @@ from apps.finance.models import FinanceDecision, FinanceHandoff
 
 class FinanceHandoffSerializer(serializers.ModelSerializer):
     subject_name = serializers.SerializerMethodField()
+    vendor_name = serializers.SerializerMethodField()
     recipient_emails = serializers.SerializerMethodField()
     recipient_count = serializers.SerializerMethodField()
 
@@ -11,7 +12,7 @@ class FinanceHandoffSerializer(serializers.ModelSerializer):
         model = FinanceHandoff
         fields = [
             "id", "org", "scope_node", "module", "subject_type", "subject_id",
-            "subject_name",
+            "subject_name", "vendor_name",
             "status", "export_file", "submitted_by",
             "finance_reference_id", "sent_at", "created_at", "updated_at",
             "recipient_emails",
@@ -23,6 +24,18 @@ class FinanceHandoffSerializer(serializers.ModelSerializer):
         from apps.finance.services import _get_subject_name
 
         return _get_subject_name(obj)
+
+    def get_vendor_name(self, obj) -> str | None:
+        if obj.module != "invoice":
+            return None
+
+        from apps.invoices.models import Invoice
+
+        return (
+            Invoice.objects.filter(pk=obj.subject_id)
+            .values_list("vendor__vendor_name", flat=True)
+            .first()
+        )
 
     def get_recipient_emails(self, obj) -> list[str]:
         """
@@ -76,6 +89,7 @@ class PublicFinanceTokenSerializer(serializers.Serializer):
     subject_type = serializers.CharField()
     subject_name = serializers.CharField()
     handoff_status = serializers.CharField()
+    reject_token = serializers.CharField(required=False, allow_null=True)
 
 
 # ── Invoice Finance Review Serializers ─────────────────────────────────────────
@@ -84,6 +98,7 @@ class InvoiceFinanceDocumentSerializer(serializers.Serializer):
     id = serializers.IntegerField()
     file_name = serializers.CharField()
     document_type = serializers.CharField()
+    document_group = serializers.CharField()
     uploaded_at = serializers.DateTimeField(allow_null=True)
     url = serializers.CharField(allow_null=True)  # None if not publicly accessible
 
@@ -96,6 +111,26 @@ class InvoiceFinanceVendorSerializer(serializers.Serializer):
     gstin = serializers.CharField(allow_null=True)
     pan = serializers.CharField(allow_null=True)
     sap_vendor_id = serializers.CharField(allow_null=True)
+    preferred_payment_mode = serializers.CharField(allow_null=True, required=False)
+    beneficiary_name = serializers.CharField(allow_null=True, required=False)
+    beneficiary_account_number = serializers.CharField(allow_null=True, required=False)
+    bank_name = serializers.CharField(allow_null=True, required=False)
+    bank_address = serializers.CharField(allow_null=True, required=False)
+    bank_email = serializers.CharField(allow_null=True, required=False)
+    account_number = serializers.CharField(allow_null=True, required=False)
+    bank_account_number = serializers.CharField(allow_null=True, required=False)
+    bank_account_type = serializers.CharField(allow_null=True, required=False)
+    ifsc = serializers.CharField(allow_null=True, required=False)
+    micr_code = serializers.CharField(allow_null=True, required=False)
+    neft_code = serializers.CharField(allow_null=True, required=False)
+    bank_branch_address_line1 = serializers.CharField(allow_null=True, required=False)
+    bank_branch_address_line2 = serializers.CharField(allow_null=True, required=False)
+    bank_branch_city = serializers.CharField(allow_null=True, required=False)
+    bank_branch_state = serializers.CharField(allow_null=True, required=False)
+    bank_branch_country = serializers.CharField(allow_null=True, required=False)
+    bank_branch_pincode = serializers.CharField(allow_null=True, required=False)
+    bank_phone = serializers.CharField(allow_null=True, required=False)
+    bank_fax = serializers.CharField(allow_null=True, required=False)
 
 
 class InvoiceFinanceAllocationSerializer(serializers.Serializer):
@@ -173,6 +208,7 @@ class InvoiceFinanceInvoiceDataSerializer(serializers.Serializer):
     description = serializers.CharField(allow_null=True)
     scope_node_id = serializers.IntegerField()
     scope_node_name = serializers.CharField()
+    can_record_payment = serializers.BooleanField(required=False)
     created_at = serializers.DateTimeField()
     updated_at = serializers.DateTimeField()
 
@@ -189,6 +225,7 @@ class InvoiceFinanceReviewSerializer(serializers.Serializer):
     subject_type = serializers.CharField()
     subject_name = serializers.CharField()
     handoff_status = serializers.CharField()
+    reject_token = serializers.CharField(required=False, allow_null=True)
     handoff = InvoiceFinanceHandoffDataSerializer()
     invoice = InvoiceFinanceInvoiceDataSerializer()
     vendor = InvoiceFinanceVendorSerializer(allow_null=True)
