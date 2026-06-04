@@ -9,6 +9,7 @@ class UserSerializer(serializers.ModelSerializer):
     assigned_roles = serializers.SerializerMethodField()
     capabilities = serializers.SerializerMethodField()
     is_vendor_portal_user = serializers.SerializerMethodField()
+    user_type = serializers.SerializerMethodField()
     vendor_id = serializers.SerializerMethodField()
     vendor_name = serializers.SerializerMethodField()
 
@@ -18,7 +19,7 @@ class UserSerializer(serializers.ModelSerializer):
             "id", "email", "first_name", "last_name", "employee_id",
             "is_active", "is_staff", "is_superuser", "date_joined",
             "assigned_roles", "capabilities",
-            "is_vendor_portal_user", "vendor_id", "vendor_name",
+            "is_vendor_portal_user", "user_type", "vendor_id", "vendor_name",
         )
         read_only_fields = ("id", "date_joined")
 
@@ -44,6 +45,9 @@ class UserSerializer(serializers.ModelSerializer):
     def get_is_vendor_portal_user(self, obj):
         from apps.vendors.models import UserVendorAssignment
         return UserVendorAssignment.objects.filter(user=obj, is_active=True).exists()
+
+    def get_user_type(self, obj):
+        return "vendor" if self.get_is_vendor_portal_user(obj) else "internal"
 
     def get_vendor_id(self, obj):
         from apps.vendors.models import UserVendorAssignment
@@ -105,6 +109,9 @@ class UserListSerializer(serializers.ModelSerializer):
     assigned_roles = serializers.SerializerMethodField()
     capabilities = serializers.SerializerMethodField()
     is_vendor_portal_user = serializers.SerializerMethodField()
+    user_type = serializers.SerializerMethodField()
+    vendor_id = serializers.SerializerMethodField()
+    vendor_name = serializers.SerializerMethodField()
 
     class Meta:
         model = User
@@ -112,6 +119,7 @@ class UserListSerializer(serializers.ModelSerializer):
             "id", "email", "first_name", "last_name", "employee_id",
             "is_active", "is_staff", "date_joined",
             "assigned_roles", "capabilities", "is_vendor_portal_user",
+            "user_type", "vendor_id", "vendor_name",
         )
         read_only_fields = ("id", "date_joined")
 
@@ -137,6 +145,29 @@ class UserListSerializer(serializers.ModelSerializer):
     def get_is_vendor_portal_user(self, obj):
         from apps.vendors.models import UserVendorAssignment
         return UserVendorAssignment.objects.filter(user=obj, is_active=True).exists()
+
+    def get_user_type(self, obj):
+        return "vendor" if self.get_is_vendor_portal_user(obj) else "internal"
+
+    def get_vendor_id(self, obj):
+        from apps.vendors.models import UserVendorAssignment
+        assignment = (
+            UserVendorAssignment.objects
+            .select_related("vendor")
+            .filter(user=obj, is_active=True)
+            .first()
+        )
+        return str(assignment.vendor_id) if assignment else None
+
+    def get_vendor_name(self, obj):
+        from apps.vendors.models import UserVendorAssignment
+        assignment = (
+            UserVendorAssignment.objects
+            .select_related("vendor")
+            .filter(user=obj, is_active=True)
+            .first()
+        )
+        return assignment.vendor.vendor_name if assignment else None
 
 
 class UserUpdateSerializer(serializers.ModelSerializer):

@@ -17,6 +17,7 @@ from apps.vendors.models import (
     VendorFinanceActionToken,
     VendorInvitation,
     VendorOnboardingSubmission,
+    VendorTrainingVideo,
 )
 from apps.vendors.services import (
     FinanceTokenError,
@@ -69,6 +70,7 @@ from apps.vendors.api.serializers import (
     VendorSubmissionRouteCreateSerializer,
     VendorSubmissionRouteUpdateSerializer,
     VendorSubmissionRouteVendorSerializer,
+    VendorTrainingVideoSerializer,
 )
 
 
@@ -1099,6 +1101,33 @@ class VendorPortalProfileView(APIView):
             "profile_hold_reason": vendor.profile_hold_reason,
             "snapshot": snapshot,
             "documents": documents,
+        })
+
+
+class VendorPortalTrainingVideoView(APIView):
+    """
+    GET /api/v1/vendors/portal/training-video/
+    Returns the latest active training video for authenticated vendor users.
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from apps.vendors.models import UserVendorAssignment
+
+        has_vendor_account = UserVendorAssignment.objects.filter(
+            user=request.user,
+            is_active=True,
+        ).exists()
+        if not has_vendor_account:
+            return Response({"detail": "No vendor account linked."}, status=status.HTTP_404_NOT_FOUND)
+
+        video = VendorTrainingVideo.objects.filter(is_active=True).first()
+        return Response({
+            "video": (
+                VendorTrainingVideoSerializer(video, context={"request": request}).data
+                if video
+                else None
+            )
         })
 
 

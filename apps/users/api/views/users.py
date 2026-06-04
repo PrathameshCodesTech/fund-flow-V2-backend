@@ -57,6 +57,7 @@ class UserViewSet(viewsets.ModelViewSet):
         qs = User.objects.all()
         q = self.request.query_params.get("q")
         is_active = self.request.query_params.get("is_active")
+        user_type = (self.request.query_params.get("user_type") or "").strip().lower()
 
         if q:
             qs = qs.filter(
@@ -67,6 +68,10 @@ class UserViewSet(viewsets.ModelViewSet):
         if is_active is not None:
             is_active_bool = is_active.lower() in ("true", "1", "yes")
             qs = qs.filter(is_active=is_active_bool)
+        if user_type == "vendor":
+            qs = qs.filter(vendor_assignments__is_active=True).distinct()
+        elif user_type == "internal":
+            qs = qs.exclude(vendor_assignments__is_active=True).distinct()
 
         return qs
 

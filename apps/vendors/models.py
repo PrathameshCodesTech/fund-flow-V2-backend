@@ -1,6 +1,8 @@
 import secrets
+from pathlib import Path
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import models
 from django.utils import timezone
 
@@ -671,6 +673,62 @@ class VendorActivationToken(models.Model):
 
     def is_valid(self) -> bool:
         return not self.is_expired() and not self.is_used()
+
+
+# ---------------------------------------------------------------------------
+# Vendor Portal Training Video
+# ---------------------------------------------------------------------------
+
+def _vendor_training_video_upload_path(instance, filename):
+    return f"vendor_training/videos/{timezone.now():%Y/%m}/{filename}"
+
+
+class VendorTrainingVideo(models.Model):
+    """
+    Admin-managed training video shown inside the vendor portal.
+
+    Only the latest active row is exposed to vendors. Saving an active video
+    deactivates older active videos, so admins can replace training content
+    without changing frontend code.
+    """
+    ALLOWED_EXTENSIONS = {".mp4", ".webm", ".mov", ".m4v"}
+
+    title = models.CharField(max_length=255, default="How to Submit an Invoice")
+    description = models.TextField(blank=True)
+    video_file = models.FileField(upload_to=_vendor_training_video_upload_path)
+    is_active = models.BooleanField(default=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="created_vendor_training_videos",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "vendor_training_videos"
+        ordering = ["-updated_at", "-id"]
+        indexes = [
+            models.Index(fields=["is_active", "-updated_at"]),
+        ]
+
+    def __str__(self):
+        return self.title
+
+    def clean(self):
+        super().clean()
+        if self.video_file:
+            extension = Path(self.video_file.name).suffix.lower()
+            if extension not in self.ALLOWED_EXTENSIONS:
+                allowed = ", ".join(sorted(self.ALLOWED_EXTENSIONS))
+                raise ValidationError({"video_file": f"Upload a supported video file: {allowed}."})
+
+    def save(self, *args, **kwargs):
+        super().save(*args, **kwargs)
+        if self.is_active:
+            VendorTrainingVideo.objects.exclude(pk=self.pk).filter(is_active=True).update(is_active=False)
 
 
 # ---------------------------------------------------------------------------

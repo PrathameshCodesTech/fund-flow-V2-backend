@@ -25,6 +25,7 @@ from apps.vendors.api.views import (
     VendorPortalRevisionHistoryView,
     VendorPortalSaveDraftRevisionView,
     VendorPortalSubmitRevisionView,
+    VendorPortalTrainingVideoView,
     VendorProfileRevisionViewSet,
     VendorSendToOptionsView,
     VendorSubmissionRouteViewSet,
@@ -59,6 +60,7 @@ urlpatterns = [
     ),
 
     # Vendor portal profile revision endpoints
+    path("portal/training-video/", VendorPortalTrainingVideoView.as_view(), name="portal-training-video"),
     path("portal/profile/", VendorPortalProfileView.as_view(), name="portal-profile"),
     path("portal/profile/revision/", VendorPortalProfileRevisionView.as_view(), name="portal-profile-revision"),
     path("portal/profile/revision/save-draft/", VendorPortalSaveDraftRevisionView.as_view(), name="portal-profile-revision-save-draft"),

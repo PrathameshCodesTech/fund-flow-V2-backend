@@ -12,6 +12,7 @@ from apps.vendors.models import (
     VendorOnboardingSubmission,
     VendorProfileRevision,
     VendorSubmissionRoute,
+    VendorTrainingVideo,
 )
 
 
@@ -166,6 +167,29 @@ class VendorAttachmentCreateSerializer(serializers.Serializer):
                 f"Accepted types: {', '.join(sorted(ACTIVE_VENDOR_ATTACHMENT_DOCUMENT_TYPES))}"
             )
         return value
+
+
+class VendorTrainingVideoSerializer(serializers.ModelSerializer):
+    video_url = serializers.SerializerMethodField()
+    file_name = serializers.SerializerMethodField()
+
+    class Meta:
+        model = VendorTrainingVideo
+        fields = ["id", "title", "description", "video_url", "file_name", "updated_at"]
+        read_only_fields = fields
+
+    def get_video_url(self, obj):
+        if not obj.video_file:
+            return ""
+        request = self.context.get("request")
+        if request:
+            return request.build_absolute_uri(obj.video_file.url)
+        return obj.video_file.url
+
+    def get_file_name(self, obj):
+        if not obj.video_file:
+            return ""
+        return obj.video_file.name.rsplit("/", 1)[-1]
 
 
 # ---------------------------------------------------------------------------
