@@ -1610,7 +1610,7 @@ def finance_approve_submission(
     - Submission must be sent_to_finance or reopened.
     - Creates VendorFinanceDecision (approved).
     - Creates or updates the Vendor master record.
-    - Transitions submission to marketing_pending.
+    - Activates the vendor and sends the portal activation email.
 
     Returns (submission, vendor).
 
@@ -1666,16 +1666,44 @@ def approve_vendor_submission_finance(
 
     # Update submission
     submission.finance_vendor_code = sap_vendor_id.strip()
-    submission.status = SubmissionStatus.MARKETING_PENDING
+    submission.status = SubmissionStatus.ACTIVATED
     submission.save(update_fields=["finance_vendor_code", "status", "updated_at"])
 
     # Create or upsert Vendor
     invitation = submission.invitation
     vendor_defaults = _build_vendor_defaults_from_submission(submission, invitation)
     vendor_defaults["sap_vendor_id"] = sap_vendor_id.strip()
+    vendor_defaults["marketing_status"] = MarketingStatus.APPROVED
+    vendor_defaults["operational_status"] = OperationalStatus.ACTIVE
+    vendor_defaults["approved_by_marketing"] = actor
+    vendor_defaults["approved_at"] = now
+    vendor_defaults["po_mandate_enabled"] = False
     vendor, _ = Vendor.objects.update_or_create(
         onboarding_submission=submission,
         defaults=vendor_defaults,
+    )
+
+    # Ensure existing vendors created before this rule are activated as well.
+    update_fields = []
+    for field_name, value in (
+        ("marketing_status", MarketingStatus.APPROVED),
+        ("operational_status", OperationalStatus.ACTIVE),
+        ("approved_by_marketing", actor),
+        ("approved_at", now),
+        ("po_mandate_enabled", False),
+    ):
+        if getattr(vendor, field_name) != value:
+            setattr(vendor, field_name, value)
+            update_fields.append(field_name)
+    if update_fields:
+        update_fields.append("updated_at")
+        vendor.save(update_fields=update_fields)
+
+    # Send portal activation (mandatory — raises on failure, rolls back transaction)
+    activation_result = send_vendor_activation_for_vendor(vendor, actor=actor)
+    contact_notice_result = send_vendor_contact_activation_notices(
+        vendor,
+        primary_vendor_email=activation_result["email"],
     )
 
     _build_audit_log(
@@ -1683,15 +1711,13 @@ def approve_vendor_submission_finance(
         action="vendor_finance_approved",
         resource_type="VendorOnboardingSubmission",
         resource_id=submission.pk,
-        metadata={"sap_vendor_id": sap_vendor_id, "vendor_id": vendor.pk},
+        metadata={
+            "sap_vendor_id": sap_vendor_id,
+            "vendor_id": vendor.pk,
+            **activation_result,
+            **contact_notice_result,
+        },
     )
-
-    # Notify vendor and inviter of the approval + marketing next step
-    from apps.vendors.notifications import notify_vendor_approved
-    try:
-        notify_vendor_approved(submission, vendor)
-    except Exception:
-        pass  # Notification failure does not roll back the state transition
 
     return submission, vendor
 

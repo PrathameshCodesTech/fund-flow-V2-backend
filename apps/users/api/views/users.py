@@ -1,4 +1,5 @@
 from rest_framework import viewsets, filters, status
+from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from django.db.models import Q
@@ -20,6 +21,8 @@ class IsAdminOrReadOnly:
 
     def has_permission(self, request, view):
         if request.method in ("GET", "HEAD", "OPTIONS"):
+            return request.user and request.user.is_authenticated
+        if getattr(view, "action", None) == "send_password_reset":
             return request.user and request.user.is_authenticated
         return request.user and request.user.is_authenticated and request.user.is_staff
 
@@ -84,3 +87,29 @@ class UserViewSet(viewsets.ModelViewSet):
             UserSerializer(user).data,
             status=status.HTTP_201_CREATED,
         )
+
+    @action(detail=True, methods=["post"], url_path="send-password-reset")
+    def send_password_reset(self, request, pk=None):
+        from apps.users.services import can_admin_reset_password, send_password_reset_for_user
+
+        if not can_admin_reset_password(request.user):
+            return Response(
+                {"detail": "You do not have permission to send password reset emails."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        user = self.get_object()
+        try:
+            result = send_password_reset_for_user(target_user=user, requested_by=request.user)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as exc:
+            return Response(
+                {"detail": f"Failed to send password reset email: {exc}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        return Response({
+            "detail": "Password reset email sent.",
+            **result,
+        })
