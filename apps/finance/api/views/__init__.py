@@ -240,7 +240,7 @@ class PublicFinanceTokenView(APIView):
         base_data = {
             "action_type": action_token.action_type,
             "is_expired": action_token.is_expired(),
-            "is_used": action_token.is_used(),
+            "is_used": action_token.is_used() or not handoff.is_active(),
             "module": handoff.module,
             "subject_type": handoff.subject_type,
             "subject_name": self._get_subject_name(handoff),
