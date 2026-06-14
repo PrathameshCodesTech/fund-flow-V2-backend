@@ -1,3 +1,4 @@
+import logging
 from decimal import Decimal
 
 from django.db import transaction
@@ -32,6 +33,8 @@ from apps.notifications.models import (
     NotificationChannel,
     NotificationStatus,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -598,11 +601,19 @@ def _sync_subject_status_on_workflow_change(instance):
                 Invoice.objects.filter(pk=instance.subject_id).update(
                     status=InvoiceStatus.FINANCE_PENDING
                 )
-            except FinanceHandoffError:
+            except FinanceHandoffError as exc:
                 # Keep the invoice internally approved and leave the handoff in
                 # PENDING when finance recipients or email delivery are not
                 # ready. Ops can fix assignments and resend from Finance Handoffs.
-                pass
+                logger.exception(
+                    "Failed to create/send finance handoff for invoice workflow. "
+                    "workflow_instance_id=%s invoice_id=%s scope_node_id=%s started_by_id=%s error=%s",
+                    instance.id,
+                    instance.subject_id,
+                    instance.subject_scope_node_id,
+                    instance.started_by_id,
+                    exc,
+                )
 
     elif instance.subject_type == "campaign":
         from apps.campaigns.models import Campaign, CampaignStatus
@@ -646,11 +657,19 @@ def _sync_subject_status_on_workflow_change(instance):
                 Campaign.objects.filter(pk=instance.subject_id).update(
                     status=CampaignStatus.FINANCE_PENDING
                 )
-            except FinanceHandoffError:
+            except FinanceHandoffError as exc:
                 # Keep the campaign internally approved and leave the handoff in
                 # PENDING when finance recipients or email delivery are not
                 # ready. Ops can fix assignments and resend from Finance Handoffs.
-                pass
+                logger.exception(
+                    "Failed to create/send finance handoff for campaign workflow. "
+                    "workflow_instance_id=%s campaign_id=%s scope_node_id=%s started_by_id=%s error=%s",
+                    instance.id,
+                    instance.subject_id,
+                    instance.subject_scope_node_id,
+                    instance.started_by_id,
+                    exc,
+                )
 
 
 def _return_vendor_submission_for_correction(instance, acted_by, note="") -> bool:
