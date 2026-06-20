@@ -33,6 +33,7 @@ INSTALLED_APPS = [
     "apps.finance",
     "apps.dashboard",
     "apps.manual_expenses",
+    "apps.document_ingestion",
 ]
 
 MIDDLEWARE = [
@@ -99,6 +100,11 @@ VENDOR_PORTAL_BASE_URL = config("VENDOR_PORTAL_BASE_URL", default="http://localh
 FINANCE_REVIEW_BASE_URL = config("FINANCE_REVIEW_BASE_URL", default=VENDOR_PORTAL_BASE_URL)
 VENDOR_FINANCE_TOKEN_EXPIRY_HOURS = config("VENDOR_FINANCE_TOKEN_EXPIRY_HOURS", default=72, cast=int)
 VENDOR_MSME_TESSERACT_CMD = config("VENDOR_MSME_TESSERACT_CMD", default="")
+
+# External document ingestion safety limits. Provider credentials are supplied
+# by connector-specific environment variables and are never stored in the DB.
+DOCUMENT_INGESTION_MAX_FILE_SIZE_MB = config("DOCUMENT_INGESTION_MAX_FILE_SIZE_MB", default=25, cast=int)
+DOCUMENT_INGESTION_MAX_PDF_PAGES = config("DOCUMENT_INGESTION_MAX_PDF_PAGES", default=50, cast=int)
 
 # Azure Document Intelligence
 AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT = config("AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT", default="")

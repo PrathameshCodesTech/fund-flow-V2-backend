@@ -23,6 +23,7 @@ urlpatterns = [
     path("api/v1/finance/", include("apps.finance.api.urls")),
     path("api/v1/dashboard/", include("apps.dashboard.api.urls")),
     path("api/v1/manual-expenses/", include("apps.manual_expenses.api.urls")),
+    path("api/v1/document-ingestion/", include("apps.document_ingestion.api.urls")),
 ]
 
 if settings.DEBUG:
