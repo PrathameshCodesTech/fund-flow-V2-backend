@@ -82,6 +82,26 @@ class ImportRowStatus(models.TextChoices):
     SKIPPED = "skipped", "Skipped"
 
 
+class BudgetRevisionSource(models.TextChoices):
+    MANUAL = "manual", "Manual Edit"
+    EXCEL = "excel", "Excel Upload"
+
+
+class BudgetRevisionStatus(models.TextChoices):
+    DRAFT = "draft", "Draft"
+    VALIDATED = "validated", "Validated"
+    PUBLISHED = "published", "Published"
+    REJECTED = "rejected", "Rejected"
+    CANCELLED = "cancelled", "Cancelled"
+
+
+class BudgetRevisionLineChangeType(models.TextChoices):
+    ADDED = "added", "Added"
+    UPDATED = "updated", "Updated"
+    REMOVED = "removed", "Removed"
+    UNCHANGED = "unchanged", "Unchanged"
+
+
 # ---------------------------------------------------------------------------
 # BudgetCategory
 # ---------------------------------------------------------------------------
@@ -324,6 +344,141 @@ class BudgetLine(models.Model):
             return Decimal("0")
         result = ((self.reserved_amount + self.consumed_amount) / self.allocated_amount) * 100
         return min(result, Decimal("200"))
+
+
+# ---------------------------------------------------------------------------
+# Budget revisions
+# ---------------------------------------------------------------------------
+
+class BudgetRevision(models.Model):
+    """
+    Immutable proposed allocation plan for one Budget.
+
+    Manual edits and scoped Excel uploads both create a revision first. Only a
+    published revision changes the live Budget and BudgetLine allocations.
+    """
+    budget = models.ForeignKey(
+        Budget,
+        on_delete=models.PROTECT,
+        related_name="revisions",
+    )
+    revision_number = models.PositiveIntegerField()
+    source = models.CharField(
+        max_length=20,
+        choices=BudgetRevisionSource.choices,
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=BudgetRevisionStatus.choices,
+        default=BudgetRevisionStatus.DRAFT,
+    )
+    change_reason = models.TextField()
+    source_file = models.FileField(
+        upload_to="budget_revisions/source_files/",
+        null=True,
+        blank=True,
+    )
+    source_file_name = models.CharField(max_length=500, blank=True)
+    base_budget_updated_at = models.DateTimeField(
+        help_text="Optimistic concurrency marker captured when the revision was created.",
+    )
+    before_snapshot = models.JSONField(default=dict, blank=True)
+    after_snapshot = models.JSONField(default=dict, blank=True)
+    validation_errors = models.JSONField(default=list, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="created_budget_revisions",
+    )
+    published_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="published_budget_revisions",
+    )
+    published_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "budget_revisions"
+        ordering = ["-revision_number"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["budget", "revision_number"],
+                name="unique_budget_revision_number",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["budget", "status"]),
+            models.Index(fields=["created_by"]),
+        ]
+
+    def __str__(self):
+        return f"BudgetRevision {self.budget_id} v{self.revision_number} [{self.status}]"
+
+
+class BudgetRevisionLine(models.Model):
+    """One category/subcategory allocation in a BudgetRevision."""
+    revision = models.ForeignKey(
+        BudgetRevision,
+        on_delete=models.CASCADE,
+        related_name="lines",
+    )
+    budget_line = models.ForeignKey(
+        BudgetLine,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="revision_lines",
+    )
+    category = models.ForeignKey(
+        BudgetCategory,
+        on_delete=models.PROTECT,
+        related_name="budget_revision_lines",
+    )
+    subcategory = models.ForeignKey(
+        BudgetSubCategory,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="budget_revision_lines",
+    )
+    line_key = models.CharField(max_length=100)
+    previous_allocated_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0"),
+    )
+    proposed_allocated_amount = models.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        default=Decimal("0"),
+    )
+    change_type = models.CharField(
+        max_length=20,
+        choices=BudgetRevisionLineChangeType.choices,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "budget_revision_lines"
+        ordering = ["category_id", "subcategory_id", "id"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["revision", "line_key"],
+                name="unique_budget_revision_line_key",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["revision", "change_type"]),
+        ]
+
+    def __str__(self):
+        return f"BudgetRevisionLine {self.revision_id}: {self.line_key} [{self.change_type}]"
 
 
 # ---------------------------------------------------------------------------

@@ -1574,7 +1574,36 @@ def reassign_workflow_step(instance_step, new_user, reassigned_by, note=""):
     from apps.access.models import PermissionAction, PermissionResource
     from apps.access.services import user_has_permission_including_ancestors
 
+    instance_step = (
+        WorkflowInstanceStep.objects.select_for_update()
+        .select_related(
+            "instance_group__instance__subject_scope_node",
+            "workflow_step__required_role",
+            "workflow_step__fixed_scope_node",
+            "assigned_user",
+        )
+        .get(pk=instance_step.pk)
+    )
     instance = instance_step.instance_group.instance
+    if instance.status != InstanceStatus.ACTIVE:
+        raise StepActionError(
+            f"Workflow instance {instance.id} is not ACTIVE and cannot be reassigned."
+        )
+    if instance_step.instance_group.status != GroupStatus.IN_PROGRESS:
+        raise StepActionError(
+            f"Step {instance_step.id} is not in the active workflow group."
+        )
+    if instance_step.status != StepStatus.WAITING:
+        raise StepActionError(
+            f"Step {instance_step.id} is not WAITING and cannot be reassigned. "
+            f"Current status: '{instance_step.status}'."
+        )
+    if not instance_step.assigned_user_id:
+        raise StepActionError(
+            f"Step {instance_step.id} has no current assignee; use assignment instead."
+        )
+    if instance_step.assigned_user_id == new_user.pk:
+        raise StepActionError("Select a different replacement user.")
 
     # Determine resource from subject_type
     resource_map = {
@@ -2011,8 +2040,38 @@ def reassign_workflow_branch(branch: WorkflowInstanceBranch, new_user, reassigne
     from apps.access.models import PermissionAction, PermissionResource
     from apps.access.services import user_has_permission_including_ancestors
 
+    branch = (
+        WorkflowInstanceBranch.objects.select_for_update()
+        .select_related(
+            "instance__subject_scope_node",
+            "parent_instance_step__instance_group",
+            "parent_instance_step__workflow_step__required_role",
+            "target_scope_node",
+            "assigned_user",
+        )
+        .get(pk=branch.pk)
+    )
     instance = branch.instance
     step = branch.parent_instance_step.workflow_step
+    if instance.status != InstanceStatus.ACTIVE:
+        raise StepActionError(
+            f"Workflow instance {instance.id} is not ACTIVE and cannot be reassigned."
+        )
+    if branch.parent_instance_step.instance_group.status != GroupStatus.IN_PROGRESS:
+        raise StepActionError(
+            f"Branch {branch.id} is not in the active workflow group."
+        )
+    if branch.status != BranchStatus.PENDING:
+        raise StepActionError(
+            f"Branch {branch.id} is not PENDING and cannot be reassigned. "
+            f"Current status: '{branch.status}'."
+        )
+    if not branch.assigned_user_id:
+        raise StepActionError(
+            f"Branch {branch.id} has no current assignee; use assignment instead."
+        )
+    if branch.assigned_user_id == new_user.pk:
+        raise StepActionError("Select a different replacement user.")
 
     resource_map = {
         "invoice": PermissionResource.INVOICE,

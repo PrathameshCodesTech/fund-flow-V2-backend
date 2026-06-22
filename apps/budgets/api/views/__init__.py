@@ -1,5 +1,7 @@
 from django.db import transaction
 from django.db.models import Q
+from django.http import HttpResponse
+from django.utils.text import slugify
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
@@ -17,8 +19,11 @@ from apps.budgets.models import (
     BudgetConsumption,
     BudgetVarianceRequest,
     BudgetImportBatch,
+    BudgetRevision,
     BudgetStatus,
     ImportMode,
+    BudgetRevisionSource,
+    BudgetRevisionStatus,
 )
 from apps.budgets.api.serializers import (
     BudgetCategorySerializer,
@@ -42,6 +47,9 @@ from apps.budgets.api.serializers import (
     BudgetImportBatchSerializer,
     BudgetImportBatchListSerializer,
     BudgetImportUploadSerializer,
+    BudgetRevisionSerializer,
+    BudgetRevisionManualCreateSerializer,
+    BudgetRevisionExcelCreateSerializer,
 )
 from apps.budgets.services import (
     reserve_budget_line,
@@ -64,6 +72,13 @@ from apps.budgets.services import (
     create_budget_import_batch,
     validate_budget_import_batch,
     commit_budget_import_batch,
+    BudgetRevisionConflictError,
+    BudgetRevisionValidationError,
+    build_budget_revision_snapshot,
+    create_budget_revision,
+    parse_scoped_budget_revision_file,
+    publish_budget_revision,
+    resolve_scoped_budget_revision_rows,
 )
 from apps.budgets.selectors import get_budgets_overview, get_budget_live_balances
 from apps.access.selectors import (
@@ -422,6 +437,65 @@ class BudgetViewSet(ModelViewSet):
         """GET /budgets/{id}/in-use/ — whether this budget has active usage."""
         budget = self.get_object()
         return Response(get_budget_in_use_summary(budget))
+
+    @action(detail=True, methods=["get"], url_path="revision-template")
+    def revision_template(self, request, pk=None):
+        """Download a scoped allocation workbook for this budget only."""
+        budget = self.get_object()
+        try:
+            import openpyxl
+            from openpyxl.styles import Font, PatternFill
+        except ImportError:
+            return Response(
+                {"detail": "openpyxl is required to generate budget templates."},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        workbook = openpyxl.Workbook()
+        worksheet = workbook.active
+        worksheet.title = "Budget Allocation"
+        headers = [
+            "Category Code *",
+            "Category Name",
+            "Subcategory Code",
+            "Subcategory Name",
+            "Current Allocation",
+            "New Allocation *",
+        ]
+        worksheet.append(headers)
+        for cell in worksheet[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill("solid", fgColor="EA580C")
+
+        for line in budget.lines.select_related("category", "subcategory").order_by(
+            "category__code", "subcategory__code", "id"
+        ):
+            worksheet.append([
+                line.category.code,
+                line.category.name,
+                line.subcategory.code if line.subcategory_id else "",
+                line.subcategory.name if line.subcategory_id else "",
+                float(line.allocated_amount),
+                float(line.allocated_amount),
+            ])
+
+        worksheet.freeze_panes = "A2"
+        for column, width in {
+            "A": 28, "B": 38, "C": 32, "D": 42, "E": 20, "F": 20,
+        }.items():
+            worksheet.column_dimensions[column].width = width
+
+        from io import BytesIO
+        output = BytesIO()
+        workbook.save(output)
+        output.seek(0)
+        filename = f"{slugify(budget.code) or 'budget'}-allocation-template.xlsx"
+        response = HttpResponse(
+            output.getvalue(),
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return response
 
     @action(detail=True, methods=["post"], url_path="reserve")
     def reserve(self, request, pk=None):
@@ -870,6 +944,133 @@ class BudgetImportBatchViewSet(ModelViewSet):
         except ValueError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(BudgetImportBatchSerializer(batch).data)
+
+
+# ---------------------------------------------------------------------------
+# Scoped budget revisions
+# ---------------------------------------------------------------------------
+
+class BudgetRevisionViewSet(ModelViewSet):
+    """
+    Versioned allocation changes for a single selected budget.
+
+    POST /revisions/manual/ accepts one full allocation plan from the manual UI.
+    POST /revisions/excel/ accepts one selected budget's allocation workbook.
+    POST /revisions/{id}/publish/ applies the validated revision atomically.
+    """
+    permission_classes = [IsAuthenticated]
+    serializer_class = BudgetRevisionSerializer
+    http_method_names = ["get", "post", "head", "options"]
+
+    def get_queryset(self):
+        visible_scope_ids = get_user_visible_scope_ids(self.request.user)
+        qs = (
+            BudgetRevision.objects.select_related(
+                "budget", "budget__scope_node", "created_by", "published_by"
+            )
+            .prefetch_related("lines__category", "lines__subcategory")
+            .filter(budget__scope_node_id__in=visible_scope_ids)
+            .order_by("-created_at")
+        )
+        budget_id = self.request.query_params.get("budget")
+        if budget_id:
+            qs = qs.filter(budget_id=budget_id)
+        revision_status = self.request.query_params.get("status")
+        if revision_status:
+            qs = qs.filter(status=revision_status)
+        return qs
+
+    def create(self, request, *args, **kwargs):
+        return Response(
+            {"detail": "Use /revisions/manual/ or /revisions/excel/ to create a budget revision."},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
+    def _can_manage_budget(self, request, budget):
+        if err := user_can_act_on_scope_or_ancestors_response(
+            request.user, budget.scope_node_id, "change this budget"
+        ):
+            return err
+        return _budget_permission_response(
+            request.user, budget.scope_node, "update", "change this budget"
+        )
+
+    @action(detail=False, methods=["post"], url_path="manual")
+    def create_manual(self, request):
+        serializer = BudgetRevisionManualCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        budget = data["budget"]
+        if err := self._can_manage_budget(request, budget):
+            return err
+
+        try:
+            revision = create_budget_revision(
+                budget=budget,
+                proposed_lines=data["lines"],
+                source=BudgetRevisionSource.MANUAL,
+                change_reason=data["change_reason"],
+                created_by=request.user,
+            )
+        except BudgetRevisionValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(BudgetRevisionSerializer(revision, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["post"], url_path="excel")
+    def create_excel(self, request):
+        serializer = BudgetRevisionExcelCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        budget = data["budget"]
+        if err := self._can_manage_budget(request, budget):
+            return err
+
+        uploaded_file = data["file"]
+        try:
+            parsed_rows = parse_scoped_budget_revision_file(uploaded_file)
+            proposed_lines = resolve_scoped_budget_revision_rows(budget, parsed_rows)
+            uploaded_file.seek(0)
+            revision = create_budget_revision(
+                budget=budget,
+                proposed_lines=proposed_lines,
+                source=BudgetRevisionSource.EXCEL,
+                change_reason=data["change_reason"],
+                created_by=request.user,
+                source_file=uploaded_file,
+                source_file_name=uploaded_file.name,
+            )
+        except (BudgetRevisionValidationError, ImportError) as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(BudgetRevisionSerializer(revision, context={"request": request}).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="publish")
+    def publish(self, request, pk=None):
+        revision = self.get_object()
+        if err := self._can_manage_budget(request, revision.budget):
+            return err
+        try:
+            revision = publish_budget_revision(revision=revision, published_by=request.user)
+        except BudgetRevisionConflictError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_409_CONFLICT)
+        except BudgetRevisionValidationError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(BudgetRevisionSerializer(revision, context={"request": request}).data)
+
+    @action(detail=True, methods=["post"], url_path="cancel")
+    def cancel(self, request, pk=None):
+        revision = self.get_object()
+        if err := self._can_manage_budget(request, revision.budget):
+            return err
+        if revision.status not in (BudgetRevisionStatus.DRAFT, BudgetRevisionStatus.VALIDATED):
+            return Response(
+                {"detail": f"Revision {revision.id} is '{revision.status}' and cannot be cancelled."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        revision.status = BudgetRevisionStatus.CANCELLED
+        revision.save(update_fields=["status", "updated_at"])
+        return Response(BudgetRevisionSerializer(revision, context={"request": request}).data)
 
 
 # ---------------------------------------------------------------------------

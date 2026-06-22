@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from apps.users.models import User
+
 from apps.vendors.models import (
     ACTIVE_VENDOR_ATTACHMENT_DOCUMENT_TYPES,
     FinanceActionType,
@@ -480,6 +482,19 @@ class VendorSubmissionRouteUpdateSerializer(serializers.ModelSerializer):
                         "Template and route must share the same org."
                     ),
                 })
+        return data
+
+
+class VendorSubmissionRouteReplaceAssigneeSerializer(serializers.Serializer):
+    old_user = serializers.PrimaryKeyRelatedField(queryset=User.objects.all())
+    new_user = serializers.PrimaryKeyRelatedField(queryset=User.objects.all())
+    label = serializers.CharField(max_length=255, allow_blank=False, trim_whitespace=True)
+
+    def validate(self, data):
+        if data["old_user"].pk == data["new_user"].pk:
+            raise serializers.ValidationError({
+                "new_user": "The replacement user must be different from the current assignee."
+            })
         return data
 
 

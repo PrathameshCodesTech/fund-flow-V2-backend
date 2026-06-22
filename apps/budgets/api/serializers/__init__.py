@@ -11,6 +11,8 @@ from apps.budgets.models import (
     BudgetVarianceRequest,
     BudgetImportBatch,
     BudgetImportRow,
+    BudgetRevision,
+    BudgetRevisionLine,
     PeriodType,
     BudgetStatus,
     ConsumptionType,
@@ -20,6 +22,9 @@ from apps.budgets.models import (
     ImportBatchStatus,
     ImportRowStatus,
     ImportMode,
+    BudgetRevisionSource,
+    BudgetRevisionStatus,
+    BudgetRevisionLineChangeType,
 )
 
 
@@ -665,3 +670,76 @@ class BudgetImportUploadSerializer(serializers.Serializer):
         required=False,
         default=ImportMode.SAFE_UPDATE,
     )
+
+
+# ---------------------------------------------------------------------------
+# Scoped budget revisions
+# ---------------------------------------------------------------------------
+
+class BudgetRevisionLineSerializer(serializers.ModelSerializer):
+    category_name = serializers.CharField(source="category.name", read_only=True)
+    category_code = serializers.CharField(source="category.code", read_only=True)
+    subcategory_name = serializers.CharField(source="subcategory.name", read_only=True, allow_null=True)
+    subcategory_code = serializers.CharField(source="subcategory.code", read_only=True, allow_null=True)
+
+    class Meta:
+        model = BudgetRevisionLine
+        fields = (
+            "id", "budget_line", "line_key",
+            "category", "category_name", "category_code",
+            "subcategory", "subcategory_name", "subcategory_code",
+            "previous_allocated_amount", "proposed_allocated_amount",
+            "change_type", "created_at",
+        )
+        read_only_fields = fields
+
+
+class BudgetRevisionSerializer(serializers.ModelSerializer):
+    budget_name = serializers.CharField(source="budget.name", read_only=True)
+    budget_code = serializers.CharField(source="budget.code", read_only=True)
+    budget_scope_node = serializers.CharField(source="budget.scope_node.name", read_only=True)
+    created_by_email = serializers.CharField(source="created_by.email", read_only=True, allow_null=True)
+    published_by_email = serializers.CharField(source="published_by.email", read_only=True, allow_null=True)
+    lines = BudgetRevisionLineSerializer(many=True, read_only=True)
+
+    class Meta:
+        model = BudgetRevision
+        fields = (
+            "id", "budget", "budget_name", "budget_code", "budget_scope_node",
+            "revision_number", "source", "status", "change_reason",
+            "source_file", "source_file_name",
+            "before_snapshot", "after_snapshot", "validation_errors",
+            "created_by", "created_by_email", "published_by", "published_by_email", "published_at",
+            "created_at", "updated_at", "lines",
+        )
+        read_only_fields = fields
+
+
+class BudgetRevisionInputLineSerializer(serializers.Serializer):
+    category = serializers.PrimaryKeyRelatedField(queryset=BudgetCategory.objects.all())
+    subcategory = serializers.PrimaryKeyRelatedField(
+        queryset=BudgetSubCategory.objects.all(), required=False, allow_null=True
+    )
+    allocated_amount = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=2,
+        min_value=Decimal("0"),
+    )
+
+
+class BudgetRevisionManualCreateSerializer(serializers.Serializer):
+    budget = serializers.PrimaryKeyRelatedField(queryset=Budget.objects.all())
+    change_reason = serializers.CharField()
+    lines = BudgetRevisionInputLineSerializer(many=True, allow_empty=False)
+
+
+class BudgetRevisionExcelCreateSerializer(serializers.Serializer):
+    budget = serializers.PrimaryKeyRelatedField(queryset=Budget.objects.all())
+    change_reason = serializers.CharField()
+    file = serializers.FileField()
+
+    def validate_file(self, value):
+        name = (value.name or "").lower()
+        if not name.endswith((".xlsx", ".xls")):
+            raise serializers.ValidationError("Upload an .xlsx or .xls budget allocation workbook.")
+        return value

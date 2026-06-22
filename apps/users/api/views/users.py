@@ -4,12 +4,14 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from django.db.models import Q
 
+from apps.access.services import user_can_act_on_scope_response
 from apps.users.models import User
 from apps.users.api.serializers.users import (
     UserSerializer,
     UserListSerializer,
     UserCreateSerializer,
     UserUpdateSerializer,
+    WorkflowResponsibilityReassignSerializer,
 )
 
 
@@ -22,8 +24,14 @@ class IsAdminOrReadOnly:
     def has_permission(self, request, view):
         if request.method in ("GET", "HEAD", "OPTIONS"):
             return request.user and request.user.is_authenticated
-        if getattr(view, "action", None) == "send_password_reset":
-            return request.user and request.user.is_authenticated
+        if getattr(view, "action", None) in (
+            "send_password_reset",
+            "workflow_responsibilities",
+            "reassign_workflow_responsibilities",
+        ):
+            from apps.users.services import can_admin_reset_password
+
+            return can_admin_reset_password(request.user)
         return request.user and request.user.is_authenticated and request.user.is_staff
 
     def has_object_permission(self, request, view, obj):
@@ -87,6 +95,14 @@ class UserViewSet(viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        scope_node = serializer.validated_data["scope_node"]
+        if not request.user.is_superuser:
+            if err := user_can_act_on_scope_response(
+                request.user,
+                scope_node.id,
+                "create a user with a role",
+            ):
+                return err
         user = serializer.save()
         return Response(
             UserSerializer(user).data,
@@ -118,3 +134,56 @@ class UserViewSet(viewsets.ModelViewSet):
             "detail": "Password reset email sent.",
             **result,
         })
+
+    @action(detail=True, methods=["get"], url_path="workflow-responsibilities")
+    def workflow_responsibilities(self, request, pk=None):
+        from apps.workflow.responsibility_services import (
+            WorkflowResponsibilityError,
+            WorkflowResponsibilityPermissionError,
+            get_workflow_responsibility_preview,
+        )
+
+        target_user = self.get_object()
+        try:
+            preview = get_workflow_responsibility_preview(
+                target_user=target_user,
+                actor=request.user,
+            )
+        except WorkflowResponsibilityPermissionError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_403_FORBIDDEN)
+        except WorkflowResponsibilityError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(preview)
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path="reassign-workflow-responsibilities",
+    )
+    def reassign_workflow_responsibilities(self, request, pk=None):
+        from apps.workflow.responsibility_services import (
+            WorkflowResponsibilityError,
+            WorkflowResponsibilityPermissionError,
+            bulk_reassign_workflow_responsibilities,
+            get_workflow_responsibility_preview,
+        )
+
+        target_user = self.get_object()
+        serializer = WorkflowResponsibilityReassignSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            result = bulk_reassign_workflow_responsibilities(
+                from_user=target_user,
+                to_user=serializer.validated_data["new_user"],
+                actor=request.user,
+                reason=serializer.validated_data["reason"],
+            )
+            preview = get_workflow_responsibility_preview(
+                target_user=target_user,
+                actor=request.user,
+            )
+        except WorkflowResponsibilityPermissionError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_403_FORBIDDEN)
+        except WorkflowResponsibilityError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({**result, "remaining": preview["counts"]})

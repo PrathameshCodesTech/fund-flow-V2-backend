@@ -42,6 +42,11 @@ from apps.vendors.services import (
     reopen_submission,
     send_submission_to_finance,
 )
+from apps.vendors.route_services import (
+    RouteAssigneeReplacementError,
+    get_route_assignee_replacement_options,
+    replace_route_assignee,
+)
 from apps.access.selectors import get_user_actionable_scope_ids, get_user_visible_scope_ids
 from apps.access.services import user_can_act_on_scope_response
 from apps.vendors.api.serializers import (
@@ -68,6 +73,7 @@ from apps.vendors.api.serializers import (
     VendorUpdateSerializer,
     VendorSubmissionRouteSerializer,
     VendorSubmissionRouteCreateSerializer,
+    VendorSubmissionRouteReplaceAssigneeSerializer,
     VendorSubmissionRouteUpdateSerializer,
     VendorSubmissionRouteVendorSerializer,
     VendorTrainingVideoSerializer,
@@ -1027,6 +1033,45 @@ class VendorSubmissionRouteViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         route = serializer.save()
         return Response(VendorSubmissionRouteSerializer(route).data)
+
+    @action(detail=True, methods=["get"], url_path="replacement-options")
+    def replacement_options(self, request, pk=None):
+        route = self.get_object()
+        try:
+            payload = get_route_assignee_replacement_options(route)
+        except RouteAssigneeReplacementError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(payload)
+
+    @action(detail=True, methods=["post"], url_path="replace-assignee")
+    def replace_assignee(self, request, pk=None):
+        route = self.get_object()
+        if err := user_can_act_on_scope_response(
+            request.user,
+            route.workflow_template.scope_node_id,
+            "replace a send-to route assignee",
+        ):
+            return err
+
+        serializer = VendorSubmissionRouteReplaceAssigneeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            updated_route, new_version, affected_count = replace_route_assignee(
+                route=route,
+                old_user=serializer.validated_data["old_user"],
+                new_user=serializer.validated_data["new_user"],
+                new_label=serializer.validated_data["label"],
+                actor=request.user,
+            )
+        except RouteAssigneeReplacementError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({
+            "route": VendorSubmissionRouteSerializer(updated_route).data,
+            "published_version_id": new_version.pk,
+            "published_version_number": new_version.version_number,
+            "affected_step_count": affected_count,
+        })
 
 
 # ---------------------------------------------------------------------------

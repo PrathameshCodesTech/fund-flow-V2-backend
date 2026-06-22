@@ -1,6 +1,10 @@
 from django.contrib.auth import get_user_model
+from django.db import transaction
 from django.db.models import Q
 from rest_framework import serializers
+
+from apps.access.models import Role, UserRoleAssignment
+from apps.core.models import ScopeNode
 
 User = get_user_model()
 
@@ -72,10 +76,21 @@ class UserSerializer(serializers.ModelSerializer):
 
 class UserCreateSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    role = serializers.PrimaryKeyRelatedField(
+        queryset=Role.objects.filter(is_active=True),
+        write_only=True,
+    )
+    scope_node = serializers.PrimaryKeyRelatedField(
+        queryset=ScopeNode.objects.filter(is_active=True),
+        write_only=True,
+    )
 
     class Meta:
         model = User
-        fields = ("id", "email", "first_name", "last_name", "employee_id", "is_active", "password")
+        fields = (
+            "id", "email", "first_name", "last_name", "employee_id",
+            "is_active", "password", "role", "scope_node",
+        )
         read_only_fields = ("id",)
 
     def validate_email(self, value):
@@ -94,13 +109,30 @@ class UserCreateSerializer(serializers.ModelSerializer):
                 qs = qs.exclude(pk=self.instance.pk)
             if qs.exists():
                 raise serializers.ValidationError({"employee_id": "This employee ID is already in use."})
+
+        role = data["role"]
+        scope_node = data["scope_node"]
+        if role.org_id != scope_node.org_id:
+            raise serializers.ValidationError({
+                "role": "The selected role belongs to a different organization than the selected scope.",
+            })
+        if role.node_type_scope and role.node_type_scope != scope_node.node_type:
+            raise serializers.ValidationError({
+                "scope_node": (
+                    f"The {role.name} role can only be assigned at {role.node_type_scope} scope nodes."
+                ),
+            })
         return data
 
+    @transaction.atomic
     def create(self, validated_data):
         password = validated_data.pop("password", None)
+        role = validated_data.pop("role")
+        scope_node = validated_data.pop("scope_node")
         if not password:
             password = User.objects.make_random_password()
         user = User.objects.create_user(password=password, **validated_data)
+        UserRoleAssignment.objects.create(user=user, role=role, scope_node=scope_node)
         return user
 
 
@@ -188,3 +220,30 @@ class UserUpdateSerializer(serializers.ModelSerializer):
 
     def validate_email(self, value):
         return value.lower().strip()
+
+    def validate(self, attrs):
+        if (
+            self.instance
+            and self.instance.is_active
+            and attrs.get("is_active") is False
+        ):
+            from apps.workflow.responsibility_services import (
+                get_pending_workflow_responsibility_count,
+            )
+
+            counts = get_pending_workflow_responsibility_count(self.instance)
+            if counts["total"]:
+                raise serializers.ValidationError({
+                    "is_active": (
+                        f"Reassign {counts['total']} pending workflow "
+                        "responsibility/responsibilities before deactivating this user."
+                    ),
+                })
+        return attrs
+
+
+class WorkflowResponsibilityReassignSerializer(serializers.Serializer):
+    new_user = serializers.PrimaryKeyRelatedField(
+        queryset=User.objects.filter(is_active=True),
+    )
+    reason = serializers.CharField(allow_blank=False, trim_whitespace=True)

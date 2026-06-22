@@ -1,5 +1,5 @@
 from django.db import transaction
-from django.db.models import Sum, Q
+from django.db.models import Max, Sum, Q
 from django.utils import timezone
 from decimal import Decimal, InvalidOperation
 from datetime import date
@@ -14,6 +14,8 @@ from apps.budgets.models import (
     BudgetVarianceRequest,
     BudgetImportBatch,
     BudgetImportRow,
+    BudgetRevision,
+    BudgetRevisionLine,
     ConsumptionType,
     ConsumptionStatus,
     VarianceStatus,
@@ -22,6 +24,9 @@ from apps.budgets.models import (
     ImportBatchStatus,
     ImportRowStatus,
     ImportMode,
+    BudgetRevisionLineChangeType,
+    BudgetRevisionSource,
+    BudgetRevisionStatus,
     SourceType,
 )
 
@@ -40,6 +45,14 @@ class BudgetNotActiveError(ValueError):
 
 class BudgetLineNotFoundError(ValueError):
     """Raised when no matching BudgetLine exists for an allocation."""
+
+
+class BudgetRevisionValidationError(ValueError):
+    """Raised when a proposed budget revision is invalid."""
+
+
+class BudgetRevisionConflictError(ValueError):
+    """Raised when a revision is no longer based on the live budget state."""
 
 
 # ---------------------------------------------------------------------------
@@ -1413,3 +1426,388 @@ def commit_budget_import_batch(batch: BudgetImportBatch, committed_by) -> Budget
     batch.committed_at = timezone.now()
     batch.save(update_fields=["committed_rows", "skipped_rows", "status", "committed_by", "committed_at", "updated_at"])
     return batch
+
+
+# ---------------------------------------------------------------------------
+# Scoped budget revisions
+# ---------------------------------------------------------------------------
+
+SCOPED_REVISION_COLUMN_MAP = {
+    "category code": "category_code",
+    "category_code": "category_code",
+    "subcategory code": "subcategory_code",
+    "subcategory_code": "subcategory_code",
+    "new allocation": "allocated_amount",
+    "new_allocated_amount": "allocated_amount",
+    "allocated amount": "allocated_amount",
+    "allocated_amount": "allocated_amount",
+}
+
+SCOPED_REVISION_REQUIRED_COLUMNS = {"category_code", "allocated_amount"}
+
+
+def budget_revision_line_key(category_id: int, subcategory_id: int | None) -> str:
+    return f"{category_id}:{subcategory_id if subcategory_id is not None else 'direct'}"
+
+
+def _serialize_budget_revision_line(line: BudgetLine) -> dict:
+    return {
+        "line_key": budget_revision_line_key(line.category_id, line.subcategory_id),
+        "budget_line_id": line.id,
+        "category_id": line.category_id,
+        "category_code": line.category.code,
+        "category_name": line.category.name,
+        "subcategory_id": line.subcategory_id,
+        "subcategory_code": line.subcategory.code if line.subcategory_id else "",
+        "subcategory_name": line.subcategory.name if line.subcategory_id else "",
+        "allocated_amount": str(line.allocated_amount),
+    }
+
+
+def build_budget_revision_snapshot(budget: Budget) -> dict:
+    """Return a serialisable, complete allocation snapshot for one budget."""
+    lines = list(
+        budget.lines.select_related("category", "subcategory").order_by("category__code", "subcategory__code", "id")
+    )
+    return {
+        "budget_id": budget.id,
+        "budget_code": budget.code,
+        "budget_name": budget.name,
+        "financial_year": budget.financial_year,
+        "scope_node_id": budget.scope_node_id,
+        "scope_node_name": budget.scope_node.name if budget.scope_node_id else "",
+        "allocated_amount": str(budget.allocated_amount),
+        "lines": [_serialize_budget_revision_line(line) for line in lines],
+    }
+
+
+def parse_scoped_budget_revision_file(file_obj) -> list[dict]:
+    """Parse one selected budget's allocation workbook into proposed line rows."""
+    try:
+        import openpyxl
+    except ImportError as exc:
+        raise ImportError("openpyxl is required for budget revision upload") from exc
+
+    wb = openpyxl.load_workbook(file_obj, read_only=True, data_only=True)
+    ws = wb.active
+    rows_iter = ws.iter_rows(values_only=True)
+    try:
+        header_row = next(rows_iter)
+    except StopIteration:
+        raise BudgetRevisionValidationError("The uploaded file is empty.")
+
+    headers = []
+    for cell in header_row:
+        raw = str(cell).strip().lower() if cell is not None else ""
+        headers.append(SCOPED_REVISION_COLUMN_MAP.get(raw, raw))
+
+    missing = SCOPED_REVISION_REQUIRED_COLUMNS - set(headers)
+    if missing:
+        raise BudgetRevisionValidationError(
+            "Excel file is missing required columns: "
+            f"{', '.join(sorted(missing))}."
+        )
+
+    parsed = []
+    for row_number, row_values in enumerate(rows_iter, start=2):
+        if all(value is None or str(value).strip() == "" for value in row_values):
+            continue
+        row = {}
+        for header, value in zip(headers, row_values):
+            row[header] = str(value).strip() if value is not None else ""
+        row["row_number"] = row_number
+        parsed.append(row)
+
+    wb.close()
+    if not parsed:
+        raise BudgetRevisionValidationError("The uploaded file has no allocation rows.")
+    return parsed
+
+
+def _normalise_revision_lines(budget: Budget, proposed_lines: list[dict]) -> list[dict]:
+    """Resolve proposed category/subcategory allocations and validate their identity."""
+    errors: list[str] = []
+    seen_keys: set[str] = set()
+    normalized: list[dict] = []
+
+    for index, raw in enumerate(proposed_lines, start=1):
+        row_number = raw.get("row_number", index)
+        category = raw.get("category")
+        subcategory = raw.get("subcategory")
+        amount = raw.get("allocated_amount")
+
+        if category is None:
+            errors.append(f"Row {row_number}: category is required.")
+            continue
+        if category.org_id != budget.org_id:
+            errors.append(f"Row {row_number}: category '{category.code}' is not in this budget's organisation.")
+            continue
+        if not category.is_active:
+            errors.append(f"Row {row_number}: category '{category.code}' is inactive.")
+            continue
+        if subcategory is not None and subcategory.category_id != category.id:
+            errors.append(f"Row {row_number}: subcategory does not belong to category '{category.code}'.")
+            continue
+        if subcategory is not None and not subcategory.is_active:
+            errors.append(f"Row {row_number}: subcategory '{subcategory.code}' is inactive.")
+            continue
+
+        try:
+            allocation = Decimal(str(amount).replace(",", ""))
+        except (InvalidOperation, ValueError):
+            errors.append(f"Row {row_number}: allocation '{amount}' is not a valid number.")
+            continue
+        if allocation < 0:
+            errors.append(f"Row {row_number}: allocation cannot be negative.")
+            continue
+
+        line_key = budget_revision_line_key(category.id, subcategory.id if subcategory else None)
+        if line_key in seen_keys:
+            errors.append(f"Row {row_number}: duplicate category/subcategory allocation.")
+            continue
+        seen_keys.add(line_key)
+        normalized.append({
+            "row_number": row_number,
+            "category": category,
+            "subcategory": subcategory,
+            "allocated_amount": allocation.quantize(Decimal("0.01")),
+            "line_key": line_key,
+        })
+
+    if errors:
+        raise BudgetRevisionValidationError(" ".join(errors))
+    if not normalized:
+        raise BudgetRevisionValidationError("At least one allocation line is required.")
+    return normalized
+
+
+def resolve_scoped_budget_revision_rows(budget: Budget, parsed_rows: list[dict]) -> list[dict]:
+    """Resolve category and subcategory codes in an uploaded selected-budget workbook."""
+    categories = {
+        category.code.lower(): category
+        for category in BudgetCategory.objects.filter(org=budget.org)
+    }
+    subcategories = {
+        (subcategory.category_id, subcategory.code.lower()): subcategory
+        for subcategory in BudgetSubCategory.objects.filter(category__org=budget.org)
+    }
+
+    resolved = []
+    errors: list[str] = []
+    for row in parsed_rows:
+        row_number = row["row_number"]
+        category_code = row.get("category_code", "").strip()
+        subcategory_code = row.get("subcategory_code", "").strip()
+        category = categories.get(category_code.lower()) if category_code else None
+        if category is None:
+            errors.append(f"Row {row_number}: category_code '{category_code}' was not found.")
+            continue
+        subcategory = None
+        if subcategory_code:
+            subcategory = subcategories.get((category.id, subcategory_code.lower()))
+            if subcategory is None:
+                errors.append(
+                    f"Row {row_number}: subcategory_code '{subcategory_code}' was not found under '{category_code}'."
+                )
+                continue
+        resolved.append({
+            "row_number": row_number,
+            "category": category,
+            "subcategory": subcategory,
+            "allocated_amount": row.get("allocated_amount", ""),
+        })
+
+    if errors:
+        raise BudgetRevisionValidationError(" ".join(errors))
+    return resolved
+
+
+def _revision_change_type(previous: Decimal | None, proposed: Decimal) -> str:
+    if previous is None and proposed > 0:
+        return BudgetRevisionLineChangeType.ADDED
+    if previous is not None and proposed == 0:
+        return BudgetRevisionLineChangeType.REMOVED
+    if previous != proposed:
+        return BudgetRevisionLineChangeType.UPDATED
+    return BudgetRevisionLineChangeType.UNCHANGED
+
+
+@transaction.atomic
+def create_budget_revision(
+    *,
+    budget: Budget,
+    proposed_lines: list[dict],
+    source: str,
+    change_reason: str,
+    created_by,
+    source_file=None,
+    source_file_name: str = "",
+) -> BudgetRevision:
+    """Create a validated, immutable revision draft for one budget."""
+    if source not in BudgetRevisionSource.values:
+        raise BudgetRevisionValidationError("Invalid revision source.")
+    if not change_reason or not change_reason.strip():
+        raise BudgetRevisionValidationError("A change reason is required.")
+
+    budget = Budget.objects.select_for_update().select_related("scope_node", "org").get(pk=budget.pk)
+    current_lines = list(
+        BudgetLine.objects.select_for_update()
+        .filter(budget=budget)
+        .select_related("category", "subcategory")
+        .order_by("id")
+    )
+    normalized_lines = _normalise_revision_lines(budget, proposed_lines)
+    before_snapshot = build_budget_revision_snapshot(budget)
+    current_by_key = {
+        budget_revision_line_key(line.category_id, line.subcategory_id): line
+        for line in current_lines
+    }
+    proposed_by_key = {line["line_key"]: line for line in normalized_lines}
+
+    revision_line_data: list[dict] = []
+    after_lines: list[dict] = []
+    for line_key in sorted(set(current_by_key) | set(proposed_by_key)):
+        current = current_by_key.get(line_key)
+        proposed = proposed_by_key.get(line_key)
+        category = proposed["category"] if proposed else current.category
+        subcategory = proposed["subcategory"] if proposed else current.subcategory
+        previous_amount = current.allocated_amount if current else None
+        proposed_amount = proposed["allocated_amount"] if proposed else Decimal("0")
+        change_type = _revision_change_type(previous_amount, proposed_amount)
+
+        if current is not None:
+            allowed, reason = can_decrease_budget_line_allocated(current, proposed_amount)
+            if not allowed:
+                raise BudgetRevisionValidationError(
+                    f"{category.name}{' > ' + subcategory.name if subcategory else ''}: {reason}"
+                )
+
+        revision_line_data.append({
+            "budget_line": current,
+            "category": category,
+            "subcategory": subcategory,
+            "line_key": line_key,
+            "previous_allocated_amount": previous_amount or Decimal("0"),
+            "proposed_allocated_amount": proposed_amount,
+            "change_type": change_type,
+        })
+        if proposed_amount > 0:
+            after_lines.append({
+                "line_key": line_key,
+                "budget_line_id": current.id if current else None,
+                "category_id": category.id,
+                "category_code": category.code,
+                "category_name": category.name,
+                "subcategory_id": subcategory.id if subcategory else None,
+                "subcategory_code": subcategory.code if subcategory else "",
+                "subcategory_name": subcategory.name if subcategory else "",
+                "allocated_amount": str(proposed_amount),
+            })
+
+    next_revision = (budget.revisions.aggregate(max_number=Max("revision_number"))["max_number"] or 0) + 1
+    after_snapshot = {
+        **{key: value for key, value in before_snapshot.items() if key not in {"allocated_amount", "lines"}},
+        "allocated_amount": str(sum((line["proposed_allocated_amount"] for line in revision_line_data), Decimal("0"))),
+        "lines": after_lines,
+    }
+
+    revision = BudgetRevision.objects.create(
+        budget=budget,
+        revision_number=next_revision,
+        source=source,
+        status=BudgetRevisionStatus.VALIDATED,
+        change_reason=change_reason.strip(),
+        source_file=source_file,
+        source_file_name=source_file_name,
+        base_budget_updated_at=budget.updated_at,
+        before_snapshot=before_snapshot,
+        after_snapshot=after_snapshot,
+        created_by=created_by,
+    )
+    BudgetRevisionLine.objects.bulk_create(
+        [BudgetRevisionLine(revision=revision, **data) for data in revision_line_data]
+    )
+    return revision
+
+
+@transaction.atomic
+def publish_budget_revision(*, revision: BudgetRevision, published_by) -> BudgetRevision:
+    """Publish a validated revision and atomically update live allocation lines."""
+    revision = (
+        BudgetRevision.objects.select_for_update()
+        .select_related("budget__scope_node", "budget__org")
+        .get(pk=revision.pk)
+    )
+    if revision.status != BudgetRevisionStatus.VALIDATED:
+        raise BudgetRevisionValidationError(
+            f"Revision {revision.id} is '{revision.status}' and cannot be published."
+        )
+
+    budget = Budget.objects.select_for_update().get(pk=revision.budget_id)
+    if budget.updated_at != revision.base_budget_updated_at:
+        raise BudgetRevisionConflictError(
+            "This budget changed after the revision was created. Create a new revision from the latest budget state."
+        )
+
+    live_lines = {
+        budget_revision_line_key(line.category_id, line.subcategory_id): line
+        for line in BudgetLine.objects.select_for_update().filter(budget=budget)
+    }
+    expected_lines = {
+        line["line_key"]: line["allocated_amount"]
+        for line in revision.before_snapshot.get("lines", [])
+    }
+    actual_lines = {
+        line_key: str(line.allocated_amount)
+        for line_key, line in live_lines.items()
+    }
+    if actual_lines != expected_lines:
+        raise BudgetRevisionConflictError(
+            "This budget's allocation lines changed after the revision was created. "
+            "Create a new revision from the latest budget state."
+        )
+    revision_lines = list(
+        revision.lines.select_related("category", "subcategory", "budget_line").order_by("id")
+    )
+
+    for revision_line in revision_lines:
+        current = live_lines.get(revision_line.line_key)
+        proposed_amount = revision_line.proposed_allocated_amount
+        if current is not None:
+            allowed, reason = can_decrease_budget_line_allocated(current, proposed_amount)
+            if not allowed:
+                raise BudgetRevisionValidationError(
+                    f"Cannot publish {revision_line.line_key}: {reason}"
+                )
+
+        if proposed_amount == 0:
+            if current is not None:
+                # Keep the row for historical ledger/audit integrity. A zero
+                # allocation is the logical removal state for a line.
+                current.allocated_amount = Decimal("0")
+                current.save(update_fields=["allocated_amount", "updated_at"])
+            continue
+
+        if current is None:
+            BudgetLine.objects.create(
+                budget=budget,
+                category=revision_line.category,
+                subcategory=revision_line.subcategory,
+                allocated_amount=proposed_amount,
+            )
+        elif current.allocated_amount != proposed_amount:
+            current.allocated_amount = proposed_amount
+            current.save(update_fields=["allocated_amount", "updated_at"])
+
+    total = budget.lines.aggregate(total=Sum("allocated_amount"))["total"] or Decimal("0")
+    allowed, reason = can_decrease_budget_allocated(budget, total)
+    if not allowed:
+        raise BudgetRevisionValidationError(reason)
+    budget.allocated_amount = total
+    budget.save(update_fields=["allocated_amount", "updated_at"])
+
+    revision.status = BudgetRevisionStatus.PUBLISHED
+    revision.published_by = published_by
+    revision.published_at = timezone.now()
+    revision.save(update_fields=["status", "published_by", "published_at", "updated_at"])
+    return revision

@@ -18,6 +18,7 @@ from apps.workflow.models import (
 
 
 PASSWORD = "Hiparks@123"
+MARKETING_ROLE_NODE_TYPE = "department"
 
 
 ROLE_SPECS = {
@@ -579,11 +580,16 @@ class Command(BaseCommand):
             role, _ = Role.objects.get_or_create(
                 org=org,
                 code=code,
-                defaults={"name": spec["name"], "is_active": True},
+                defaults={
+                    "name": spec["name"],
+                    "node_type_scope": MARKETING_ROLE_NODE_TYPE,
+                    "is_active": True,
+                },
             )
             role.name = spec["name"]
+            role.node_type_scope = MARKETING_ROLE_NODE_TYPE
             role.is_active = True
-            role.save(update_fields=["name", "is_active"])
+            role.save(update_fields=["name", "node_type_scope", "is_active"])
             RolePermission.objects.filter(role=role).delete()
             for action, resource in spec["permissions"]:
                 perm, _ = Permission.objects.get_or_create(action=action, resource=resource)

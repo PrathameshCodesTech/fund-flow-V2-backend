@@ -31,9 +31,15 @@ from apps.workflow.models import (
     WorkflowTemplate, WorkflowTemplateVersion, StepGroup, WorkflowStep,
     WorkflowInstance, VersionStatus, InstanceStatus,
     ScopeResolutionPolicy, StepKind, ParallelMode, RejectionAction,
+    WorkflowSplitOption,
 )
 from apps.workflow.services import publish_template_version
 from apps.invoices.api.views import VendorInvoiceSubmissionViewSet
+from apps.vendors.route_services import (
+    RouteAssigneeReplacementError,
+    get_route_assignee_replacement_options,
+    replace_route_assignee,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -667,3 +673,167 @@ class TestRoutePermissionGating:
         patch_resp = patch_view(patch_req, pk=new_route_id)
         assert patch_resp.status_code == 200, patch_resp.data
         assert patch_resp.data["label"] == "Internal Route Updated"
+
+
+# ---------------------------------------------------------------------------
+# G. Route assignee replacement
+# ---------------------------------------------------------------------------
+
+class TestRouteAssigneeReplacement:
+    def test_replacement_options_and_replace_endpoint(
+        self, route, wf_template_and_version, approver, approver_role, company, factory
+    ):
+        replacement = User.objects.create_user(
+            email="api-replacement@route.com",
+            first_name="API",
+            last_name="Replacement",
+            password="pass",
+        )
+        from apps.access.services import assign_user_role
+        assign_user_role(replacement, approver_role, company)
+
+        from apps.vendors.api.views import VendorSubmissionRouteViewSet
+        options_view = VendorSubmissionRouteViewSet.as_view({
+            "get": "replacement_options",
+        })
+        options_request = factory.get(
+            f"/vendors/send-to-options/{route.pk}/replacement-options/"
+        )
+        force_authenticate(options_request, user=approver)
+        options_response = options_view(options_request, pk=route.pk)
+        assert options_response.status_code == 200
+        assert options_response.data["published_version_number"] == 1
+
+        replace_view = VendorSubmissionRouteViewSet.as_view({
+            "post": "replace_assignee",
+        })
+        replace_request = factory.post(
+            f"/vendors/send-to-options/{route.pk}/replace-assignee/",
+            {
+                "old_user": approver.pk,
+                "new_user": replacement.pk,
+                "label": "Send To API Replacement",
+            },
+            format="json",
+        )
+        force_authenticate(replace_request, user=approver)
+        replace_response = replace_view(replace_request, pk=route.pk)
+        assert replace_response.status_code == 200, replace_response.data
+        assert replace_response.data["route"]["code"] == "tarun"
+        assert replace_response.data["route"]["label"] == "Send To API Replacement"
+        assert replace_response.data["published_version_number"] == 2
+
+    def test_replacement_clones_and_publishes_without_touching_existing_instance(
+        self, route, wf_template_and_version, approver, approver_role, company, entity
+    ):
+        template, source_version = wf_template_and_version
+        group = source_version.step_groups.get()
+        second_step = WorkflowStep.objects.create(
+            group=group,
+            name="Allocate",
+            display_order=2,
+            required_role=approver_role,
+            step_kind=StepKind.RUNTIME_SPLIT_ALLOCATION,
+            scope_resolution_policy=ScopeResolutionPolicy.SUBJECT_NODE,
+            default_user=approver,
+            require_category=True,
+            require_budget=True,
+        )
+        split_option = WorkflowSplitOption.objects.create(
+            workflow_step=second_step,
+            entity=entity,
+            display_order=1,
+        )
+        split_option.allowed_approvers.set([approver])
+
+        existing_instance = WorkflowInstance.objects.create(
+            template_version=source_version,
+            subject_type="invoice",
+            subject_id=999,
+            subject_scope_node=company,
+            started_by=approver,
+        )
+
+        replacement = User.objects.create_user(
+            email="replacement@route.com",
+            first_name="Replacement",
+            last_name="Executive",
+            password="pass",
+        )
+        from apps.access.services import assign_user_role
+        assign_user_role(replacement, approver_role, company)
+
+        updated_route, new_version, affected_count = replace_route_assignee(
+            route=route,
+            old_user=approver,
+            new_user=replacement,
+            new_label="Send To Replacement Executive",
+            actor=approver,
+        )
+
+        source_version.refresh_from_db()
+        existing_instance.refresh_from_db()
+        assert source_version.status == VersionStatus.ARCHIVED
+        assert new_version.status == VersionStatus.PUBLISHED
+        assert new_version.version_number == 2
+        assert affected_count == 2
+        assert updated_route.code == "tarun"
+        assert updated_route.label == "Send To Replacement Executive"
+        assert existing_instance.template_version_id == source_version.pk
+
+        cloned_steps = WorkflowStep.objects.filter(
+            group__template_version=new_version
+        ).order_by("display_order")
+        assert cloned_steps.count() == 2
+        assert set(cloned_steps.values_list("default_user_id", flat=True)) == {
+            replacement.pk
+        }
+        cloned_split = WorkflowSplitOption.objects.get(
+            workflow_step=cloned_steps.get(display_order=2)
+        )
+        assert list(cloned_split.allowed_approvers.all()) == [approver]
+
+        from apps.audit.models import AuditLog
+        audit = AuditLog.objects.get(
+            action="vendor_route_assignee_replaced",
+            resource_id=route.pk,
+        )
+        assert audit.metadata["old_user_id"] == approver.pk
+        assert audit.metadata["new_user_id"] == replacement.pk
+
+    def test_options_only_return_users_eligible_for_all_affected_steps(
+        self, route, wf_template_and_version, approver, approver_role, company, org
+    ):
+        eligible = User.objects.create_user(email="eligible@route.com", password="pass")
+        ineligible = User.objects.create_user(email="ineligible@route.com", password="pass")
+        from apps.access.services import assign_user_role
+        assign_user_role(eligible, approver_role, company)
+
+        options = get_route_assignee_replacement_options(route)
+        current = next(item for item in options["assignees"] if item["id"] == approver.pk)
+        candidate_ids = {item["id"] for item in current["candidates"]}
+        assert eligible.pk in candidate_ids
+        assert ineligible.pk not in candidate_ids
+
+    def test_replacement_rejects_user_without_required_role_atomically(
+        self, route, wf_template_and_version, approver
+    ):
+        _, source_version = wf_template_and_version
+        ineligible = User.objects.create_user(email="wrong-role@route.com", password="pass")
+
+        with pytest.raises(RouteAssigneeReplacementError, match="does not hold"):
+            replace_route_assignee(
+                route=route,
+                old_user=approver,
+                new_user=ineligible,
+                new_label="Send To Wrong User",
+                actor=approver,
+            )
+
+        route.refresh_from_db()
+        source_version.refresh_from_db()
+        assert route.label == "Tarun"
+        assert source_version.status == VersionStatus.PUBLISHED
+        assert WorkflowTemplateVersion.objects.filter(
+            template=route.workflow_template
+        ).count() == 1
