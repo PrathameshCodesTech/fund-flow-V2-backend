@@ -1658,7 +1658,7 @@ def create_budget_revision(
 
     budget = Budget.objects.select_for_update(of=("self",)).select_related("scope_node", "org").get(pk=budget.pk)
     current_lines = list(
-        BudgetLine.objects.select_for_update()
+        BudgetLine.objects.select_for_update(of=("self",))
         .filter(budget=budget)
         .select_related("category", "subcategory")
         .order_by("id")
