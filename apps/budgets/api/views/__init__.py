@@ -4,7 +4,7 @@ from django.http import HttpResponse
 from django.utils.text import slugify
 from rest_framework import status
 from rest_framework.decorators import action
-from rest_framework.exceptions import ValidationError
+from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
@@ -87,6 +87,7 @@ from apps.access.selectors import (
     get_user_visible_scope_ids,
     get_user_visible_org_ids,
 )
+from apps.access.models import UserRoleAssignment
 from apps.access.services import user_can_act_on_scope_or_ancestors_response
 from apps.core.models import ScopeNode
 
@@ -863,9 +864,28 @@ class BudgetImportBatchViewSet(ModelViewSet):
     permission_classes = [IsAuthenticated]
     http_method_names = ["get", "post"]
 
+    def _tenant_admin_org_ids(self):
+        """Return organizations where the caller has an active Tenant Admin role."""
+        if self.request.user.is_superuser:
+            return None
+        return set(
+            UserRoleAssignment.objects.filter(
+                user=self.request.user,
+                role__code="tenant_admin",
+                role__is_active=True,
+            ).values_list("role__org_id", flat=True)
+        )
+
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+        if not request.user.is_superuser and not self._tenant_admin_org_ids():
+            raise PermissionDenied("Only Tenant Admin users can manage bulk budget imports.")
+
     def get_queryset(self):
-        visible_org_ids = get_user_visible_org_ids(self.request.user)
-        return BudgetImportBatch.objects.filter(org_id__in=visible_org_ids).order_by("-created_at")
+        admin_org_ids = self._tenant_admin_org_ids()
+        if admin_org_ids is None:
+            admin_org_ids = get_user_visible_org_ids(self.request.user)
+        return BudgetImportBatch.objects.filter(org_id__in=admin_org_ids).order_by("-created_at")
 
     def get_serializer_class(self):
         if self.action == "list":
@@ -896,16 +916,25 @@ class BudgetImportBatchViewSet(ModelViewSet):
         financial_year = data.get("financial_year", "")
         import_mode = data.get("import_mode", ImportMode.SAFE_UPDATE)
 
-        # Resolve org from user
+        # Resolve the organization only from the caller's Tenant Admin role scope.
         from apps.core.models import Organization
-        from apps.access.selectors import get_user_visible_org_ids
-        org_ids = list(get_user_visible_org_ids(request.user))
+        admin_org_ids = self._tenant_admin_org_ids()
+        if admin_org_ids is None:
+            admin_org_ids = set(get_user_visible_org_ids(request.user))
+        org_ids = list(admin_org_ids)
         if not org_ids:
-            return Response({"detail": "No accessible organisation found."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": "No Tenant Admin organisation assignment found."}, status=status.HTTP_403_FORBIDDEN)
+
+        requested_org_id = request.data.get("org")
+        if requested_org_id is not None and str(requested_org_id) not in {str(org_id) for org_id in org_ids}:
+            return Response(
+                {"detail": "You cannot create a bulk budget import for this organization."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         try:
-            org = Organization.objects.get(pk=request.data.get("org") or org_ids[0])
+            org = Organization.objects.get(pk=requested_org_id or org_ids[0])
         except Organization.DoesNotExist:
-            org = Organization.objects.get(pk=org_ids[0])
+            return Response({"detail": "Organization not found."}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
             parsed = parse_budget_import_file(uploaded_file)

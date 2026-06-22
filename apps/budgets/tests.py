@@ -2,7 +2,9 @@ from decimal import Decimal
 from io import BytesIO
 
 from django.test import TestCase
+from rest_framework.test import APIClient
 
+from apps.access.models import Role, UserRoleAssignment
 from apps.budgets.models import (
     Budget,
     BudgetCategory,
@@ -157,3 +159,41 @@ class BudgetRevisionServiceTests(TestCase):
             "allocated_amount": "1250",
             "row_number": 2,
         }])
+
+
+class BudgetImportAccessTests(TestCase):
+    def setUp(self):
+        self.org = Organization.objects.create(name="Import Org", code="import-org")
+        self.scope = ScopeNode.objects.create(
+            org=self.org,
+            parent=None,
+            name="Marketing",
+            code="marketing",
+            node_type=NodeType.DEPARTMENT,
+            path="/import-org/marketing",
+            depth=0,
+        )
+        self.tenant_admin_role = Role.objects.create(
+            org=self.org,
+            name="Tenant Admin",
+            code="tenant_admin",
+        )
+        self.hod_role = Role.objects.create(
+            org=self.org,
+            name="HOD",
+            code="hod",
+        )
+        self.tenant_admin = User.objects.create_user(email="admin@example.com", password="password")
+        self.hod = User.objects.create_user(email="hod-import@example.com", password="password")
+        UserRoleAssignment.objects.create(user=self.tenant_admin, role=self.tenant_admin_role, scope_node=self.scope)
+        UserRoleAssignment.objects.create(user=self.hod, role=self.hod_role, scope_node=self.scope)
+        self.client = APIClient()
+
+    def test_only_tenant_admin_can_access_bulk_import_endpoints(self):
+        self.client.force_authenticate(self.hod)
+        denied = self.client.get("/api/v1/budgets/import-batches/")
+        self.assertEqual(denied.status_code, 403)
+
+        self.client.force_authenticate(self.tenant_admin)
+        allowed = self.client.get("/api/v1/budgets/import-batches/")
+        self.assertEqual(allowed.status_code, 200)
