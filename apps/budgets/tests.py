@@ -1,4 +1,5 @@
 from decimal import Decimal
+from io import BytesIO
 
 from django.test import TestCase
 
@@ -14,6 +15,7 @@ from apps.budgets.models import (
 from apps.budgets.services import (
     BudgetRevisionValidationError,
     create_budget_revision,
+    parse_scoped_budget_revision_file,
     publish_budget_revision,
 )
 from apps.core.models import NodeType, Organization, ScopeNode
@@ -126,3 +128,32 @@ class BudgetRevisionServiceTests(TestCase):
         self.assertEqual(self.line.allocated_amount, Decimal("0.00"))
         self.assertEqual(self.budget.allocated_amount, Decimal("0.00"))
         self.assertTrue(BudgetLine.objects.filter(pk=self.line.pk).exists())
+
+    def test_revision_excel_parser_accepts_template_required_markers(self):
+        import openpyxl
+
+        workbook = openpyxl.Workbook()
+        worksheet = workbook.active
+        worksheet.append([
+            "Category Code *",
+            "Category Name",
+            "Subcategory Code",
+            "Subcategory Name",
+            "Current Allocation",
+            "New Allocation *",
+        ])
+        worksheet.append(["EVENTS", "Events", "CUSTOMER-EVENT", "Customer Event", 1000, 1250])
+
+        file_obj = BytesIO()
+        workbook.save(file_obj)
+        file_obj.seek(0)
+
+        self.assertEqual(parse_scoped_budget_revision_file(file_obj), [{
+            "category_code": "EVENTS",
+            "category name": "Events",
+            "subcategory_code": "CUSTOMER-EVENT",
+            "subcategory name": "Customer Event",
+            "current allocation": "1000",
+            "allocated_amount": "1250",
+            "row_number": 2,
+        }])

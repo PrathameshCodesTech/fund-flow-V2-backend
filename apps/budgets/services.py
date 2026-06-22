@@ -943,6 +943,13 @@ IMPORT_COLUMN_MAP = {
 }
 
 
+def _normalise_excel_header(value) -> str:
+    """Normalize human-facing Excel headers before matching known aliases."""
+    raw = str(value).strip().lower() if value is not None else ""
+    # Templates mark required columns with '*'; that marker is not part of the field name.
+    return " ".join(raw.rstrip("*").strip().split())
+
+
 def parse_budget_import_file(file_obj) -> list[dict]:
     """
     Parse an Excel file (xlsx/xls) and return a list of row dicts.
@@ -965,7 +972,7 @@ def parse_budget_import_file(file_obj) -> list[dict]:
 
     headers = []
     for cell in header_row:
-        raw = str(cell).strip().lower() if cell is not None else ""
+        raw = _normalise_excel_header(cell)
         headers.append(IMPORT_COLUMN_MAP.get(raw, raw))
 
     missing = IMPORT_REQUIRED_COLUMNS - set(headers)
@@ -1498,7 +1505,7 @@ def parse_scoped_budget_revision_file(file_obj) -> list[dict]:
 
     headers = []
     for cell in header_row:
-        raw = str(cell).strip().lower() if cell is not None else ""
+        raw = _normalise_excel_header(cell)
         headers.append(SCOPED_REVISION_COLUMN_MAP.get(raw, raw))
 
     missing = SCOPED_REVISION_REQUIRED_COLUMNS - set(headers)
