@@ -1656,7 +1656,7 @@ def create_budget_revision(
     if not change_reason or not change_reason.strip():
         raise BudgetRevisionValidationError("A change reason is required.")
 
-    budget = Budget.objects.select_for_update().select_related("scope_node", "org").get(pk=budget.pk)
+    budget = Budget.objects.select_for_update(of=("self",)).select_related("scope_node", "org").get(pk=budget.pk)
     current_lines = list(
         BudgetLine.objects.select_for_update()
         .filter(budget=budget)
@@ -1741,7 +1741,7 @@ def create_budget_revision(
 def publish_budget_revision(*, revision: BudgetRevision, published_by) -> BudgetRevision:
     """Publish a validated revision and atomically update live allocation lines."""
     revision = (
-        BudgetRevision.objects.select_for_update()
+        BudgetRevision.objects.select_for_update(of=("self",))
         .select_related("budget__scope_node", "budget__org")
         .get(pk=revision.pk)
     )
