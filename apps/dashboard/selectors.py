@@ -161,6 +161,7 @@ def get_stuck_invoices(user, sla_hours=48):
     final_statuses = [
         InvoiceStatus.FINANCE_APPROVED, InvoiceStatus.FINANCE_REJECTED,
         InvoiceStatus.REJECTED, InvoiceStatus.PAID,
+        InvoiceStatus.HISTORICAL_POSTED, InvoiceStatus.HISTORICAL_REVERSED,
     ]
 
     # Invoices stuck in a status without an active workflow

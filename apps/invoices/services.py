@@ -16,7 +16,18 @@ from django.db import transaction
 from django.http import HttpResponse
 from django.utils import timezone
 
-from apps.invoices.models import Invoice, InvoiceDocument, InvoiceStatus, VendorInvoiceSubmission, VendorInvoiceSubmissionStatus
+from apps.invoices.models import (
+    Invoice,
+    InvoiceAllocation,
+    InvoiceAllocationSource,
+    InvoiceAllocationStatus,
+    InvoiceDocument,
+    InvoiceDocumentType,
+    InvoiceEntrySource,
+    InvoiceStatus,
+    VendorInvoiceSubmission,
+    VendorInvoiceSubmissionStatus,
+)
 from apps.access.models import PermissionAction, PermissionResource
 from apps.access.services import user_has_permission_including_ancestors
 
@@ -360,11 +371,521 @@ class InvoicePOMandateError(ValueError):
     """Legacy exception kept for compatibility; PO numbers are optional."""
 
 
+class HistoricalInvoicePermissionError(PermissionError):
+    """Raised when an actor cannot post or reverse historical invoices."""
+
+
+class HistoricalInvoiceValidationError(ValueError):
+    """Raised when historical invoice data cannot be safely posted."""
+
+    def __init__(self, detail):
+        self.detail = detail
+        super().__init__(str(detail))
+
+
 def sync_invoice_status(invoice, new_status):
     """Directly update invoice status. Used by workflow sync."""
     invoice.status = new_status
     invoice.save(update_fields=["status", "updated_at"])
     return invoice
+
+
+# ---------------------------------------------------------------------------
+# Historical invoice posting
+# ---------------------------------------------------------------------------
+
+def _historical_invoice_import_key(vendor_id: int, invoice_number: str) -> str:
+    normalized_number = " ".join(invoice_number.strip().casefold().split())
+    return hashlib.sha256(f"{vendor_id}:{normalized_number}".encode("utf-8")).hexdigest()
+
+
+def _scope_matches_entity_or_descendant(entity, scope_node) -> bool:
+    if not scope_node:
+        return False
+    return (
+        scope_node.path == entity.path
+        or scope_node.path.startswith(entity.path + "/")
+    )
+
+
+def _can_historical_post_at_scope(actor, scope_node) -> bool:
+    if actor.is_superuser:
+        return True
+    return user_has_permission_including_ancestors(
+        actor,
+        PermissionAction.HISTORICAL_POST,
+        PermissionResource.INVOICE,
+        scope_node,
+    )
+
+
+def _validate_historical_invoice_data(data: dict, actor) -> list[dict]:
+    from apps.budgets.models import BudgetStatus
+    from apps.budgets.services import (
+        BudgetLineNotFoundError,
+        resolve_budget_line_for_allocation,
+    )
+    from apps.vendors.models import OperationalStatus
+
+    vendor = data["vendor"]
+    vendor_org_id = vendor.org_id or vendor.scope_node.org_id
+    errors: dict[str, object] = {}
+
+    if data["amount"] <= 0:
+        errors["amount"] = "Invoice amount must be greater than zero."
+    if data.get("currency") != "INR":
+        errors["currency"] = "Historical invoice posting currently supports INR only."
+    if not data.get("invoice_number", "").strip():
+        errors["invoice_number"] = "Invoice number is required."
+    if not data.get("finance_reference_number", "").strip():
+        errors["finance_reference_number"] = "Finance/SAP reference number is required."
+
+    allocation_total = sum(
+        (allocation["amount"] for allocation in data["allocations"]),
+        Decimal("0"),
+    )
+    if allocation_total != data["amount"]:
+        errors["allocation_total"] = (
+            f"Allocation total {allocation_total} must equal invoice amount {data['amount']}."
+        )
+
+    if vendor.operational_status != OperationalStatus.ACTIVE:
+        errors["vendor"] = "Only active vendors can receive historical invoices."
+
+    duplicate = Invoice.objects.filter(
+        vendor=vendor,
+        vendor_invoice_number__iexact=data["invoice_number"].strip(),
+    ).exists()
+    if duplicate:
+        errors["invoice_number"] = (
+            "An invoice with this number already exists for the selected vendor."
+        )
+
+    validated_lines = []
+    line_errors = []
+    seen_paths = set()
+
+    for index, allocation in enumerate(data["allocations"], start=1):
+        entity = allocation["entity"]
+        budget = allocation["budget"]
+        category = allocation["category"]
+        subcategory = allocation.get("subcategory")
+        campaign = allocation.get("campaign")
+        current_errors = []
+
+        if entity.org_id != vendor_org_id:
+            current_errors.append("Entity belongs to a different organization.")
+        if not _can_historical_post_at_scope(actor, entity):
+            raise HistoricalInvoicePermissionError(
+                f"You cannot post historical invoices at scope '{entity.name}'."
+            )
+        if entity.children.filter(is_active=True, node_type="branch").exists():
+            current_errors.append("Select a Branch/Park under this region.")
+        if category.org_id != vendor_org_id:
+            current_errors.append("Category belongs to a different organization.")
+        if subcategory and subcategory.category_id != category.id:
+            current_errors.append("Subcategory does not belong to the selected category.")
+        if budget.org_id != vendor_org_id:
+            current_errors.append("Budget belongs to a different organization.")
+        if budget.status != BudgetStatus.ACTIVE:
+            current_errors.append(f"Budget is not active (status={budget.status}).")
+        if budget.currency != data["currency"]:
+            current_errors.append("Budget currency does not match invoice currency.")
+        if budget.scope_node_id and not _scope_matches_entity_or_descendant(entity, budget.scope_node):
+            current_errors.append("Budget is outside the selected entity scope.")
+
+        if campaign:
+            campaign_org_id = campaign.org_id or campaign.scope_node.org_id
+            if campaign_org_id != vendor_org_id:
+                current_errors.append("Campaign belongs to a different organization.")
+            if campaign.budget_id and campaign.budget_id != budget.id:
+                current_errors.append("Campaign does not use the selected budget.")
+            if campaign.category_id and campaign.category_id != category.id:
+                current_errors.append("Campaign does not use the selected category.")
+            if campaign.subcategory_id and campaign.subcategory_id != getattr(subcategory, "id", None):
+                current_errors.append("Campaign does not use the selected subcategory.")
+            if not _scope_matches_entity_or_descendant(entity, campaign.scope_node):
+                current_errors.append("Campaign is outside the selected entity scope.")
+
+        budget_line = None
+        if not current_errors:
+            try:
+                budget_line = resolve_budget_line_for_allocation(
+                    budget=budget,
+                    category_id=category.id,
+                    subcategory_id=subcategory.id if subcategory else None,
+                )
+            except BudgetLineNotFoundError as exc:
+                current_errors.append(str(exc))
+
+        path = (
+            entity.id,
+            budget.id,
+            category.id,
+            subcategory.id if subcategory else None,
+        )
+        if path in seen_paths:
+            current_errors.append("Duplicate allocation path is not allowed.")
+        seen_paths.add(path)
+
+        if current_errors:
+            line_errors.append({"line": index, "errors": current_errors})
+            continue
+
+        validated_lines.append({**allocation, "budget_line": budget_line})
+
+    if line_errors:
+        errors["allocations"] = line_errors
+    if errors:
+        raise HistoricalInvoiceValidationError(errors)
+
+    # Validate cumulative impact, not only each line in isolation.
+    line_totals: dict[int, Decimal] = {}
+    budget_totals: dict[int, Decimal] = {}
+    for allocation in validated_lines:
+        line = allocation["budget_line"]
+        budget = allocation["budget"]
+        line_totals[line.id] = line_totals.get(line.id, Decimal("0")) + allocation["amount"]
+        budget_totals[budget.id] = budget_totals.get(budget.id, Decimal("0")) + allocation["amount"]
+
+    balance_errors = []
+    for allocation in validated_lines:
+        line = allocation["budget_line"]
+        budget = allocation["budget"]
+        if line_totals[line.id] > line.available_amount:
+            balance_errors.append(
+                f"Budget line {line.id} has {line.available_amount} available but "
+                f"{line_totals[line.id]} is allocated."
+            )
+        if budget_totals[budget.id] > budget.available_amount:
+            balance_errors.append(
+                f"Budget {budget.id} has {budget.available_amount} available but "
+                f"{budget_totals[budget.id]} is allocated."
+            )
+    if balance_errors:
+        raise HistoricalInvoiceValidationError({"allocations": sorted(set(balance_errors))})
+
+    return validated_lines
+
+
+def preview_historical_invoice_post(data: dict, actor) -> dict:
+    validated_lines = _validate_historical_invoice_data(data, actor)
+    validated_lines.sort(key=lambda item: (item["budget"].id, item["budget_line"].id))
+    return {
+        "vendor": {
+            "id": data["vendor"].id,
+            "name": data["vendor"].vendor_name,
+            "email": data["vendor"].email,
+        },
+        "invoice_number": data["invoice_number"],
+        "invoice_amount": str(data["amount"]),
+        "currency": data["currency"],
+        "allocation_total": str(sum((line["amount"] for line in validated_lines), Decimal("0"))),
+        "allocations": [
+            {
+                "entity_id": line["entity"].id,
+                "entity_name": line["entity"].name,
+                "budget_id": line["budget"].id,
+                "budget_name": line["budget"].name,
+                "budget_line_id": line["budget_line"].id,
+                "category_id": line["category"].id,
+                "category_name": line["category"].name,
+                "subcategory_id": line["subcategory"].id if line.get("subcategory") else None,
+                "subcategory_name": line["subcategory"].name if line.get("subcategory") else None,
+                "campaign_id": line["campaign"].id if line.get("campaign") else None,
+                "campaign_name": line["campaign"].name if line.get("campaign") else None,
+                "amount": str(line["amount"]),
+                "available_before": str(line["budget_line"].available_amount),
+                "available_after": str(line["budget_line"].available_amount - line["amount"]),
+            }
+            for line in validated_lines
+        ],
+    }
+
+
+def get_historical_invoice_options(vendor, actor) -> dict:
+    """Return the established allocation option shape for historical posting."""
+    from apps.core.models import NodeType, ScopeNode
+    from apps.vendors.models import OperationalStatus
+    from apps.workflow.services_split import _build_allowed_entities_for_entity
+
+    if vendor.operational_status != OperationalStatus.ACTIVE:
+        raise HistoricalInvoiceValidationError({
+            "vendor": "Only active vendors can receive historical invoices."
+        })
+
+    root = vendor.scope_node
+    top_entities = list(
+        ScopeNode.objects.filter(
+            org=root.org,
+            parent=root,
+            is_active=True,
+            node_type=NodeType.REGION,
+        ).order_by("name")
+    )
+    if not top_entities and root.node_type in {NodeType.REGION, NodeType.BRANCH}:
+        top_entities = [root]
+    if not top_entities:
+        top_entities = list(
+            ScopeNode.objects.filter(org=root.org, parent=root, is_active=True).order_by("name")
+        )
+
+    allowed_entities = []
+    for entity in top_entities:
+        if not _can_historical_post_at_scope(actor, entity):
+            continue
+        payload = _build_allowed_entities_for_entity(entity, entity.org_id)
+        payload.update({
+            "node_type": entity.node_type,
+            "parent_entity_id": entity.parent_id,
+            "parent_entity_name": entity.parent.name if entity.parent_id else None,
+            "child_entities": [],
+        })
+        children = ScopeNode.objects.filter(
+            org=entity.org,
+            parent=entity,
+            is_active=True,
+            node_type=NodeType.BRANCH,
+        ).order_by("name")
+        for child in children:
+            if not _can_historical_post_at_scope(actor, child):
+                continue
+            child_payload = _build_allowed_entities_for_entity(child, child.org_id)
+            child_payload.update({
+                "node_type": child.node_type,
+                "parent_entity_id": entity.id,
+                "parent_entity_name": entity.name,
+                "child_entities": [],
+            })
+            payload["child_entities"].append(child_payload)
+        allowed_entities.append(payload)
+
+    if not allowed_entities:
+        raise HistoricalInvoicePermissionError(
+            "You do not have permission to post historical invoices for this vendor."
+        )
+
+    return {
+        "vendor": {
+            "id": vendor.id,
+            "name": vendor.vendor_name,
+            "email": vendor.email,
+            "scope_node_id": vendor.scope_node_id,
+        },
+        "allowed_entities": allowed_entities,
+        "rules": {
+            "currency": "INR",
+            "amount_required": True,
+            "document_required": False,
+            "allocation_total_policy": "MUST_EQUAL_INVOICE_TOTAL",
+            "workflow_bypassed": True,
+        },
+    }
+
+
+@transaction.atomic
+def post_historical_invoice(data: dict, actor) -> dict:
+    from django.db import IntegrityError
+    from apps.audit.models import AuditLog
+    from apps.budgets.models import SourceType
+    from apps.budgets.services import consume_budget_line_direct
+
+    validated_lines = _validate_historical_invoice_data(data, actor)
+    validated_lines.sort(key=lambda item: (item["budget"].id, item["budget_line"].id))
+    import_key = _historical_invoice_import_key(data["vendor"].id, data["invoice_number"])
+    now = timezone.now()
+
+    try:
+        invoice = Invoice.objects.create(
+            scope_node=data["vendor"].scope_node,
+            title=data["invoice_number"],
+            amount=data["amount"],
+            currency=data["currency"],
+            status=InvoiceStatus.HISTORICAL_POSTED,
+            po_number=data.get("po_number", ""),
+            vendor=data["vendor"],
+            created_by=actor,
+            vendor_invoice_number=data["invoice_number"],
+            invoice_date=data["invoice_date"],
+            description=data.get("posting_reason", ""),
+            entry_source=InvoiceEntrySource.HISTORICAL_IMPORT,
+            finance_reference_number=data["finance_reference_number"],
+            historical_import_key=import_key,
+            historical_posting_reason=data.get("posting_reason", ""),
+            historical_posted_by=actor,
+            historical_posted_at=now,
+        )
+    except IntegrityError as exc:
+        raise HistoricalInvoiceValidationError({
+            "invoice_number": "This historical invoice has already been posted."
+        }) from exc
+
+    created_allocations = []
+    consumptions = []
+    for allocation_data in validated_lines:
+        allocation = InvoiceAllocation.objects.create(
+            invoice=invoice,
+            workflow_instance=None,
+            split_step=None,
+            entity=allocation_data["entity"],
+            category=allocation_data["category"],
+            subcategory=allocation_data.get("subcategory"),
+            campaign=allocation_data.get("campaign"),
+            budget=allocation_data["budget"],
+            amount=allocation_data["amount"],
+            percentage=(allocation_data["amount"] / invoice.amount * 100),
+            status=InvoiceAllocationStatus.APPROVED,
+            selected_by=actor,
+            selected_at=now,
+            approved_by=actor,
+            approved_at=now,
+            note=allocation_data.get("note", ""),
+            metadata={"historical_import": True},
+            allocation_source=InvoiceAllocationSource.HISTORICAL_IMPORT,
+        )
+        source_id = f"invoice:{invoice.id}:allocation:{allocation.id}"
+        result = consume_budget_line_direct(
+            line=allocation_data["budget_line"],
+            amount=allocation.amount,
+            source_type=SourceType.INVOICE,
+            source_id=source_id,
+            consumed_by=actor,
+            note=f"Historical invoice {invoice.vendor_invoice_number}: allocation {allocation.id}",
+        )
+        allocation.metadata = {
+            "historical_import": True,
+            "budget_line_id": result["budget_line"].id,
+            "budget_consumption_id": result["consumption"].id,
+        }
+        allocation.save(update_fields=["metadata", "updated_at"])
+        created_allocations.append(allocation)
+        consumptions.append(result["consumption"])
+
+    document = data.get("document")
+    created_document = None
+    if document:
+        extension = document.name.rsplit(".", 1)[-1].lower()
+        document_type = (
+            InvoiceDocumentType.INVOICE_PDF
+            if extension == "pdf"
+            else InvoiceDocumentType.INVOICE_EXCEL
+            if extension in {"xls", "xlsx"}
+            else InvoiceDocumentType.SUPPORTING_DOCUMENT
+        )
+        created_document = InvoiceDocument.objects.create(
+            invoice=invoice,
+            submission=None,
+            file=document,
+            file_name=document.name,
+            file_type=extension,
+            document_type=document_type,
+            uploaded_by=actor,
+        )
+
+    AuditLog.objects.create(
+        user=actor,
+        action="historical_invoice_posted",
+        resource_type="invoice",
+        resource_id=invoice.id,
+        metadata={
+            "vendor_id": invoice.vendor_id,
+            "invoice_number": invoice.vendor_invoice_number,
+            "finance_reference_number": invoice.finance_reference_number,
+            "amount": str(invoice.amount),
+            "reason": invoice.historical_posting_reason,
+            "allocation_ids": [allocation.id for allocation in created_allocations],
+            "budget_consumption_ids": [consumption.id for consumption in consumptions],
+            "document_id": created_document.id if created_document else None,
+        },
+    )
+    return {
+        "invoice": invoice,
+        "allocations": created_allocations,
+        "consumptions": consumptions,
+        "document": created_document,
+    }
+
+
+@transaction.atomic
+def reverse_historical_invoice(invoice: Invoice, actor, reason: str) -> dict:
+    from apps.audit.models import AuditLog
+    from apps.budgets.models import SourceType
+    from apps.budgets.services import (
+        resolve_budget_line_for_allocation,
+        reverse_direct_budget_line_consumption,
+    )
+
+    invoice = Invoice.objects.select_for_update(of=("self",)).get(pk=invoice.pk)
+    if invoice.entry_source != InvoiceEntrySource.HISTORICAL_IMPORT:
+        raise HistoricalInvoiceValidationError({"invoice": "Invoice is not a historical import."})
+    if invoice.status != InvoiceStatus.HISTORICAL_POSTED:
+        raise HistoricalInvoiceValidationError({
+            "invoice": f"Historical invoice cannot be reversed from status '{invoice.status}'."
+        })
+
+    allocations = list(
+        InvoiceAllocation.objects.filter(
+            invoice=invoice,
+            allocation_source=InvoiceAllocationSource.HISTORICAL_IMPORT,
+        ).select_related("entity", "budget", "category", "subcategory")
+    )
+    allocations.sort(key=lambda item: (item.budget_id or 0, item.id))
+    if not allocations:
+        raise HistoricalInvoiceValidationError({"allocations": "No historical allocations found."})
+    for allocation in allocations:
+        if not _can_historical_post_at_scope(actor, allocation.entity):
+            raise HistoricalInvoicePermissionError(
+                "You do not have permission to reverse this historical invoice."
+            )
+
+    adjustments = []
+    for allocation in allocations:
+        line = resolve_budget_line_for_allocation(
+            budget=allocation.budget,
+            category_id=allocation.category_id,
+            subcategory_id=allocation.subcategory_id,
+        )
+        source_id = f"invoice:{invoice.id}:allocation:{allocation.id}"
+        result = reverse_direct_budget_line_consumption(
+            line=line,
+            amount=allocation.amount,
+            source_type=SourceType.INVOICE,
+            source_id=source_id,
+            reversed_by=actor,
+            note=f"Historical invoice reversal: {reason}",
+        )
+        adjustments.append(result["consumption"])
+        allocation.status = InvoiceAllocationStatus.CANCELLED
+        allocation.metadata = {
+            **(allocation.metadata or {}),
+            "historical_reversed": True,
+            "historical_reversal_consumption_id": result["consumption"].id,
+        }
+        allocation.save(update_fields=["status", "metadata", "updated_at"])
+
+    invoice.status = InvoiceStatus.HISTORICAL_REVERSED
+    invoice.historical_reversed_by = actor
+    invoice.historical_reversed_at = timezone.now()
+    invoice.historical_reversal_reason = reason
+    invoice.save(update_fields=[
+        "status",
+        "historical_reversed_by",
+        "historical_reversed_at",
+        "historical_reversal_reason",
+        "updated_at",
+    ])
+    AuditLog.objects.create(
+        user=actor,
+        action="historical_invoice_reversed",
+        resource_type="invoice",
+        resource_id=invoice.id,
+        metadata={
+            "reason": reason,
+            "allocation_ids": [allocation.id for allocation in allocations],
+            "adjustment_ids": [adjustment.id for adjustment in adjustments],
+        },
+    )
+    return {"invoice": invoice, "adjustments": adjustments}
 
 
 # ---------------------------------------------------------------------------

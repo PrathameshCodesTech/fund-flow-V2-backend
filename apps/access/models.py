@@ -43,6 +43,7 @@ class PermissionAction(models.TextChoices):
     REASSIGN = "reassign", "Reassign"
     START_WORKFLOW = "start_workflow", "Start Workflow"
     MANAGE_MODULE = "manage_module", "Manage Module"
+    HISTORICAL_POST = "historical_post", "Post Historical Record"
 
 
 class PermissionResource(models.TextChoices):

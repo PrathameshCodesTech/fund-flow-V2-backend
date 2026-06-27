@@ -13,6 +13,13 @@ class InvoiceStatus(models.TextChoices):
     FINANCE_REJECTED = "finance_rejected", "Finance Rejected"
     REJECTED = "rejected", "Rejected"
     PAID = "paid", "Paid"
+    HISTORICAL_POSTED = "historical_posted", "Historical Posted"
+    HISTORICAL_REVERSED = "historical_reversed", "Historical Reversed"
+
+
+class InvoiceEntrySource(models.TextChoices):
+    STANDARD = "standard", "Standard"
+    HISTORICAL_IMPORT = "historical_import", "Historical Import"
 
 
 class Invoice(models.Model):
@@ -68,6 +75,38 @@ class Invoice(models.Model):
         help_text="Tax amount",
     )
     description = models.TextField(blank=True, help_text="Invoice description / notes")
+    entry_source = models.CharField(
+        max_length=30,
+        choices=InvoiceEntrySource.choices,
+        default=InvoiceEntrySource.STANDARD,
+        db_index=True,
+    )
+    finance_reference_number = models.CharField(max_length=255, blank=True, default="")
+    historical_import_key = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        unique=True,
+        help_text="Deterministic duplicate-protection key for historical imports.",
+    )
+    historical_posting_reason = models.TextField(blank=True, default="")
+    historical_posted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="historically_posted_invoices",
+    )
+    historical_posted_at = models.DateTimeField(null=True, blank=True)
+    historical_reversed_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="historically_reversed_invoices",
+    )
+    historical_reversed_at = models.DateTimeField(null=True, blank=True)
+    historical_reversal_reason = models.TextField(blank=True, default="")
     # Explicit workflow attachment (set by internal user before runtime starts)
     selected_workflow_template = models.ForeignKey(
         "workflow.WorkflowTemplate",
@@ -227,11 +266,16 @@ class InvoiceAllocationStatus(models.TextChoices):
     CANCELLED = "cancelled", "Cancelled"
 
 
+class InvoiceAllocationSource(models.TextChoices):
+    WORKFLOW = "workflow", "Workflow"
+    HISTORICAL_IMPORT = "historical_import", "Historical Import"
+
+
 class InvoiceAllocation(models.Model):
     """
-    First-class business object representing one line of a runtime invoice split.
-    Created when the assigned splitter submits allocation lines at a
-    RUNTIME_SPLIT_ALLOCATION workflow step. One allocation = one branch task.
+    First-class business object representing one allocated portion of an invoice.
+    Workflow allocations carry runtime context; historical imports deliberately
+    omit workflow context and are identified by allocation_source.
     """
     invoice = models.ForeignKey(
         "invoices.Invoice",
@@ -241,11 +285,15 @@ class InvoiceAllocation(models.Model):
     workflow_instance = models.ForeignKey(
         "workflow.WorkflowInstance",
         on_delete=models.CASCADE,
+        null=True,
+        blank=True,
         related_name="invoice_allocations",
     )
     split_step = models.ForeignKey(
         "workflow.WorkflowInstanceStep",
         on_delete=models.CASCADE,
+        null=True,
+        blank=True,
         related_name="invoice_allocations",
         help_text="The RUNTIME_SPLIT_ALLOCATION instance step that owns this allocation",
     )
@@ -333,11 +381,34 @@ class InvoiceAllocation(models.Model):
     note = models.TextField(blank=True)
     revision_number = models.PositiveIntegerField(default=1)
     metadata = models.JSONField(default=dict, blank=True)
+    allocation_source = models.CharField(
+        max_length=30,
+        choices=InvoiceAllocationSource.choices,
+        default=InvoiceAllocationSource.WORKFLOW,
+        db_index=True,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         db_table = "invoice_allocations"
+        constraints = [
+            models.CheckConstraint(
+                check=(
+                    models.Q(
+                        allocation_source=InvoiceAllocationSource.WORKFLOW,
+                        workflow_instance__isnull=False,
+                        split_step__isnull=False,
+                    )
+                    | models.Q(
+                        allocation_source=InvoiceAllocationSource.HISTORICAL_IMPORT,
+                        workflow_instance__isnull=True,
+                        split_step__isnull=True,
+                    )
+                ),
+                name="invoice_allocation_source_context",
+            ),
+        ]
         indexes = [
             models.Index(fields=["invoice", "status"]),
             models.Index(fields=["workflow_instance"]),
@@ -405,6 +476,8 @@ class InvoiceDocument(models.Model):
     submission = models.ForeignKey(
         VendorInvoiceSubmission,
         on_delete=models.CASCADE,
+        null=True,
+        blank=True,
         related_name="documents",
     )
     file = models.FileField(

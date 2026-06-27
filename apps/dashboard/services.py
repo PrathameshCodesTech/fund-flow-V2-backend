@@ -178,6 +178,10 @@ def get_invoice_control_tower_payload(invoice, user):
 
     # ── Lifecycle phase ────────────────────────────────────────────────────────
     def _compute_lifecycle_phase(inv):
+        if inv.status == "historical_posted":
+            return "historical_posted"
+        if inv.status == "historical_reversed":
+            return "historical_reversed"
         if inv.status == "draft":
             return "draft"
         if inv.status == "pending_workflow":

@@ -101,7 +101,7 @@ ROLE_SPECS = {
             ("approve", "campaign"), ("create", "campaign"), ("delete", "campaign"), ("manage_module", "campaign"),
             ("read", "campaign"), ("reassign", "campaign"), ("reject", "campaign"), ("start_workflow", "campaign"), ("update", "campaign"),
             ("approve", "invoice"), ("create", "invoice"), ("delete", "invoice"), ("manage_module", "invoice"),
-            ("read", "invoice"), ("reassign", "invoice"), ("reject", "invoice"), ("start_workflow", "invoice"), ("update", "invoice"),
+            ("historical_post", "invoice"), ("read", "invoice"), ("reassign", "invoice"), ("reject", "invoice"), ("start_workflow", "invoice"), ("update", "invoice"),
             ("approve", "module"), ("create", "module"), ("delete", "module"), ("manage_module", "module"),
             ("read", "module"), ("reassign", "module"), ("reject", "module"), ("start_workflow", "module"), ("update", "module"),
             ("approve", "role"), ("create", "role"), ("delete", "role"), ("manage_module", "role"),

@@ -34,6 +34,7 @@ ALL_CAPABILITIES: FrozenSet[str] = frozenset([
     "invoice.review",
     "invoice.approve",
     "invoice.manage",
+    "invoice.historical_post",
     # Campaign
     "campaign.view",
     "campaign.create",
@@ -75,6 +76,7 @@ _ROLE_CAPABILITIES: dict[str, FrozenSet[str]] = {
         "invoice.review",
         "invoice.approve",
         "invoice.manage",
+        "invoice.historical_post",
         "campaign.view",
         "campaign.create",
         "campaign.edit",
@@ -106,6 +108,7 @@ _ROLE_CAPABILITIES: dict[str, FrozenSet[str]] = {
         "invoice.review",
         "invoice.approve",
         "invoice.manage",
+        "invoice.historical_post",
         "campaign.view",
         "campaign.create",
         "campaign.edit",

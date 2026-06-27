@@ -45,11 +45,27 @@ invoice_get_payment = InvoiceViewSet.as_view({
 invoice_record_payment = InvoiceViewSet.as_view({
     "post": "record_payment",
 })
+invoice_historical_preview = InvoiceViewSet.as_view({
+    "post": "historical_preview",
+})
+invoice_historical_options = InvoiceViewSet.as_view({
+    "get": "historical_options",
+})
+invoice_historical_post = InvoiceViewSet.as_view({
+    "post": "historical_post",
+})
+invoice_historical_reverse = InvoiceViewSet.as_view({
+    "post": "historical_reverse",
+})
 
 urlpatterns = [
     path("", invoice_list, name="invoice-list"),
     path("", include(submission_router.urls)),
     path("pending-review/", invoice_pending_review, name="invoice-pending-review"),
+    path("historical/options/", invoice_historical_options, name="invoice-historical-options"),
+    path("historical/preview/", invoice_historical_preview, name="invoice-historical-preview"),
+    path("historical/post/", invoice_historical_post, name="invoice-historical-post"),
+    path("<str:pk>/historical/reverse/", invoice_historical_reverse, name="invoice-historical-reverse"),
     path("<str:pk>/", invoice_detail, name="invoice-detail"),
     path("<str:pk>/submit/", invoice_submit, name="invoice-submit"),
     path("<str:pk>/eligible-workflows/", invoice_eligible_workflows, name="invoice-eligible-workflows"),

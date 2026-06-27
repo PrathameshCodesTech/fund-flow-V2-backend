@@ -150,6 +150,23 @@ def get_source_reserved_balance_for_line(line: BudgetLine, source_type: str, sou
     return reserved - consumed - released
 
 
+def get_source_consumed_balance_for_line(line: BudgetLine, source_type: str, source_id: str) -> Decimal:
+    """Return net consumed amount after immutable adjustment entries."""
+    rows = BudgetConsumption.objects.filter(
+        budget_line=line,
+        source_type=source_type,
+        source_id=str(source_id),
+        status=ConsumptionStatus.APPLIED,
+    )
+    consumed = rows.filter(consumption_type=ConsumptionType.CONSUMED).aggregate(
+        t=Sum("amount")
+    )["t"] or Decimal("0")
+    adjusted = rows.filter(consumption_type=ConsumptionType.ADJUSTED).aggregate(
+        t=Sum("amount")
+    )["t"] or Decimal("0")
+    return max(consumed - adjusted, Decimal("0"))
+
+
 def get_source_reserved_balance(budget: Budget, source_type: str, source_id: str) -> Decimal:
     """
     Net reserved balance for a specific (budget, source_type, source_id) tuple.
@@ -299,6 +316,133 @@ def consume_reserved_budget_line(
     return {
         "status": "consumed",
         "consumption": consumption,
+    }
+
+
+@transaction.atomic
+def consume_budget_line_direct(
+    line: BudgetLine,
+    amount: Decimal,
+    source_type: str,
+    source_id: str,
+    consumed_by,
+    note: str = "",
+) -> dict:
+    """
+    Consume available budget without creating a reservation first.
+
+    This is intentionally separate from the normal reserve/approve/consume
+    lifecycle and is used only by explicitly authorized historical posting.
+    Both the line and header are locked to prevent concurrent overspend.
+    """
+    line = (
+        BudgetLine.objects
+        .select_for_update(of=("self",))
+        .select_related("budget")
+        .get(pk=line.pk)
+    )
+    budget = Budget.objects.select_for_update(of=("self",)).get(pk=line.budget_id)
+
+    if budget.status != BudgetStatus.ACTIVE:
+        raise BudgetNotActiveError(
+            f"Budget {budget.id} is {budget.status}, expected ACTIVE."
+        )
+    if amount <= 0:
+        raise ValueError("Consumption amount must be greater than zero.")
+    if BudgetConsumption.objects.filter(
+        budget_line=line,
+        source_type=source_type,
+        source_id=str(source_id),
+        status=ConsumptionStatus.APPLIED,
+    ).exists():
+        raise ValueError(
+            f"Budget source {source_type}/{source_id} has already been posted."
+        )
+    if amount > line.available_amount:
+        raise BudgetLimitExceeded(
+            f"Consumption of {amount} exceeds available amount of {line.available_amount} "
+            f"for budget line {line.id}."
+        )
+    if amount > budget.available_amount:
+        raise BudgetLimitExceeded(
+            f"Consumption of {amount} exceeds available amount of {budget.available_amount} "
+            f"for budget {budget.id}."
+        )
+
+    consumption = BudgetConsumption.objects.create(
+        budget=budget,
+        budget_line=line,
+        source_type=source_type,
+        source_id=str(source_id),
+        amount=amount,
+        consumption_type=ConsumptionType.CONSUMED,
+        status=ConsumptionStatus.APPLIED,
+        created_by=consumed_by,
+        note=note,
+    )
+    line.consumed_amount += amount
+    line.save(update_fields=["consumed_amount", "updated_at"])
+    budget.consumed_amount += amount
+    budget.save(update_fields=["consumed_amount", "updated_at"])
+
+    return {
+        "status": "consumed",
+        "consumption": consumption,
+        "budget": budget,
+        "budget_line": line,
+    }
+
+
+@transaction.atomic
+def reverse_direct_budget_line_consumption(
+    line: BudgetLine,
+    amount: Decimal,
+    source_type: str,
+    source_id: str,
+    reversed_by,
+    note: str,
+) -> dict:
+    """Reverse a direct consumption through an immutable adjustment entry."""
+    line = (
+        BudgetLine.objects
+        .select_for_update(of=("self",))
+        .select_related("budget")
+        .get(pk=line.pk)
+    )
+    budget = Budget.objects.select_for_update(of=("self",)).get(pk=line.budget_id)
+    net_consumed = get_source_consumed_balance_for_line(line, source_type, str(source_id))
+
+    if amount <= 0:
+        raise ValueError("Reversal amount must be greater than zero.")
+    if amount > net_consumed:
+        raise ValueError(
+            f"Cannot reverse {amount}: only {net_consumed} remains consumed for "
+            f"source {source_type}/{source_id}."
+        )
+    if line.consumed_amount < amount or budget.consumed_amount < amount:
+        raise ValueError("Cached budget balances are inconsistent with the ledger.")
+
+    adjustment = BudgetConsumption.objects.create(
+        budget=budget,
+        budget_line=line,
+        source_type=source_type,
+        source_id=str(source_id),
+        amount=amount,
+        consumption_type=ConsumptionType.ADJUSTED,
+        status=ConsumptionStatus.APPLIED,
+        created_by=reversed_by,
+        note=note,
+    )
+    line.consumed_amount -= amount
+    line.save(update_fields=["consumed_amount", "updated_at"])
+    budget.consumed_amount -= amount
+    budget.save(update_fields=["consumed_amount", "updated_at"])
+
+    return {
+        "status": "reversed",
+        "consumption": adjustment,
+        "budget": budget,
+        "budget_line": line,
     }
 
 

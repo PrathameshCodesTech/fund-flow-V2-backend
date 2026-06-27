@@ -1,3 +1,7 @@
+import json
+from decimal import Decimal
+from pathlib import Path
+
 from rest_framework import serializers
 from apps.invoices.models import (
     Invoice, InvoiceDocument, InvoiceDocumentType,
@@ -6,6 +10,8 @@ from apps.invoices.models import (
 )
 from apps.core.models import ScopeNode
 from apps.vendors.models import Vendor
+from apps.budgets.models import Budget, BudgetCategory, BudgetSubCategory
+from apps.campaigns.models import Campaign
 
 
 # ---------------------------------------------------------------------------
@@ -38,6 +44,9 @@ class InvoiceSerializer(serializers.ModelSerializer):
             "send_to_route_label",
             "vendor_invoice_number", "invoice_date", "due_date",
             "subtotal_amount", "tax_amount", "description",
+            "entry_source", "finance_reference_number",
+            "historical_posting_reason", "historical_posted_by", "historical_posted_at",
+            "historical_reversed_by", "historical_reversed_at", "historical_reversal_reason",
             "selected_workflow_template", "selected_workflow_version",
             "selected_workflow_template_name", "selected_workflow_version_number",
             "workflow_selected_by", "workflow_selected_by_name",
@@ -49,6 +58,9 @@ class InvoiceSerializer(serializers.ModelSerializer):
         read_only_fields = [
             "id", "status", "selected_workflow_template", "selected_workflow_version",
             "workflow_selected_by", "workflow_selected_at",
+            "entry_source", "finance_reference_number",
+            "historical_posting_reason", "historical_posted_by", "historical_posted_at",
+            "historical_reversed_by", "historical_reversed_at", "historical_reversal_reason",
             "created_by", "created_at", "updated_at",
         ]
 
@@ -109,6 +121,100 @@ class InvoiceCreateSerializer(serializers.Serializer):
         if value <= 0:
             raise serializers.ValidationError("Amount must be greater than zero.")
         return value
+
+
+class HistoricalInvoiceAllocationInputSerializer(serializers.Serializer):
+    entity = serializers.PrimaryKeyRelatedField(queryset=ScopeNode.objects.filter(is_active=True))
+    budget = serializers.PrimaryKeyRelatedField(queryset=Budget.objects.all())
+    category = serializers.PrimaryKeyRelatedField(queryset=BudgetCategory.objects.filter(is_active=True))
+    subcategory = serializers.PrimaryKeyRelatedField(
+        queryset=BudgetSubCategory.objects.filter(is_active=True),
+        required=False,
+        allow_null=True,
+        default=None,
+    )
+    campaign = serializers.PrimaryKeyRelatedField(
+        queryset=Campaign.objects.all(),
+        required=False,
+        allow_null=True,
+        default=None,
+    )
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=Decimal("0.01"))
+    note = serializers.CharField(required=False, allow_blank=True, default="")
+
+
+class HistoricalInvoicePostSerializer(serializers.Serializer):
+    vendor = serializers.PrimaryKeyRelatedField(queryset=Vendor.objects.select_related("org", "scope_node"))
+    invoice_number = serializers.CharField(max_length=255)
+    po_number = serializers.CharField(max_length=100, required=False, allow_blank=True, default="")
+    finance_reference_number = serializers.CharField(max_length=255)
+    invoice_date = serializers.DateField()
+    amount = serializers.DecimalField(max_digits=14, decimal_places=2, min_value=Decimal("0.01"))
+    currency = serializers.ChoiceField(choices=["INR"], required=False, default="INR")
+    posting_reason = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="Historical invoice posting",
+    )
+    allocations = serializers.JSONField()
+    document = serializers.FileField(required=False, allow_null=True, write_only=True)
+
+    def validate_invoice_number(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError("Invoice number is required.")
+        return value
+
+    def validate_finance_reference_number(self, value):
+        value = value.strip()
+        if not value:
+            raise serializers.ValidationError("Finance/SAP reference number is required.")
+        return value
+
+    def validate_allocations(self, value):
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise serializers.ValidationError("Allocations must be valid JSON.") from exc
+        if not isinstance(value, list) or not value:
+            raise serializers.ValidationError("At least one allocation line is required.")
+        serializer = HistoricalInvoiceAllocationInputSerializer(data=value, many=True)
+        serializer.is_valid(raise_exception=True)
+        return serializer.validated_data
+
+    def validate_document(self, value):
+        if value is None:
+            return value
+        extension = Path(value.name).suffix.lower().lstrip(".")
+        if extension not in {"pdf", "xlsx", "xls", "png", "jpg", "jpeg"}:
+            raise serializers.ValidationError(
+                "Document must be PDF, Excel, PNG, or JPG."
+            )
+        if value.size > 10 * 1024 * 1024:
+            raise serializers.ValidationError("Document must not exceed 10 MB.")
+        return value
+
+    def validate(self, attrs):
+        allocation_total = sum(
+            (line["amount"] for line in attrs["allocations"]),
+            start=attrs["amount"] * 0,
+        )
+        if allocation_total != attrs["amount"]:
+            raise serializers.ValidationError({
+                "allocations": (
+                    f"Allocation total {allocation_total} must equal invoice amount "
+                    f"{attrs['amount']}."
+                )
+            })
+        return attrs
+
+
+class HistoricalInvoiceReverseSerializer(serializers.Serializer):
+    reason = serializers.CharField(min_length=3)
+
+    def validate_reason(self, value):
+        return value.strip()
 
 
 # ---------------------------------------------------------------------------

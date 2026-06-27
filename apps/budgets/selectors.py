@@ -58,9 +58,15 @@ def _ledger_consumed_for_budgets(budget_ids):
         BudgetConsumption.objects
         .filter(budget_id__in=budget_ids, status=ConsumptionStatus.APPLIED)
         .values("budget_id")
-        .annotate(consumed=Coalesce(Sum("amount", filter=Q(consumption_type=ConsumptionType.CONSUMED)), Value(Decimal("0"))))
+        .annotate(
+            consumed=Coalesce(Sum("amount", filter=Q(consumption_type=ConsumptionType.CONSUMED)), Value(Decimal("0"))),
+            adjusted=Coalesce(Sum("amount", filter=Q(consumption_type=ConsumptionType.ADJUSTED)), Value(Decimal("0"))),
+        )
     )
-    return {r["budget_id"]: r["consumed"] for r in rows}
+    return {
+        r["budget_id"]: max(r["consumed"] - r["adjusted"], Decimal("0"))
+        for r in rows
+    }
 
 
 def _ledger_balances_for_budgets(budget_ids):
@@ -99,6 +105,7 @@ def _ledger_balances_for_lines(line_ids):
             reserved=Coalesce(Sum("amount", filter=Q(consumption_type=ConsumptionType.RESERVED)), Value(Decimal("0"))),
             consumed=Coalesce(Sum("amount", filter=Q(consumption_type=ConsumptionType.CONSUMED)), Value(Decimal("0"))),
             released=Coalesce(Sum("amount", filter=Q(consumption_type=ConsumptionType.RELEASED)), Value(Decimal("0"))),
+            adjusted=Coalesce(Sum("amount", filter=Q(consumption_type=ConsumptionType.ADJUSTED)), Value(Decimal("0"))),
         )
     )
     line_map = {l.id: l for l in BudgetLine.objects.filter(id__in=line_ids)}
@@ -108,9 +115,13 @@ def _ledger_balances_for_lines(line_ids):
         line = line_map[line_id]
         row = raw.get(line_id, {})
         reserved = row.get("reserved", Decimal("0"))
-        consumed = row.get("consumed", Decimal("0"))
+        gross_consumed = row.get("consumed", Decimal("0"))
+        consumed = max(
+            gross_consumed - row.get("adjusted", Decimal("0")),
+            Decimal("0"),
+        )
         released = row.get("released", Decimal("0"))
-        net_reserved = max(reserved - released - consumed, Decimal("0"))
+        net_reserved = max(reserved - released - gross_consumed, Decimal("0"))
         result[line_id] = {
             "reserved": net_reserved,
             "consumed": consumed,
@@ -169,11 +180,15 @@ def get_budget_line_live_balances(line: "BudgetLine") -> dict:
     released = rows.filter(consumption_type=ConsumptionType.RELEASED).aggregate(
         t=Coalesce(Sum("amount"), Value(Decimal("0")))
     )["t"]
+    adjusted = rows.filter(consumption_type=ConsumptionType.ADJUSTED).aggregate(
+        t=Coalesce(Sum("amount"), Value(Decimal("0")))
+    )["t"]
     net_reserved = max(reserved - released - consumed, Decimal("0"))
-    available = max(line.allocated_amount - net_reserved - consumed, Decimal("0"))
+    net_consumed = max(consumed - adjusted, Decimal("0"))
+    available = max(line.allocated_amount - net_reserved - net_consumed, Decimal("0"))
     return {
         "reserved_amount": net_reserved,
-        "consumed_amount": consumed,
+        "consumed_amount": net_consumed,
         "available_amount": available,
     }
 

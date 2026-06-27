@@ -9,14 +9,25 @@ from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from apps.core.models import ScopeNode
 
-from apps.invoices.models import Invoice, InvoiceStatus, InvoicePayment, PaymentMethod
+from apps.invoices.models import (
+    Invoice,
+    InvoiceEntrySource,
+    InvoiceStatus,
+    InvoicePayment,
+    PaymentMethod,
+)
 from apps.invoices.api.serializers import (
     InvoiceSerializer, InvoiceCreateSerializer,
     InvoicePaymentSerializer, VendorInvoicePaymentSerializer, InvoicePaymentUpdateSerializer,
+    HistoricalInvoicePostSerializer, HistoricalInvoiceReverseSerializer,
+    InvoiceDocumentSerializer,
 )
 from apps.invoices.services import (
     create_invoice, InvoicePermissionError, InvoicePOMandateError,
     record_invoice_payment, PaymentPermissionError, PaymentValidationError,
+    preview_historical_invoice_post, post_historical_invoice, reverse_historical_invoice,
+    get_historical_invoice_options,
+    HistoricalInvoicePermissionError, HistoricalInvoiceValidationError,
 )
 from apps.invoices.selectors import (
     user_can_access_invoice,
@@ -56,6 +67,7 @@ class InvoiceViewSet(ModelViewSet):
             Q(title__icontains=search_term)
             | Q(vendor_invoice_number__icontains=search_term)
             | Q(po_number__icontains=search_term)
+            | Q(finance_reference_number__icontains=search_term)
             | Q(vendor__vendor_name__icontains=search_term)
         )
 
@@ -70,10 +82,16 @@ class InvoiceViewSet(ModelViewSet):
 
         node_id = self.request.query_params.get("scope_node")
         invoice_status = self.request.query_params.get("status")
+        entry_source = self.request.query_params.get("entry_source")
+        vendor_id = self.request.query_params.get("vendor")
         search_term = self.request.query_params.get("search")
         qs = self._apply_scope_filter(qs, node_id)
         if invoice_status:
             qs = qs.filter(status=invoice_status)
+        if entry_source:
+            qs = qs.filter(entry_source=entry_source)
+        if vendor_id:
+            qs = qs.filter(vendor_id=vendor_id)
         qs = self._apply_search_filter(qs, search_term)
 
         return filter_invoices_readable_for_user(self.request.user, qs)
@@ -112,6 +130,11 @@ class InvoiceViewSet(ModelViewSet):
         Returns 403 if unauthorized.
         """
         invoice = self.get_object()
+        if invoice.entry_source == InvoiceEntrySource.HISTORICAL_IMPORT:
+            return Response(
+                {"detail": "Historical invoices are immutable. Reverse the posting and create a corrected entry."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if not user_can_update_invoice(request.user, invoice):
             return Response(
                 {"detail": "You do not have permission to update this invoice."},
@@ -121,6 +144,15 @@ class InvoiceViewSet(ModelViewSet):
 
     def partial_update(self, request, *args, **kwargs):
         return self.update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        invoice = self.get_object()
+        if invoice.entry_source == InvoiceEntrySource.HISTORICAL_IMPORT:
+            return Response(
+                {"detail": "Historical invoices cannot be deleted. Use the audited reversal action."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return super().destroy(request, *args, **kwargs)
 
     def create(self, request, *args, **kwargs):
         serializer = InvoiceCreateSerializer(data=request.data)
@@ -179,6 +211,106 @@ class InvoiceViewSet(ModelViewSet):
         except InvoicePOMandateError as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
         return Response(InvoiceSerializer(invoice).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["post"], url_path="historical/preview")
+    def historical_preview(self, request):
+        """Validate a historical invoice and return its budget impact without writing."""
+        serializer = HistoricalInvoicePostSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        data.pop("document", None)
+        try:
+            preview = preview_historical_invoice_post(data, request.user)
+        except HistoricalInvoicePermissionError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_403_FORBIDDEN)
+        except HistoricalInvoiceValidationError as exc:
+            return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
+        return Response(preview)
+
+    @action(detail=False, methods=["get"], url_path="historical/options")
+    def historical_options(self, request):
+        """Return vendor-prefilled allocation options for the historical posting form."""
+        from apps.vendors.models import Vendor
+
+        vendor_id = request.query_params.get("vendor")
+        if not vendor_id:
+            return Response(
+                {"vendor": "Vendor query parameter is required."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        vendor = get_object_or_404(
+            Vendor.objects.select_related("org", "scope_node", "scope_node__parent"),
+            pk=vendor_id,
+        )
+        try:
+            options = get_historical_invoice_options(vendor, request.user)
+        except HistoricalInvoicePermissionError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_403_FORBIDDEN)
+        except HistoricalInvoiceValidationError as exc:
+            return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
+        return Response(options)
+
+    @action(detail=False, methods=["post"], url_path="historical/post")
+    def historical_post(self, request):
+        """Post an audited historical invoice directly to the budget ledger."""
+        serializer = HistoricalInvoicePostSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            result = post_historical_invoice(dict(serializer.validated_data), request.user)
+        except HistoricalInvoicePermissionError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_403_FORBIDDEN)
+        except HistoricalInvoiceValidationError as exc:
+            return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        invoice = result["invoice"]
+        return Response({
+            "invoice": InvoiceSerializer(invoice, context={"request": request}).data,
+            "allocations": [
+                {
+                    "id": allocation.id,
+                    "entity": allocation.entity_id,
+                    "budget": allocation.budget_id,
+                    "category": allocation.category_id,
+                    "subcategory": allocation.subcategory_id,
+                    "campaign": allocation.campaign_id,
+                    "amount": str(allocation.amount),
+                    "status": allocation.status,
+                    "allocation_source": allocation.allocation_source,
+                    "budget_line_id": allocation.metadata.get("budget_line_id"),
+                    "budget_consumption_id": allocation.metadata.get("budget_consumption_id"),
+                }
+                for allocation in result["allocations"]
+            ],
+            "document": (
+                InvoiceDocumentSerializer(result["document"], context={"request": request}).data
+                if result["document"] else None
+            ),
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="historical/reverse")
+    def historical_reverse(self, request, pk=None):
+        """Reverse a historical invoice through ledger adjustments; never delete it."""
+        invoice = self.get_object()
+        serializer = HistoricalInvoiceReverseSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            result = reverse_historical_invoice(
+                invoice=invoice,
+                actor=request.user,
+                reason=serializer.validated_data["reason"],
+            )
+        except HistoricalInvoicePermissionError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_403_FORBIDDEN)
+        except HistoricalInvoiceValidationError as exc:
+            return Response(exc.detail, status=status.HTTP_400_BAD_REQUEST)
+        except ValueError as exc:
+            return Response({"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({
+            "invoice": InvoiceSerializer(result["invoice"], context={"request": request}).data,
+            "adjustment_ids": [adjustment.id for adjustment in result["adjustments"]],
+        })
 
     @action(detail=True, methods=["post"], url_path="submit")
     @transaction.atomic
@@ -682,6 +814,7 @@ class InvoiceViewSet(ModelViewSet):
                     "last_name": a.selected_approver.last_name,
                 } if a.selected_approver else None,
                 "status": a.status,
+                "allocation_source": a.allocation_source,
                 "rejection_reason": a.rejection_reason,
                 "note": a.note,
                 "branch_id": a.branch_id,
@@ -1093,7 +1226,9 @@ class InvoiceDocumentViewSet(ViewSet):
 
     def retrieve(self, request, pk=None):
         doc = get_object_or_404(
-            InvoiceDocument.objects.select_related("invoice", "submission"),
+            InvoiceDocument.objects.select_related(
+                "invoice", "invoice__vendor", "submission", "submission__vendor"
+            ),
             pk=pk,
         )
         # Only allow owner vendor or internal users
@@ -1102,9 +1237,17 @@ class InvoiceDocumentViewSet(ViewSet):
             .filter(user=request.user, is_active=True)
             .first()
         )
-        if assignment and doc.submission.vendor_id != assignment.vendor_id:
-            from django.http import Http404
-            raise Http404("Document not found.")
+        if assignment:
+            document_vendor_id = (
+                doc.invoice.vendor_id
+                if doc.invoice_id
+                else doc.submission.vendor_id
+                if doc.submission_id
+                else None
+            )
+            if document_vendor_id != assignment.vendor_id:
+                from django.http import Http404
+                raise Http404("Document not found.")
         if not doc.file:
             return Response({"detail": "No file attached."}, status=status.HTTP_404_NOT_FOUND)
         return Response({
